@@ -42,7 +42,7 @@
 - [x] استپ ۹ — **غول آخر: Auto-Prober** — تست خودکار استراتژی‌ها، ranking، انتخاب/قفل خودکار  ✅ 2026-05-29
 - [x] استپ ۱۰ — تاب‌آوری: تشخیص RST جعلی، throttle، چرخش CONNECT_IP/استراتژی، fallback chain  ✅ 2026-05-29
 - [x] استپ ۱۱ — strategies.json از راه دور (mirror + امضا) برای آپدیت بدون انتشار اپ  ✅ 2026-05-29
-- [ ] استپ ۱۲ — صفحه‌ی Strategy/Diagnostics در UI (نمایش استراتژی فعال، نمودار سلامت، probeها)
+- [x] استپ ۱۲ — صفحه‌ی Strategy/Diagnostics در UI (نمایش استراتژی فعال، نمودار سلامت، probeها)  ✅ 2026-05-29
 - [ ] استپ ۱۳ — Packaging: PyInstaller (یک exe)، آیکون، تست build، bundle نهایی
 
 ---
@@ -189,6 +189,17 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **`strategies.example.json`** — نمونه‌ی فرمت manifest.
 - تست‌ها: `tests/test_strategies_remote.py` (۲۴ تست: وریفایر Ed25519 + بردار RFC، sign/verify round-trip، رد امضا/کلید/دادهٔ دستکاری‌شده، parse/validation، canonicalization، mirror-walk/version/trust، نگاشت candidate) + ۲ تست integration در `tests/test_engine.py` (تغذیه‌ی پرابر از manifest امضاشده، fallback روی امضای بد). مجموعاً **۱۶۵ تست سبز** + round-trip واقعی keygen→sign→load با ابزار.
 - **اعمال داغ زنده** (re-fetch دوره‌ای حین اجرا) به‌صورت طبیعی در استپ UI/runtime آینده اضافه می‌شود؛ منطق load/verify/merge اینجا کامل و آزمون‌پذیر است.
+
+## ✅ استپ ۱۲ — جزئیات پیاده‌سازی (2026-05-29)
+هدف: نمایش زنده‌ی «مغز» ابزار (Auto-Prober استپ ۹ + تاب‌آوری استپ ۱۰) در UI، بدون کوپل‌شدن GUI به internalهای core.
+- **`core/diagnostics.py`** — لایه‌ی diagnostics **UI-agnostic و داده‌ی خالص** (بدون Qt/شبکه):
+  - `CandidateStat` — سلامت اندازه‌گیری‌شده‌ی هر کاندیدا (key/strategy/samples/success_rate/mean_score/selected/last_outcome).
+  - `DiagnosticsSnapshot` — یک عکسِ immutable از وضعیت زنده: status، استراتژی فعال، spoof_port، لیست کاندیداها، و فیلدهای تاب‌آوری (forged_rst_count/rst_budget/throttled/recent_bps/baseline_bps/زنجیره‌های strategy و IP). properties کمکی `has_probe_data` و `throttle_ratio`.
+  - `snapshot(engine)` — از `engine._prober` (health/selected) و `engine.resilience` (throughput/chains) عکس می‌گیرد؛ **کاملاً tolerant**: نبود prober/resilience یا engine بی‌کار فقط مقادیر پیش‌فرض می‌دهد، نه crash. کاندیداها «selected اول، سپس بر اساس mean_score» مرتب می‌شوند.
+- **`core/engine.py`** — متد `diagnostics()` که `core.diagnostics.snapshot(self)` را برمی‌گرداند (هر زمان امن).
+- **`ui/engine_bridge.py`** — متد passthrough `diagnostics()`.
+- **`ui/window.py`** — صفحه‌ی جدید **`DiagnosticsPage`**: یک **renderer نازک** که `engine.diagnostics()` را روی `QTimer` (هر ۱ ثانیه) poll می‌کند و فقط هنگام نمایشِ صفحه فعال است (`start_polling`/`stop_polling` در `_on_page_changed`). نمایش: کارت خلاصه (استراتژی فعال + وضعیت + پورت)، کارت throughput (نوار درصدِ recent/baseline + برچسب throttle + شمارش RST جعلی/بودجه + زنجیره‌های fallback)، و جدول کاندیداها (امتیاز/موفقیت/نمونه/outcome با نشانگر ★ برای انتخاب‌شده). آیتم navigation ششم «تشخیص» اضافه شد (Log به انتها رفت).
+- تست‌ها: `tests/test_diagnostics.py` (۷ تست هسته با AutoProber/ResilienceController واقعی) + `tests/test_diagnostics_page.py` (۵ تست render headless آف‌اسکرین، با skip مودبانه در نبود Qt). مجموعاً **۱۷۷ تست سبز** + smoke test موفق MainWindow (۶ صفحه، toggle شدن polling).
 
 ## 📌 یادداشت‌های فنی
 - WinDivert نیاز به admin دارد (`_ensure_admin` موجود حفظ شود).

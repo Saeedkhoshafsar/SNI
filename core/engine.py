@@ -113,6 +113,15 @@ class EngineController:
         mode = str(self.config.get("connection_mode", "SNI Only"))
         return self.profile is not None and mode != "SNI Only"
 
+    def diagnostics(self):
+        """Return a :class:`core.diagnostics.DiagnosticsSnapshot` of live state.
+
+        Safe to call any time (idle or running); the diagnostics layer tolerates
+        a not-yet-built prober / resilience controller and returns defaults.
+        """
+        from core.diagnostics import snapshot
+        return snapshot(self)
+
     # ------------------------------------------------------------------ start
 
     def start(self) -> None:
