@@ -39,6 +39,26 @@ def find_free_port(preferred: int | None = None) -> int:
         return s.getsockname()[1]
 
 
+def lan_ip_address() -> str:
+    """Best-effort primary LAN IPv4 of this machine (for sharing to a phone).
+
+    Uses the standard UDP-connect trick: no packet is actually sent, but the OS
+    picks the outbound interface, whose address is the one a phone on the same
+    Wi-Fi would reach. Falls back to ``127.0.0.1`` if it can't be determined.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
 class XrayManager:
     """Runs Xray-core for a given profile, optionally chained behind a spoofer."""
 
@@ -49,6 +69,7 @@ class XrayManager:
         http_port: int = 10809,
         spoof_port: int | None = None,
         gaming_mode: bool = False,
+        listen: str = "127.0.0.1",
     ):
         self.profile = profile
         self.socks_port = socks_port
@@ -56,6 +77,8 @@ class XrayManager:
         # if a spoofer sits in front, the outbound connects here instead
         self.spoof_port = spoof_port
         self.gaming_mode = gaming_mode
+        # inbound bind address: 0.0.0.0 shares the proxy with LAN devices
+        self.listen = listen
 
         self.xray_exe = os.path.join(get_bin_dir(), "xray.exe")
         self.config_path = os.path.join(get_runtime_dir(), "xray_config.json")
@@ -95,6 +118,7 @@ class XrayManager:
             dest_address=dest_address,
             dest_port=dest_port,
             gaming=self.gaming_mode,
+            listen=self.listen,
         )
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         with open(self.config_path, "w", encoding="utf-8") as fp:
@@ -136,10 +160,17 @@ class XrayManager:
                      f" → {self.profile.address}:{self.profile.port})"
                      if self.spoof_port else
                      f"  (direct → {self.profile.address}:{self.profile.port})")
+            host = self.listen if self.listen != "0.0.0.0" else "127.0.0.1"
             self._log(
                 f"Xray started [{self.profile.protocol}]  →  "
-                f"SOCKS5 127.0.0.1:{self.socks_port}"
-                f"  |  HTTP 127.0.0.1:{self.http_port}{chain}")
+                f"SOCKS5 {host}:{self.socks_port}"
+                f"  |  HTTP {host}:{self.http_port}{chain}")
+            if self.listen == "0.0.0.0":
+                lan_ip = lan_ip_address()
+                self._log(
+                    f"اشتراک LAN روشن — از گوشی به این آدرس وصل شوید: "
+                    f"SOCKS5 {lan_ip}:{self.socks_port}  |  "
+                    f"HTTP {lan_ip}:{self.http_port}")
         except Exception as exc:
             self._log(f"Failed to start Xray: {exc}")
 

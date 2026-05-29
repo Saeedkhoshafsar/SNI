@@ -430,12 +430,14 @@ class EngineController:
         if use_core:
             assert self.profile is not None
             from core.xray_manager import XrayManager
+            allow_lan = bool(self.config.get("allow_lan", False))
             self._xray = XrayManager(
                 self.profile,
                 socks_port=int(self.config.get("socks_port", 10808)),
                 http_port=int(self.config.get("http_port", 10809)),
                 spoof_port=self._spoof_port,
                 gaming_mode=bool(self.config.get("gaming_mode", False)),
+                listen="0.0.0.0" if allow_lan else "127.0.0.1",
             )
             self._xray.on_log = self._log
             if not self._xray.is_available:

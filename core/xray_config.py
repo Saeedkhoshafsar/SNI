@@ -152,8 +152,14 @@ def build_outbound(p: Profile, *, dest_address: str | None = None,
 def build_config(p: Profile, *, socks_port: int = 10808,
                  http_port: int = 10809, dest_address: str | None = None,
                  dest_port: int | None = None, gaming: bool = False,
+                 listen: str = "127.0.0.1",
                  loglevel: str = "warning") -> dict[str, Any]:
-    """Assemble the full Xray config (inbounds + outbound + routing)."""
+    """Assemble the full Xray config (inbounds + outbound + routing).
+
+    ``listen`` is the inbound bind address: ``127.0.0.1`` (default, local only)
+    or ``0.0.0.0`` to share the proxy with other devices on the LAN (e.g. a
+    phone). LAN sharing is opt-in because it exposes the proxy to the network.
+    """
     outbound = build_outbound(
         p, dest_address=dest_address, dest_port=dest_port, gaming=gaming)
 
@@ -163,7 +169,7 @@ def build_config(p: Profile, *, socks_port: int = 10808,
             {
                 "tag": "socks-in",
                 "port": socks_port,
-                "listen": "127.0.0.1",
+                "listen": listen,
                 "protocol": "socks",
                 "settings": {"auth": "noauth", "udp": True},
                 "sniffing": {
@@ -174,7 +180,7 @@ def build_config(p: Profile, *, socks_port: int = 10808,
             {
                 "tag": "http-in",
                 "port": http_port,
-                "listen": "127.0.0.1",
+                "listen": listen,
                 "protocol": "http",
                 "settings": {},
             },

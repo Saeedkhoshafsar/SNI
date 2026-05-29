@@ -167,5 +167,35 @@ def _store_profiles(page):
     return page._store.profiles
 
 
+@unittest.skipUnless(_HAVE_QT, "PySide6 / Qt platform unavailable")
+class LanSettingsTest(unittest.TestCase):
+    """SettingsPage LAN-sharing toggle (share proxy to a phone)."""
+
+    def _page(self):
+        from ui.window import SettingsPage
+        return SettingsPage()
+
+    def test_lan_toggle_roundtrips_through_config(self):
+        page = self._page()
+        page.load_from({"allow_lan": True})
+        self.assertTrue(page.chk_lan.isChecked())
+        self.assertTrue(page.collect()["allow_lan"])
+        page.chk_lan.setChecked(False)
+        self.assertFalse(page.collect()["allow_lan"])
+
+    def test_lan_off_by_default(self):
+        page = self._page()
+        page.load_from({})
+        self.assertFalse(page.chk_lan.isChecked())
+        self.assertIn("127.0.0.1", page.lan_hint.text())
+
+    def test_lan_hint_shows_address_when_on(self):
+        page = self._page()
+        page.chk_lan.setChecked(True)   # toggled → hint updates
+        hint = page.lan_hint.text()
+        self.assertIn("SOCKS5", hint)
+        self.assertIn(str(page.spin_socks.value()), hint)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -18,7 +18,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPlainTextEdit, QProgressBar, QPushButton,
     QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
@@ -334,6 +334,16 @@ class SettingsPage(QWidget):
         self.connect_ip = QLineEdit("www.speedtest.net")
         form.addWidget(self.connect_ip)
 
+        # --- LAN sharing (use the proxy from a phone on the same Wi-Fi) ---
+        self.chk_lan = QCheckBox(
+            "اشتراک LAN — پروکسی روی شبکه‌ی محلی باز شود (برای گوشی)")
+        form.addWidget(self.chk_lan)
+        self.lan_hint = QLabel("")
+        self.lan_hint.setObjectName("Muted")
+        self.lan_hint.setWordWrap(True)
+        form.addWidget(self.lan_hint)
+        self.chk_lan.toggled.connect(self._update_lan_hint)
+
         save_row = QHBoxLayout()
         save_row.addStretch(1)
         self.btn_save = QPushButton("ذخیره")
@@ -355,6 +365,8 @@ class SettingsPage(QWidget):
         self.spin_listen.setValue(int(cfg.get("LISTEN_PORT", 40443)))
         self.spin_socks.setValue(int(cfg.get("socks_port", 10808)))
         self.connect_ip.setText(str(cfg.get("CONNECT_IP", "")))
+        self.chk_lan.setChecked(bool(cfg.get("allow_lan", False)))
+        self._update_lan_hint(self.chk_lan.isChecked())
 
     def collect(self) -> dict:
         """Read the widgets back into a config dict fragment."""
@@ -364,7 +376,24 @@ class SettingsPage(QWidget):
             "LISTEN_PORT": self.spin_listen.value(),
             "socks_port": self.spin_socks.value(),
             "CONNECT_IP": self.connect_ip.text().strip(),
+            "allow_lan": self.chk_lan.isChecked(),
         }
+
+    def _update_lan_hint(self, on: bool) -> None:
+        """Show the LAN address the phone should use when sharing is on."""
+        if not on:
+            self.lan_hint.setText(
+                "خاموش — پروکسی فقط روی همین کامپیوتر (127.0.0.1) در دسترس است")
+            return
+        try:
+            from core.xray_manager import lan_ip_address
+            ip = lan_ip_address()
+        except Exception:
+            ip = "<IP این کامپیوتر>"
+        port = self.spin_socks.value()
+        self.lan_hint.setText(
+            f"روشن — در گوشی، پروکسی SOCKS5 را روی {ip}:{port} تنظیم کنید "
+            f"(هر دو دستگاه باید روی یک شبکه/Wi-Fi باشند)")
 
     def _field_label(self, t: str) -> QLabel:
         lbl = QLabel(t)

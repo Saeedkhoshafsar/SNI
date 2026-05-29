@@ -33,6 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "FAKE_SNI": "www.speedtest.net",
     "socks_port": 10808,
     "http_port": 10809,
+    "allow_lan": False,           # bind socks/http on 0.0.0.0 so LAN devices (phone) can use it
     "bypass_method": "wrong_seq",
     "gaming_mode": False,
     "auto_prober": False,

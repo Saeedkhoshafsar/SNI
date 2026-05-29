@@ -52,12 +52,13 @@ class FakeXray:
     last_instance = None
 
     def __init__(self, profile, socks_port=10808, http_port=10809,
-                 spoof_port=None, gaming_mode=False):
+                 spoof_port=None, gaming_mode=False, listen="127.0.0.1"):
         self.profile = profile
         self.socks_port = socks_port
         self.http_port = http_port
         self.spoof_port = spoof_port
         self.gaming_mode = gaming_mode
+        self.listen = listen
         self.on_log = None
         self.started = False
         self.stopped = False
@@ -412,6 +413,33 @@ class EngineControllerTest(unittest.TestCase):
             sr.TRUSTED_PUBLIC_KEY_HEX = saved_pk
             sr.urllib_fetcher = saved_fetch
             prober_mod.tcp_probe = saved_probe
+
+    def test_allow_lan_binds_xray_on_all_interfaces(self):
+        ctrl = EngineController({
+            "connection_mode": "SNI + Warp",  # use_core → xray is built
+            "LISTEN_PORT": 40443, "CONNECT_IP": "1.1.1.1", "CONNECT_PORT": 443,
+            "bypass_method": "wrong_seq", "allow_lan": True,
+        })
+        ctrl.set_profile(Profile(protocol="vless", address="srv.example.com",
+                                 port=8443, uuid="x"))
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        self.assertIsNotNone(FakeXray.last_instance)
+        self.assertEqual(FakeXray.last_instance.listen, "0.0.0.0")
+        ctrl.stop()
+
+    def test_local_only_binds_loopback(self):
+        ctrl = EngineController({
+            "connection_mode": "SNI + Warp",
+            "LISTEN_PORT": 40443, "CONNECT_IP": "1.1.1.1", "CONNECT_PORT": 443,
+            "bypass_method": "wrong_seq", "allow_lan": False,
+        })
+        ctrl.set_profile(Profile(protocol="vless", address="srv.example.com",
+                                 port=8443, uuid="x"))
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        self.assertEqual(FakeXray.last_instance.listen, "127.0.0.1")
+        ctrl.stop()
 
     def test_resilience_chain_includes_extra_ips(self):
         ctrl = EngineController({

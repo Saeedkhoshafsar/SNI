@@ -115,6 +115,19 @@ def test_full_config_valid_json_and_inbounds():
     assert cfg["routing"]["rules"][0]["outboundTag"] == "direct"
 
 
+def test_inbounds_listen_localhost_by_default():
+    cfg = build_config(_vless_ws_tls())
+    for ib in cfg["inbounds"]:
+        assert ib["listen"] == "127.0.0.1"
+
+
+def test_inbounds_listen_lan_when_shared():
+    """allow_lan → both inbounds bind 0.0.0.0 so a phone can connect."""
+    cfg = build_config(_vless_ws_tls(), listen="0.0.0.0")
+    for ib in cfg["inbounds"]:
+        assert ib["listen"] == "0.0.0.0"
+
+
 def test_gaming_mode_sockopt():
     cfg = build_config(_vless_ws_tls(), gaming=True)
     ss = cfg["outbounds"][0]["streamSettings"]
@@ -139,6 +152,21 @@ def test_manager_chain_wiring(tmp_path=None):
         cfg = json.load(fp)
     v = cfg["outbounds"][0]["settings"]["vnext"][0]
     assert v["address"] == "127.0.0.1" and v["port"] == port
+
+
+def test_manager_lan_listen_propagates():
+    from core.xray_manager import XrayManager
+    mgr = XrayManager(_vless_ws_tls(), listen="0.0.0.0")
+    path = mgr.generate_config()
+    with open(path, encoding="utf-8") as fp:
+        cfg = json.load(fp)
+    assert all(ib["listen"] == "0.0.0.0" for ib in cfg["inbounds"])
+
+
+def test_lan_ip_address_returns_string():
+    from core.xray_manager import lan_ip_address
+    ip = lan_ip_address()
+    assert isinstance(ip, str) and ip.count(".") == 3
 
 
 def test_manager_direct_wiring():
