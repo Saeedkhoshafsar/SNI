@@ -57,6 +57,7 @@ class EngineController:
         # internals
         self._proxy = None            # main.ProxyServer
         self._xray = None             # core.xray_manager.XrayManager
+        self._prober = None           # core.prober.AutoProber (when enabled)
         self._spoof_port: Optional[int] = None
         self._status = STATUS_IDLE
         self._lock = threading.RLock()
@@ -130,6 +131,46 @@ class EngineController:
             self._set_status(STATUS_ERROR)
             self.stop()
 
+    def _choose_bypass_method(self, host: str, port: int) -> str:
+        """Pick the bypass method: auto-probe when enabled, else the config one.
+
+        When ``auto_prober`` is on, build candidates from the implemented
+        strategies (ordered by their static prior), probe them against the real
+        upstream and lock the best. Falls back to the configured method on any
+        failure / no host, so Start never blocks on the prober.
+        """
+        configured = str(self.config.get("bypass_method", "wrong_seq"))
+        if not self.config.get("auto_prober", False):
+            return configured
+        if not host:
+            self._log("auto-prober: مقصدی برای probe نیست — از روش پیکربندی‌شده استفاده می‌شود")
+            return configured
+        try:
+            from strategies import all_strategies
+            from core.prober import AutoProber, build_candidates, tcp_probe
+
+            keys = [s.meta.key for s in all_strategies(implemented_only=True)]
+            scored = {s.meta.key: s.score()
+                      for s in all_strategies(implemented_only=True)}
+            candidates = AutoProber.candidate_order(
+                scored, build_candidates(
+                    keys,
+                    fragment_tcp=bool(self.config.get("fragment_tcp", False)),
+                    fragment_tls=bool(self.config.get("fragment_tls", False)),
+                    tls_chunk=int(self.config.get("fragment_tls_chunk", 64)),
+                ))
+            self._prober = AutoProber(
+                candidates, tcp_probe, on_log=self._log,
+                timeout=float(self.config.get("probe_timeout", 5.0)))
+            best = self._prober.run(host, port)
+            if best is None:
+                self._log("auto-prober: کاندیدای موفقی نبود — بازگشت به روش پیکربندی‌شده")
+                return configured
+            return best.strategy
+        except Exception as exc:  # prober must never block Start
+            self._log(f"auto-prober خطا داد ({exc}) — از روش پیکربندی‌شده استفاده می‌شود")
+            return configured
+
     def _do_start(self) -> None:
         use_core = self.uses_core
 
@@ -160,10 +201,12 @@ class EngineController:
             "FAKE_SNI": str(self.config.get("FAKE_SNI", "www.speedtest.net")),
             "gaming_mode": bool(self.config.get("gaming_mode", False)),
         }
+        # choose the bypass method: auto-probe if enabled, else the configured one
+        bypass_method = self._choose_bypass_method(connect_ip, connect_port)
+
         from main import ProxyServer
         self._proxy = ProxyServer(proxy_cfg)
-        self._proxy.bypass_method = str(
-            self.config.get("bypass_method", "wrong_seq"))
+        self._proxy.bypass_method = bypass_method
         self._proxy.on_log = self._log
         self._proxy.on_status_change = self._on_proxy_status
         self._proxy.on_connection_count_change = self._emit_count

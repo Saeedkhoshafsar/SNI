@@ -199,6 +199,57 @@ class EngineControllerTest(unittest.TestCase):
         ctrl.stop()  # must not raise
         self.assertEqual(ctrl.status, STATUS_IDLE)
 
+    # -- auto-prober integration -----------------------------------------
+
+    def test_auto_prober_picks_winner_and_sets_bypass_method(self):
+        import core.prober as prober_mod
+        from core.prober import ProbeResult, OK, RST
+
+        # fake probe: only "fake_ttl" succeeds, everything else RSTs
+        def fake_probe(candidate, host, port, timeout):
+            if candidate.strategy == "fake_ttl":
+                return ProbeResult(candidate, OK, latency_ms=5.0)
+            return ProbeResult(candidate, RST)
+
+        saved = prober_mod.tcp_probe
+        prober_mod.tcp_probe = fake_probe
+        try:
+            ctrl = EngineController({
+                "connection_mode": "SNI Only",
+                "LISTEN_PORT": 40443, "CONNECT_IP": "9.9.9.9", "CONNECT_PORT": 443,
+                "auto_prober": True, "bypass_method": "wrong_seq",
+            })
+            ctrl.start()
+            self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+            # engine must have locked onto the only successful candidate
+            self.assertEqual(FakeProxy.last_instance.bypass_method, "fake_ttl")
+            ctrl.stop()
+        finally:
+            prober_mod.tcp_probe = saved
+
+    def test_auto_prober_falls_back_when_all_fail(self):
+        import core.prober as prober_mod
+        from core.prober import ProbeResult, RST
+
+        def all_fail(candidate, host, port, timeout):
+            return ProbeResult(candidate, RST)
+
+        saved = prober_mod.tcp_probe
+        prober_mod.tcp_probe = all_fail
+        try:
+            ctrl = EngineController({
+                "connection_mode": "SNI Only",
+                "LISTEN_PORT": 40443, "CONNECT_IP": "9.9.9.9", "CONNECT_PORT": 443,
+                "auto_prober": True, "bypass_method": "multi_fake",
+            })
+            ctrl.start()
+            self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+            # no candidate succeeded → fall back to the configured method
+            self.assertEqual(FakeProxy.last_instance.bypass_method, "multi_fake")
+            ctrl.stop()
+        finally:
+            prober_mod.tcp_probe = saved
+
 
 if __name__ == "__main__":
     unittest.main()

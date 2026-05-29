@@ -15,7 +15,7 @@ step 3; dynamic animations land in step 2.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -452,8 +452,12 @@ class ProfilesPage(QWidget):
 class StrategyPage(QWidget):
     """The 'final boss' surface — arsenal of bypass strategies + auto-prober."""
 
-    def __init__(self, parent=None):
+    # emitted when the auto-prober toggle changes (True == enabled)
+    auto_prober_changed = Signal(bool)
+
+    def __init__(self, store: "ConfigStore | None" = None, parent=None):
         super().__init__(parent)
+        self.store = store
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
         root.setSpacing(16)
@@ -475,8 +479,13 @@ class StrategyPage(QWidget):
         col.addWidget(desc)
         row.addLayout(col)
         row.addStretch(1)
-        self.btn_autoprobe = QPushButton("فعال‌سازی")
+        self.btn_autoprobe = QPushButton()
         self.btn_autoprobe.setObjectName("Ghost")
+        self.btn_autoprobe.setCheckable(True)
+        enabled = bool(store.get("auto_prober", False)) if store else False
+        self.btn_autoprobe.setChecked(enabled)
+        self._sync_autoprobe_label(enabled)
+        self.btn_autoprobe.toggled.connect(self._on_autoprobe_toggled)
         row.addWidget(self.btn_autoprobe)
         apb.addLayout(row)
         root.addWidget(ap)
@@ -486,6 +495,15 @@ class StrategyPage(QWidget):
             root.addWidget(self._strategy_row(key, name, desc))
 
         root.addStretch(1)
+
+    def _sync_autoprobe_label(self, enabled: bool) -> None:
+        self.btn_autoprobe.setText("فعال ✓" if enabled else "فعال‌سازی")
+
+    def _on_autoprobe_toggled(self, enabled: bool) -> None:
+        self._sync_autoprobe_label(enabled)
+        if self.store is not None:
+            self.store.set("auto_prober", bool(enabled))
+        self.auto_prober_changed.emit(bool(enabled))
 
     def _strategy_row(self, key: str, name: str, desc: str) -> Card:
         c = Card(object_name="CardAlt")
@@ -595,7 +613,8 @@ class MainWindow(QWidget):
         self.page_dashboard = DashboardPage(self._palette)
         self.page_profiles = ProfilesPage(self.store)
         self.page_settings = SettingsPage()
-        self.page_strategy = StrategyPage()
+        self.page_strategy = StrategyPage(self.store)
+        self.page_strategy.auto_prober_changed.connect(self._on_auto_prober_changed)
         self.page_log = LogPage()
         for p in (self.page_dashboard, self.page_profiles, self.page_settings,
                   self.page_strategy, self.page_log):
@@ -663,6 +682,16 @@ class MainWindow(QWidget):
         self.engine.set_profile(profile)
         if profile:
             self.page_log.append(f"[profile] انتخاب شد: {profile.display_name}")
+
+    def _on_auto_prober_changed(self, enabled: bool):
+        # the StrategyPage already persisted the flag; push it to the live engine
+        self.store.save_config()
+        self.engine.update_config(self.store.config)
+        self.page_log.append(
+            f"[auto-prober] {'فعال شد' if enabled else 'غیرفعال شد'}")
+        Toast.show_message(
+            self, "پراب خودکار فعال شد" if enabled else "پراب خودکار غیرفعال شد",
+            "ok")
 
     def _save_settings(self):
         self.store.update(**self.page_settings.collect())

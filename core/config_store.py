@@ -36,6 +36,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "bypass_method": "wrong_seq",
     "gaming_mode": False,
     "auto_prober": False,
+    "probe_timeout": 5.0,         # per-candidate probe timeout (seconds)
     # fragmentation layer (core.fragment) — independent of the inject method
     "fragment_tcp": False,        # split the real ClientHello across TCP segments
     "fragment_tls": False,        # rewrite the ClientHello as smaller TLS records
