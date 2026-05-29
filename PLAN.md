@@ -15,10 +15,16 @@
 ## 🎯 تصمیمات معماری (قطعی)
 
 - **پلتفرم:** فقط Windows (نیاز به WinDivert + admin). اندروید/لینوکس حذف از scope فعلی.
-- **UI:** مهاجرت از tkinter به **PySide6 (Qt6)** — تنها راه عملی برای شیشه‌ای/Mica/سایه/
-  انیمیشن نرم/تم پویا روی ویندوز. tkinter قدیمی بازنشسته می‌شود (`gui.py`/`gui_old2.py`).
+- **UI:** مهاجرت از tkinter به **PySide6 (Qt6)**. حس بصری: **گیمینگ × هکری** —
+  دارک مات عمیق، accent نئونی سایان، سایه‌ی مینیمال، بدج‌های مونواسپیس ترمینالی،
+  تم لایت/دارک. tkinter قدیمی بازنشسته می‌شود (`gui.py`/`gui_old2.py`).
 - **هسته‌ی bypass:** نگه‌داشتن `ProxyServer` + `TransparentSpoofServer` موجود، اما
   استخراج تکنیک تزریق به یک **StrategyEngine** ماژولار که چند تکنیک را پشتیبانی کند.
+- **یکپارچه‌سازی هسته (سبک v2rayN):** یک نرم‌افزار، یک کلیک. کاربر فقط
+  **share link** (`vless://`/`vmess://`/`trojan://`/`ss://`) یا **Subscription URL** وارد می‌کند؛
+  برنامه خودش پارس می‌کند، xray config می‌سازد، و SNI-spoofing را **خودکار زیر
+  همان اتصال زنجیر می‌کند** (forwarder روی `40443` داخلی/نامرئی — کاربر نمی‌بیند).
+  پشتیبانی چندپروتکل (VLESS/VMess/Trojan/Shadowsocks) به‌جای فقط trojan.
 - **هماهنگی:** هسته (engine/managers) کاملاً از UI جدا — UI فقط callback مصرف می‌کند.
 
 ---
@@ -27,15 +33,17 @@
 
 - [x] استپ ۱ — اسکلت UI حرفه‌ای PySide6 (تم لایت/دارک + شیشه‌ای/Mica + سایه + هدر/ناوبری)  ✅ 2026-05-29
 - [ ] استپ ۲ — اجزای پویا: کارت‌های انیمیشن‌دار، دکمه‌ی Start/Stop با حالت‌گذار نرم، toast/log زنده
-- [ ] استپ ۳ — اتصال UI به هسته (ProxyServer/Transparent/xray/vwarp) + مدیریت config + حالت‌ها
-- [ ] استپ ۴ — StrategyEngine: استخراج interface تکنیک + ثبت تکنیک‌های موجود (wrong_seq)
-- [ ] استپ ۵ — افزودن تکنیک‌ها: wrong_checksum (فعال‌سازی)، fake_ttl، multi-fake، split/disorder
-- [ ] استپ ۶ — لایه‌ی fragmentation: TCP split + TLS record fragmentation (مستقل از موقعیت)
-- [ ] استپ ۷ — **غول آخر: Auto-Prober** — تست خودکار استراتژی‌ها، ranking، انتخاب/قفل خودکار
-- [ ] استپ ۸ — تاب‌آوری: تشخیص RST جعلی، throttle، چرخش CONNECT_IP/استراتژی، fallback chain
-- [ ] استپ ۹ — strategies.json از راه دور (mirror + امضا) برای آپدیت بدون انتشار اپ
-- [ ] استپ ۱۰ — صفحه‌ی Strategy/Diagnostics در UI (نمایش استراتژی فعال، نمودار سلامت، probeها)
-- [ ] استپ ۱۱ — Packaging: PyInstaller (یک exe)، آیکون، تست build، bundle نهایی
+- [ ] استپ ۳ — **پارسر share-link + subscription** (vless/vmess/trojan/ss) → مدل پروفایل
+- [ ] استپ ۴ — **یکپارچه‌سازی هسته v2rayN-style** + زنجیر خودکار spoofing زیر اتصال (حذف 127.0.0.1:40443 دستی)
+- [ ] استپ ۵ — اتصال UI به هسته (پروفایل‌ها/start/stop/callbackها) + مدیریت config
+- [ ] استپ ۶ — StrategyEngine: استخراج interface تکنیک + ثبت تکنیک‌های موجود (wrong_seq)
+- [ ] استپ ۷ — افزودن تکنیک‌ها: wrong_checksum (فعال‌سازی)، fake_ttl، multi-fake، split/disorder
+- [ ] استپ ۸ — لایه‌ی fragmentation: TCP split + TLS record fragmentation (مستقل از موقعیت)
+- [ ] استپ ۹ — **غول آخر: Auto-Prober** — تست خودکار استراتژی‌ها، ranking، انتخاب/قفل خودکار
+- [ ] استپ ۱۰ — تاب‌آوری: تشخیص RST جعلی، throttle، چرخش CONNECT_IP/استراتژی، fallback chain
+- [ ] استپ ۱۱ — strategies.json از راه دور (mirror + امضا) برای آپدیت بدون انتشار اپ
+- [ ] استپ ۱۲ — صفحه‌ی Strategy/Diagnostics در UI (نمایش استراتژی فعال، نمودار سلامت، probeها)
+- [ ] استپ ۱۳ — Packaging: PyInstaller (یک exe)، آیکون، تست build، bundle نهایی
 
 ---
 
@@ -53,38 +61,49 @@
 کارت‌های متحرک (fade/slide در ورود)، دکمه‌ی Start/Stop با ripple/گذار رنگ، نوار وضعیت
 زنده، toastهای لاگ، اسپینر/نبض هنگام probe. انیمیشن با `QPropertyAnimation`.
 
-### استپ ۳ — اتصال UI ↔ هسته
-بازنویسی منطق start/stop حالت‌ها در لایه‌ی Qt، اتصال callbackهای on_log/on_status/
-on_count به سیگنال‌های Qt (thread-safe)، فرم تنظیمات کامل، بارگذاری/ذخیره config.
+### استپ ۳ — پارسر share-link + subscription
+پارس `vless://`/`vmess://`(base64 json)/`trojan://`/`ss://` به یک مدل پروفایل
+یکپارچه، دکد base64، URL-decode، پارس query params (sni/host/path/type/security/fp…)،
+واکشی سابسکریپشن (base64 چندخطی) → لیست پروفایل‌ها. تست unit روی نمونه‌ها.
 
-### استپ ۴ — StrategyEngine (اسکلت)
+### استپ ۴ — یکپارچه‌سازی هسته (v2rayN-style)
+تعمیم `XrayManager` به همه‌ی پروتکل‌ها (vless/vmess/trojan/ss outbound، reality/ws/grpc/tcp)،
+ساخت خودکار outbound از پروفایل، و **زنجیر خودکار spoofing**: فورواردر داخلی
+روی پورت loopback با server_address و server_port پروفایل تزریق می‌شود — کاربر هیچ پورتی
+دستی وارد نمی‌کند. یک کلیک = spoof + core با هم.
+
+### استپ ۵ — اتصال UI ↔ هسته
+اتصال callbackهای on_log/on_status/on_count به سیگنال‌های Qt (thread-safe)، لیست
+پروفایل‌ها + دکمه‌ی import-from-clipboard + start/stop، بارگذاری/ذخیره config و پروفایل‌ها.
+
+### استپ ۶ — StrategyEngine (اسکلت)
 interface `BypassStrategy` (متد `apply(packet/conn)` + `probe()` + متادیتا)، رجیستری
 استراتژی‌ها، refactor تزریق فعلی به استراتژی `WrongSeqStrategy`.
 
-### استپ ۵ — تکنیک‌های injection
+### استپ ۷ — تکنیک‌های injection
 فعال‌سازی `wrong_checksum` (کد کامنت‌شده)، `fake_ttl` (TTL پایین برای fake)، `multi_fake`
 (چند SNI whitelisted)، `fake_disorder` (تزریق + ارسال نامرتب). هرکدام یک Strategy.
 
-### استپ ۶ — fragmentation
+### استپ ۸ — fragmentation
 TCP segmentation (split ClientHello روی SNI) + TLS record fragmentation. قابل ترکیب با
 fake. این لایه حتی بدون injection هم کار می‌کند (مسیر آینده‌ی چندپلتفرمی).
 
-### استپ ۷ — غول آخر: Auto-Prober
+### استپ ۹ — غول آخر: Auto-Prober
 موتوری که هنگام Start، چند استراتژی را موازی روی CONNECT_IP تست می‌کند (آیا ServerHello
 واقعی برگشت؟ RST؟ latency؟)، امتیاز می‌دهد، بهترین را انتخاب و قفل می‌کند؛ با sliding-window
 سلامت را پایش می‌کند و در صورت افت، دوباره probe و سوییچ خودکار. → بن‌بست‌ناپذیری.
 
-### استپ ۸ — تاب‌آوری
+### استپ ۱۰ — تاب‌آوری
 تشخیص RST جعلی (drop کردنش)، تشخیص throttle (افت throughput)، چرخش خودکار
 CONNECT_IP از pool + سوییچ استراتژی، زنجیره‌ی fallback.
 
-### استپ ۹ — strategies.json از راه دور
+### استپ ۱۱ — strategies.json از راه دور
 فرمت JSON استراتژی‌ها، fetch از چند mirror، امضای ed25519، اعمال داغ بدون restart.
 
-### استپ ۱۰ — صفحه‌ی Strategy/Diagnostics
+### استپ ۱۲ — صفحه‌ی Strategy/Diagnostics
 نمایش استراتژی فعال + امتیاز هرکدام + لاگ probe + نمودار throughput/latency زنده.
 
-### استپ ۱۱ — Packaging
+### استپ ۱۳ — Packaging
 PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکون، تست، bundle.
 
 ---

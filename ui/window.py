@@ -75,13 +75,14 @@ def _section_title(text: str, sub: str = "") -> QWidget:
     return w
 
 
-def _stat_card(value: str, label: str, accent: bool = False) -> Card:
+def _stat_card(value: str, label: str, accent_color: str | None = None) -> Card:
     c = Card(object_name="CardAlt")
     b = c.body()
     v = QLabel(value)
     v.setObjectName("H1")
-    if accent:
-        v.setProperty("class", "AccentText")
+    if accent_color:
+        # inline colour overrides the #H1 rule reliably
+        v.setStyleSheet(f"color: {accent_color};")
     cap = QLabel(label)
     cap.setObjectName("Muted")
     b.addWidget(v)
@@ -126,7 +127,8 @@ class DashboardPage(QWidget):
         # --- quick stats row ---
         stats = QHBoxLayout()
         stats.setSpacing(14)
-        self.stat_conns = _stat_card("0", "اتصالات فعال", accent=True)
+        self.stat_conns = _stat_card("0", "اتصالات فعال",
+                                     accent_color=get_palette("dark").accent)
         self.stat_mode = _stat_card("SNI Only", "حالت")
         self.stat_strategy = _stat_card("wrong_seq", "استراتژی فعال")
         for c in (self.stat_conns, self.stat_mode, self.stat_strategy):
@@ -254,7 +256,7 @@ class StrategyPage(QWidget):
         row.addLayout(col)
         row.addStretch(1)
         badge = QLabel(key)
-        badge.setObjectName("Faint")
+        badge.setObjectName("Mono")
         row.addWidget(badge)
         b.addLayout(row)
         return c

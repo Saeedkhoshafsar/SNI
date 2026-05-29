@@ -49,47 +49,59 @@ class Palette:
     pad: int = 14
 
 
+# ── Gaming × Hacker dark ──────────────────────────────────────────────
+# Deep matte near-black surfaces with a single bright neon-cyan accent and a
+# violet "gaming" secondary. Minimal soft shadows, hairline borders, mono feel
+# for technical zones. The accent is intentionally vivid against matte panels.
 DARK = Palette(
     name="dark",
-    base="#0f1115",
-    surface="rgba(30, 33, 43, 0.72)",
-    surface_alt="rgba(42, 46, 60, 0.78)",
-    elevated="#1b1e27",
-    border="rgba(255, 255, 255, 0.07)",
-    text="#e6e9f0",
-    text_muted="#9aa0b0",
-    text_faint="#5b6172",
-    accent="#7c9cff",
-    accent_hover="#93acff",
-    accent_press="#6485f0",
-    on_accent="#0c0f17",
-    success="#65d6a0",
-    warning="#f2c879",
-    danger="#f08c9e",
-    shadow="rgba(0, 0, 0, 0.55)",
+    base="#0a0c10",                       # deep matte near-black
+    surface="rgba(18, 22, 28, 0.82)",     # matte panel
+    surface_alt="rgba(28, 34, 42, 0.88)", # raised / hovered
+    elevated="#12161c",
+    border="rgba(120, 230, 255, 0.10)",   # faint cyan hairline
+    text="#d7e3ec",
+    text_muted="#7d8b99",
+    text_faint="#4a5663",
+    accent="#27e0c8",                      # neon cyan-teal (hacker)
+    accent_hover="#46f0d8",
+    accent_press="#13c6b0",
+    on_accent="#04130f",
+    success="#41e08a",
+    warning="#ffcf5c",
+    danger="#ff6b81",
+    shadow="rgba(0, 0, 0, 0.65)",
     is_dark=True,
 )
 
+# Secondary "gaming" accent (violet) — used by widgets/animations in step 2.
+ACCENT2_DARK = "#9b7bff"
+
+# Light variant keeps the same neon family but on warm-white matte surfaces,
+# so toggling preserves the product's identity rather than feeling like a
+# different app.
 LIGHT = Palette(
     name="light",
-    base="#eef1f6",
-    surface="rgba(255, 255, 255, 0.78)",
-    surface_alt="rgba(238, 241, 248, 0.9)",
+    base="#eef2f4",
+    surface="rgba(255, 255, 255, 0.86)",
+    surface_alt="rgba(226, 234, 236, 0.92)",
     elevated="#ffffff",
-    border="rgba(15, 20, 35, 0.08)",
-    text="#1b1f2a",
-    text_muted="#5c6478",
-    text_faint="#9aa1b3",
-    accent="#4d6bf0",
-    accent_hover="#3f5ee6",
-    accent_press="#3552d6",
+    border="rgba(10, 60, 70, 0.12)",
+    text="#10171c",
+    text_muted="#48565f",
+    text_faint="#8a98a0",
+    accent="#0aa896",                      # deeper teal for contrast on light
+    accent_hover="#089483",
+    accent_press="#077a6c",
     on_accent="#ffffff",
-    success="#1f9d6b",
-    warning="#c98a1e",
-    danger="#d8536c",
-    shadow="rgba(40, 50, 80, 0.20)",
+    success="#0f9d5b",
+    warning="#bf8410",
+    danger="#d8415c",
+    shadow="rgba(20, 40, 50, 0.18)",
     is_dark=False,
 )
+
+ACCENT2_LIGHT = "#7a52e8"
 
 THEMES = {"dark": DARK, "light": LIGHT}
 
@@ -133,6 +145,11 @@ def build_qss(p: Palette) -> str:
     QLabel#H2 {{ font-size: 16px; font-weight: 600; color: {p.text}; }}
     QLabel#Muted {{ color: {p.text_muted}; }}
     QLabel#Faint {{ color: {p.text_faint}; font-size: 12px; }}
+    QLabel#Mono {{
+        font-family: "Cascadia Code", "JetBrains Mono", "Consolas", monospace;
+        color: {p.accent}; font-size: 12px; letter-spacing: 0.3px;
+    }}
+    QLabel[class="AccentText"] {{ color: {p.accent}; }}
 
     /* ---- Primary button ---- */
     QPushButton#Primary {{
@@ -169,15 +186,21 @@ def build_qss(p: Palette) -> str:
     QPushButton#WinBtn:hover {{ background: {p.surface_alt}; color: {p.text}; }}
     QPushButton#WinClose:hover {{ background: {p.danger}; color: #fff; }}
 
-    /* ---- Side navigation ---- */
+    /* ---- Side navigation (hacker rail w/ accent edge on active) ---- */
     QPushButton#NavItem {{
-        background: transparent; border: none; text-align: left;
+        background: transparent;
+        border: none;
+        border-left: 2px solid transparent;
+        text-align: left;
         padding: 11px 16px; border-radius: {p.radius_sm}px;
         color: {p.text_muted}; font-weight: 500;
     }}
     QPushButton#NavItem:hover    {{ background: {p.surface_alt}; color: {p.text}; }}
     QPushButton#NavItem:checked  {{
-        background: {p.surface_alt}; color: {p.accent}; font-weight: 600;
+        background: {p.surface_alt};
+        color: {p.accent};
+        border-left: 2px solid {p.accent};
+        font-weight: 600;
     }}
 
     /* ---- Inputs ---- */
