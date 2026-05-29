@@ -58,6 +58,7 @@ class EngineController:
         self._proxy = None            # main.ProxyServer
         self._xray = None             # core.xray_manager.XrayManager
         self._prober = None           # core.prober.AutoProber (when enabled)
+        self._resilience = None       # core.resilience.ResilienceController
         self._spoof_port: Optional[int] = None
         self._status = STATUS_IDLE
         self._lock = threading.RLock()
@@ -171,6 +172,63 @@ class EngineController:
             self._log(f"auto-prober خطا داد ({exc}) — از روش پیکربندی‌شده استفاده می‌شود")
             return configured
 
+    @property
+    def resilience(self):
+        """The active :class:`ResilienceController`, or ``None`` when disabled."""
+        return self._resilience
+
+    def _build_resilience(self, primary_method: str, connect_ip: str) -> None:
+        """Construct the resilience controller for this session.
+
+        Survives *active* censorship: it ignores forged (DPI-injected) RSTs up
+        to ``rst_budget`` then rotates the bypass strategy; on throttling it
+        rotates immediately; when strategies are exhausted it rotates the
+        upstream IP. The strategy fallback chain starts with the method we are
+        about to use, followed by the prober's ``fallback_order`` (when the
+        prober ran) or the other implemented strategies.
+        """
+        self._resilience = None
+        if not self.config.get("resilience", True):
+            return
+        try:
+            from core.resilience import ResilienceController, ThroughputMonitor
+
+            # strategy chain: primary first, then probed fallbacks / the rest
+            strat_chain = [primary_method]
+            if self._prober is not None:
+                try:
+                    for cand in self._prober.fallback_order():
+                        if cand.strategy not in strat_chain:
+                            strat_chain.append(cand.strategy)
+                except Exception:
+                    pass
+            if len(strat_chain) == 1:
+                from strategies import all_strategies
+                for s in all_strategies(implemented_only=True):
+                    if s.meta.key not in strat_chain:
+                        strat_chain.append(s.meta.key)
+
+            # IP chain: the upstream we're using, plus any configured alternates
+            ip_chain = [connect_ip] if connect_ip else []
+            for alt in self.config.get("CONNECT_IP_ALTS", []) or []:
+                if alt and alt not in ip_chain:
+                    ip_chain.append(str(alt))
+
+            ctrl = ResilienceController(
+                rst_budget=int(self.config.get("rst_budget", 3)),
+                throughput=ThroughputMonitor(
+                    throttle_ratio=float(self.config.get("throttle_ratio", 0.4))),
+                on_log=self._log,
+            )
+            ctrl.set_chains(strat_chain, ip_chain)
+            self._resilience = ctrl
+            self._log(
+                f"تاب‌آوری فعال شد (بودجه‌ی RST={ctrl.rst_budget}، "
+                f"زنجیره‌ی استراتژی={'→'.join(strat_chain)})")
+        except Exception as exc:  # resilience must never block Start
+            self._log(f"تاب‌آوری راه‌اندازی نشد ({exc}) — بدون آن ادامه می‌دهیم")
+            self._resilience = None
+
     def _do_start(self) -> None:
         use_core = self.uses_core
 
@@ -204,9 +262,16 @@ class EngineController:
         # choose the bypass method: auto-probe if enabled, else the configured one
         bypass_method = self._choose_bypass_method(connect_ip, connect_port)
 
+        # build the resilience controller for this session (forged-RST / throttle
+        # detection + strategy/IP rotation) so the runtime can consult it
+        self._build_resilience(bypass_method, connect_ip)
+
         from main import ProxyServer
         self._proxy = ProxyServer(proxy_cfg)
         self._proxy.bypass_method = bypass_method
+        # hand the spoofer the resilience controller if it knows how to use one
+        if self._resilience is not None and hasattr(self._proxy, "resilience"):
+            self._proxy.resilience = self._resilience
         self._proxy.on_log = self._log
         self._proxy.on_status_change = self._on_proxy_status
         self._proxy.on_connection_count_change = self._emit_count
@@ -257,5 +322,6 @@ class EngineController:
             except Exception as exc:
                 self._log(f"خطا در توقف spoofer: {exc}")
         self._spoof_port = None
+        self._resilience = None
         self._set_status(STATUS_IDLE)
         self._emit_count(0, 0)

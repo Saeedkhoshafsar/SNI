@@ -28,6 +28,7 @@ class FakeProxy:
     def __init__(self, config):
         self.config = config
         self.bypass_method = "wrong_seq"
+        self.resilience = None  # set by the engine when resilience is enabled
         self.on_log = None
         self.on_status_change = None
         self.on_connection_count_change = None
@@ -249,6 +250,59 @@ class EngineControllerTest(unittest.TestCase):
             ctrl.stop()
         finally:
             prober_mod.tcp_probe = saved
+
+
+    # -- resilience integration ------------------------------------------
+
+    def test_resilience_controller_built_and_handed_to_proxy(self):
+        ctrl = EngineController({
+            "connection_mode": "SNI Only",
+            "LISTEN_PORT": 40443, "CONNECT_IP": "1.2.3.4", "CONNECT_PORT": 443,
+            "bypass_method": "fake_ttl",
+            "resilience": True, "rst_budget": 2,
+        })
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        res = ctrl.resilience
+        self.assertIsNotNone(res)
+        # config knobs propagated
+        self.assertEqual(res.rst_budget, 2)
+        # the chosen method heads the strategy fallback chain
+        self.assertEqual(res.current_strategy, "fake_ttl")
+        # the upstream IP heads the IP chain
+        self.assertEqual(res.current_ip, "1.2.3.4")
+        # other implemented strategies follow as fallbacks
+        self.assertGreater(len(res._strategy_chain), 1)
+        # and the proxy received it
+        self.assertIs(FakeProxy.last_instance.resilience, res)
+        ctrl.stop()
+        self.assertIsNone(ctrl.resilience)  # cleared on stop
+
+    def test_resilience_can_be_disabled(self):
+        ctrl = EngineController({
+            "connection_mode": "SNI Only",
+            "LISTEN_PORT": 40443, "CONNECT_IP": "1.2.3.4", "CONNECT_PORT": 443,
+            "resilience": False,
+        })
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        self.assertIsNone(ctrl.resilience)
+        self.assertIsNone(FakeProxy.last_instance.resilience)
+        ctrl.stop()
+
+    def test_resilience_chain_includes_extra_ips(self):
+        ctrl = EngineController({
+            "connection_mode": "SNI Only",
+            "LISTEN_PORT": 40443, "CONNECT_IP": "1.1.1.1", "CONNECT_PORT": 443,
+            "bypass_method": "wrong_seq", "resilience": True,
+            "CONNECT_IP_ALTS": ["8.8.8.8", "9.9.9.9"],
+        })
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        res = ctrl.resilience
+        self.assertEqual(res.current_ip, "1.1.1.1")
+        self.assertEqual(res._ip_chain, ["1.1.1.1", "8.8.8.8", "9.9.9.9"])
+        ctrl.stop()
 
 
 if __name__ == "__main__":

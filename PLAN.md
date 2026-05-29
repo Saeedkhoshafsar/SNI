@@ -40,7 +40,7 @@
 - [x] استپ ۷ — افزودن تکنیک‌ها: wrong_checksum (فعال‌سازی)، fake_ttl، multi-fake، split/disorder  ✅ 2026-05-29
 - [x] استپ ۸ — لایه‌ی fragmentation: TCP split + TLS record fragmentation (مستقل از موقعیت)  ✅ 2026-05-29
 - [x] استپ ۹ — **غول آخر: Auto-Prober** — تست خودکار استراتژی‌ها، ranking، انتخاب/قفل خودکار  ✅ 2026-05-29
-- [ ] استپ ۱۰ — تاب‌آوری: تشخیص RST جعلی، throttle، چرخش CONNECT_IP/استراتژی، fallback chain
+- [x] استپ ۱۰ — تاب‌آوری: تشخیص RST جعلی، throttle، چرخش CONNECT_IP/استراتژی، fallback chain  ✅ 2026-05-29
 - [ ] استپ ۱۱ — strategies.json از راه دور (mirror + امضا) برای آپدیت بدون انتشار اپ
 - [ ] استپ ۱۲ — صفحه‌ی Strategy/Diagnostics در UI (نمایش استراتژی فعال، نمودار سلامت، probeها)
 - [ ] استپ ۱۳ — Packaging: PyInstaller (یک exe)، آیکون، تست build، bundle نهایی
@@ -162,6 +162,17 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **`ui/window.py`** — toggle «پراب خودکار» در StrategyPage حالا واقعی است: checkable، وضعیت اولیه از store، با `_on_autoprobe_toggled` مقدار `auto_prober` را persist می‌کند و سیگنال `auto_prober_changed` می‌دهد؛ MainWindow آن را به `engine.update_config` وصل می‌کند (toggle ↔ config ↔ engine، تست‌شده end-to-end به‌صورت headless).
 - تست‌ها: `tests/test_prober.py` (۲۰ تست، probe جعلی دترمینیستیک) + ۲ تست integration در `tests/test_engine.py` (انتخاب برنده با probe جعلی، و fallback وقتی همه شکست می‌خورند). مجموعاً **۱۱۶ تست سبز**.
 - **یادداشت بازیابی (2026-05-29):** پس از ری‌ست sandbox، کار استپ ۹ از بکاپ کاربر (`ZInsV2ss`) بازیابی شد. بکاپ شامل تغییرات `engine.py`/`config_store.py`/`ui/window.py`/`ARCHITECTURE.md`/`test_engine.py` بود؛ فایل‌های `core/prober.py` و `tests/test_prober.py` (که در بکاپ نبودند) از محتوای جلسه بازسازی شدند. صحت‌سنجی: ۱۱۶ تست سبز + smoke test موفق UI.
+
+## ✅ استپ ۱۰ — جزئیات پیاده‌سازی (2026-05-29)
+هدف: بقا در برابر سانسور **فعال** (نه فقط مسدودسازی منفعل). DPI پیشرفته دو کار می‌کند: ۱) RST جعلی تزریق می‌کند تا اتصال را قطع کند، ۲) به‌جای قطع، throttle می‌کند تا ابزار خراب به‌نظر برسد. این لایه هر دو را به سیگنال تبدیل می‌کند و با `fallback_order` پرابر، استراتژی/IP را می‌چرخاند.
+- **`core/resilience.py`** — لایه‌ی تاب‌آوری، کاملاً pure-data و **UI/شبکه‌مستقل** (هیچ import از pydivert یا Qt) تا روی sandbox تست شود:
+  - `RstClassifier` — تشخیص RST **جعلی** از واقعی با هیوریستیک موقعیت/زمان: اگر ServerHello یا داده‌ی اپ دیده شده باشد → LEGIT؛ اگر زودهنگام (≤ پنجره‌ی ۲۰۰ms) و بدون handshake → FORGED (همان reset مبتنی بر SNI)؛ TTL ناهمخوان نیز FORGED را تقویت می‌کند. RST جعلی نادیده گرفته می‌شود (سبک zapret).
+  - `ThroughputMonitor` — پنجره‌ی لغزان نرخ بایت؛ `recent_bps` فقط روی **دنباله‌ی اخیر** (`min_samples`) میانگین می‌گیرد تا نمونه‌های قدیمیِ پرسرعت، افت تازه را پنهان نکنند؛ `is_throttled` وقتی نرخ اخیر < `throttle_ratio × baseline` بماند.
+  - `ResilienceController` — سیاست واکنش: RST جعلی → `IGNORE_RST` تا سقف `rst_budget`، سپس `ROTATE_STRATEGY`؛ throttle → چرخش فوری استراتژی؛ پایان استراتژی‌ها → `ROTATE_IP`؛ پایان همه → `GIVE_UP`. زنجیره‌های استراتژی/IP از بیرون set می‌شوند تا با `fallback_order` پرابر هماهنگ شود.
+- **`core/engine.py`** — متد `_build_resilience(primary_method, connect_ip)`: هنگام Start یک `ResilienceController` می‌سازد؛ زنجیره‌ی استراتژی = روش انتخابی + خروجی `fallback_order()` پرابر (یا بقیه‌ی استراتژی‌های implemented)، زنجیره‌ی IP = `CONNECT_IP` + `CONNECT_IP_ALTS`. کنترلر از طریق property `engine.resilience` در دسترس است و در صورت پشتیبانی، به `ProxyServer.resilience` تحویل داده می‌شود تا runtime ویندوز هنگام دیدن RST/افت throughput با آن مشورت کند. روی هر خطا fail-soft (Start بلاک نمی‌شود)؛ روی stop پاک می‌شود.
+- **`core/config_store.py`** — کلیدهای `resilience` (پیش‌فرض True)، `rst_budget` (۳)، `throttle_ratio` (۰.۴) به `DEFAULT_CONFIG`.
+- تست‌ها: `tests/test_resilience.py` (۲۰ تست: کلاسبندی RST جعلی/واقعی/TTL، تشخیص/بازیابی throttle، بودجه/چرخش/پایان کنترلر) + ۳ تست integration در `tests/test_engine.py` (ساخت و تحویل کنترلر، خاموش‌کردن resilience، گنجاندن IPهای اضافی). مجموعاً **۱۳۹ تست سبز**.
+- **اعمال زنده:** خود drop کردن RST و چرخش استراتژی/IP در حین جلسه در runtime ویندوز (`fake_tcp.py`/`main.py` با pydivert) رخ می‌دهد؛ engine کنترلر و زنجیره‌ها را آماده/قفل می‌کند و آن را در اختیار proxy می‌گذارد (سیم‌کشی صریح، آزمون‌پذیر).
 
 ## 📌 یادداشت‌های فنی
 - WinDivert نیاز به admin دارد (`_ensure_admin` موجود حفظ شود).
