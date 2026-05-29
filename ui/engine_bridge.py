@@ -51,6 +51,10 @@ class EngineBridge(QObject):
     def stop(self) -> None:
         self.controller.stop()
 
+    def diagnostics(self):
+        """Live diagnostics snapshot (see :meth:`EngineController.diagnostics`)."""
+        return self.controller.diagnostics()
+
     @property
     def is_running(self) -> bool:
         return self.controller.is_running

@@ -19,8 +19,8 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QSpinBox,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem, QPlainTextEdit, QProgressBar, QPushButton,
+    QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from ui import win_effects
@@ -526,6 +526,157 @@ class StrategyPage(QWidget):
         return c
 
 
+class DiagnosticsPage(QWidget):
+    """Live picture of the auto-prober + resilience layer (step 12).
+
+    Pure renderer: it polls ``engine.diagnostics()`` (a plain
+    :class:`core.diagnostics.DiagnosticsSnapshot`) on a timer and repaints. No
+    engine internals are touched here, so the GUI stays decoupled from the core.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._provider = None          # callable -> DiagnosticsSnapshot
+        root = QVBoxLayout(self)
+        root.setContentsMargins(26, 22, 26, 22)
+        root.setSpacing(16)
+
+        root.addWidget(_section_title(
+            "تشخیص", "وضعیت زنده‌ی پراب خودکار و تاب‌آوری"))
+
+        # --- summary card: active strategy + status ---
+        summary = Card()
+        sb = summary.body()
+        self.lbl_active = QLabel("استراتژی فعال: —")
+        self.lbl_active.setObjectName("H2")
+        self.lbl_status = QLabel("وضعیت: بی‌کار")
+        self.lbl_status.setObjectName("Faint")
+        sb.addWidget(self.lbl_active)
+        sb.addWidget(self.lbl_status)
+        root.addWidget(summary)
+
+        # --- throughput / throttle card ---
+        tp = Card()
+        tb = tp.body()
+        h = QLabel("توان عبوری (throughput)")
+        h.setObjectName("H2")
+        tb.addWidget(h)
+        self.bar_tp = QProgressBar()
+        self.bar_tp.setRange(0, 100)
+        self.bar_tp.setTextVisible(False)
+        tb.addWidget(self.bar_tp)
+        self.lbl_tp = QLabel("بدون داده")
+        self.lbl_tp.setObjectName("Faint")
+        tb.addWidget(self.lbl_tp)
+        self.lbl_rst = QLabel("RST جعلی: —")
+        self.lbl_rst.setObjectName("Faint")
+        tb.addWidget(self.lbl_rst)
+        self.lbl_chain = QLabel("زنجیره‌ی fallback: —")
+        self.lbl_chain.setObjectName("Faint")
+        self.lbl_chain.setWordWrap(True)
+        tb.addWidget(self.lbl_chain)
+        root.addWidget(tp)
+
+        # --- candidate health table card ---
+        cand = Card()
+        cb = cand.body()
+        ch = QLabel("کاندیداها (probe)")
+        ch.setObjectName("H2")
+        cb.addWidget(ch)
+        self.tbl = QPlainTextEdit()
+        self.tbl.setObjectName("Log")
+        self.tbl.setReadOnly(True)
+        self.tbl.setMinimumHeight(170)
+        cb.addWidget(self.tbl)
+        root.addWidget(cand, 1)
+
+        # poll timer (started/stopped when the page becomes visible)
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self.refresh)
+
+    def set_provider(self, provider) -> None:
+        """Give the page a zero-arg callable returning a DiagnosticsSnapshot."""
+        self._provider = provider
+        self.refresh()
+
+    def start_polling(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start()
+        self.refresh()
+
+    def stop_polling(self) -> None:
+        self._timer.stop()
+
+    def refresh(self) -> None:
+        if self._provider is None:
+            return
+        try:
+            snap = self._provider()
+        except Exception:
+            return
+        self._render(snap)
+
+    # -- rendering --------------------------------------------------------
+    _STATUS_FA = {
+        "idle": "بی‌کار", "connecting": "در حال اتصال",
+        "active": "فعال", "error": "خطا",
+    }
+
+    def _render(self, snap) -> None:
+        self.lbl_active.setText(
+            f"استراتژی فعال: {snap.active_strategy or '—'}")
+        st = self._STATUS_FA.get(snap.status, snap.status)
+        port = f" · پورت {snap.spoof_port}" if snap.spoof_port else ""
+        self.lbl_status.setText(f"وضعیت: {st}{port}")
+
+        # throughput bar = recent/baseline ratio (clamped to 100%)
+        ratio = snap.throttle_ratio
+        if snap.baseline_bps > 0:
+            pct = max(0, min(100, int(ratio * 100)))
+            self.bar_tp.setValue(pct)
+            tag = " — throttle!" if snap.throttled else ""
+            self.lbl_tp.setText(
+                f"{self._fmt_bps(snap.recent_bps)} از "
+                f"{self._fmt_bps(snap.baseline_bps)} ({pct}%){tag}")
+        else:
+            self.bar_tp.setValue(0)
+            self.lbl_tp.setText("بدون داده")
+
+        if snap.resilience_on:
+            self.lbl_rst.setText(
+                f"RST جعلی: {snap.forged_rst_count} / بودجه {snap.rst_budget}")
+            chain = " → ".join(snap.strategy_chain) or "—"
+            ips = " → ".join(snap.ip_chain) or "—"
+            self.lbl_chain.setText(
+                f"زنجیره‌ی استراتژی: {chain}\nزنجیره‌ی IP: {ips}")
+        else:
+            self.lbl_rst.setText("تاب‌آوری غیرفعال است")
+            self.lbl_chain.setText("زنجیره‌ی fallback: —")
+
+        self.tbl.setPlainText(self._candidate_table(snap))
+
+    @staticmethod
+    def _fmt_bps(bps: float) -> str:
+        if bps >= 1_000_000:
+            return f"{bps / 1_000_000:.1f} MB/s"
+        if bps >= 1000:
+            return f"{bps / 1000:.0f} KB/s"
+        return f"{bps:.0f} B/s"
+
+    @staticmethod
+    def _candidate_table(snap) -> str:
+        if not snap.has_probe_data:
+            return "هنوز probe انجام نشده — هنگام اتصال با «پراب خودکار» پر می‌شود."
+        lines = [f"{'استراتژی':<22}{'امتیاز':>8}{'موفقیت':>9}{'نمونه':>7}  وضعیت"]
+        for c in snap.candidates:
+            mark = "★ " if c.selected else "  "
+            lines.append(
+                f"{mark}{c.key:<20}{c.mean_score:>8.2f}"
+                f"{c.success_rate*100:>8.0f}%{c.samples:>7}  {c.last_outcome}")
+        return "\n".join(lines)
+
+
 class LogPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -615,9 +766,11 @@ class MainWindow(QWidget):
         self.page_settings = SettingsPage()
         self.page_strategy = StrategyPage(self.store)
         self.page_strategy.auto_prober_changed.connect(self._on_auto_prober_changed)
+        self.page_diagnostics = DiagnosticsPage()
+        self.page_diagnostics.set_provider(self.engine.diagnostics)
         self.page_log = LogPage()
         for p in (self.page_dashboard, self.page_profiles, self.page_settings,
-                  self.page_strategy, self.page_log):
+                  self.page_strategy, self.page_diagnostics, self.page_log):
             self.stack.addWidget(p)
         self.stack.currentChanged.connect(self._on_page_changed)
         body.addWidget(self.stack, 1)
@@ -705,6 +858,11 @@ class MainWindow(QWidget):
         # replay the dashboard intro when navigating back to it
         if self.stack.widget(index) is self.page_dashboard:
             self.page_dashboard.play_intro()
+        # only poll diagnostics while its page is visible (saves cycles)
+        if self.stack.widget(index) is self.page_diagnostics:
+            self.page_diagnostics.start_polling()
+        else:
+            self.page_diagnostics.stop_polling()
 
     # --- navigation -------------------------------------------------------
     def _build_nav(self) -> QWidget:
@@ -723,6 +881,7 @@ class MainWindow(QWidget):
             ("پروفایل‌ها", "\u2630"),  # trigram (list)
             ("تنظیمات", "\u2699"),     # gear
             ("استراتژی", "\u29bf"),    # circled bullet
+            ("تشخیص", "\u2295"),       # circled plus (diagnostics)
             ("لاگ", "\u2261"),         # identical-to (log lines)
         ]
         for idx, (text, icon) in enumerate(items):
