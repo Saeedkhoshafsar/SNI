@@ -1,0 +1,201 @@
+"""Unit tests for :class:`core.engine.EngineController`.
+
+The real ``ProxyServer`` needs WinDivert (Windows + admin) and ``XrayManager``
+needs the bundled ``xray.exe``; neither runs in CI/sandbox. We therefore stub
+both with fakes and assert the *orchestration* logic: mode selection, the
+auto-chained spoof port, callback fan-out and clean start/stop transitions.
+"""
+import sys
+import time
+import unittest
+
+import core.engine as engine_mod
+from core.engine import (
+    EngineController, STATUS_IDLE, STATUS_ACTIVE, STATUS_CONNECTING)
+from core.profile import Profile
+
+
+# --------------------------------------------------------------------------
+#  Fakes
+# --------------------------------------------------------------------------
+
+class FakeProxy:
+    last_instance = None
+
+    def __init__(self, config):
+        self.config = config
+        self.bypass_method = "wrong_seq"
+        self.on_log = None
+        self.on_status_change = None
+        self.on_connection_count_change = None
+        self.started = False
+        self.stopped = False
+        FakeProxy.last_instance = self
+
+    def start(self):
+        self.started = True
+        if self.on_log:
+            self.on_log("fake proxy started")
+        if self.on_status_change:
+            self.on_status_change(True)
+
+    def stop(self):
+        self.stopped = True
+
+
+class FakeXray:
+    last_instance = None
+
+    def __init__(self, profile, socks_port=10808, http_port=10809,
+                 spoof_port=None, gaming_mode=False):
+        self.profile = profile
+        self.socks_port = socks_port
+        self.http_port = http_port
+        self.spoof_port = spoof_port
+        self.gaming_mode = gaming_mode
+        self.on_log = None
+        self.started = False
+        self.stopped = False
+        FakeXray.last_instance = self
+
+    @property
+    def is_available(self):
+        return True
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+
+def _install_fakes():
+    """Patch the lazily-imported core dependencies with fakes.
+
+    Returns a callable that restores the originals so the patches never leak
+    into other test modules (pytest runs everything in one process).
+    """
+    saved_main = sys.modules.get("main")
+    fake_main = type(sys)("main")
+    fake_main.ProxyServer = FakeProxy
+    sys.modules["main"] = fake_main
+
+    import core.xray_manager as xm
+    saved_xray = xm.XrayManager
+    saved_find = xm.find_free_port
+    xm.XrayManager = FakeXray
+    # deterministic port so we can assert the chain
+    xm.find_free_port = lambda preferred=None: preferred or 40443
+
+    def restore():
+        if saved_main is not None:
+            sys.modules["main"] = saved_main
+        else:
+            sys.modules.pop("main", None)
+        xm.XrayManager = saved_xray
+        xm.find_free_port = saved_find
+
+    return restore
+
+
+def _wait_status(ctrl, status, timeout=3.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if ctrl.status == status:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+# --------------------------------------------------------------------------
+#  Tests
+# --------------------------------------------------------------------------
+
+class EngineControllerTest(unittest.TestCase):
+    def setUp(self):
+        self._restore = _install_fakes()
+        FakeProxy.last_instance = None
+        FakeXray.last_instance = None
+
+    def tearDown(self):
+        self._restore()
+
+    def _profile(self):
+        return Profile(protocol="vless", address="real.example.com", port=8443,
+                       uuid="11111111-1111-1111-1111-111111111111")
+
+    def test_uses_core_logic(self):
+        ctrl = EngineController({"connection_mode": "SNI Only"})
+        self.assertFalse(ctrl.uses_core)
+        ctrl.set_profile(self._profile())
+        self.assertFalse(ctrl.uses_core)  # mode still SNI Only
+        ctrl.update_config({"connection_mode": "SNI + Warp"})
+        self.assertTrue(ctrl.uses_core)
+
+    def test_sni_only_starts_proxy_no_xray(self):
+        ctrl = EngineController({
+            "connection_mode": "SNI Only",
+            "LISTEN_PORT": 40443, "CONNECT_IP": "1.2.3.4", "CONNECT_PORT": 443,
+        })
+        logs = []
+        ctrl.on_log = logs.append
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        self.assertIsNotNone(FakeProxy.last_instance)
+        self.assertTrue(FakeProxy.last_instance.started)
+        self.assertIsNone(FakeXray.last_instance)  # no core in SNI Only
+        self.assertEqual(FakeProxy.last_instance.config["CONNECT_IP"], "1.2.3.4")
+        ctrl.stop()
+        self.assertEqual(ctrl.status, STATUS_IDLE)
+
+    def test_core_mode_chains_spoofer_under_xray(self):
+        ctrl = EngineController({
+            "connection_mode": "SNI + Warp", "LISTEN_PORT": 40443,
+        })
+        ctrl.set_profile(self._profile())
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+
+        proxy = FakeProxy.last_instance
+        xray = FakeXray.last_instance
+        self.assertIsNotNone(proxy)
+        self.assertIsNotNone(xray)
+        # spoofer forwards to the REAL server...
+        self.assertEqual(proxy.config["CONNECT_IP"], "real.example.com")
+        self.assertEqual(proxy.config["CONNECT_PORT"], 8443)
+        # ...and xray's outbound is pointed at the local spoofer port
+        self.assertEqual(xray.spoof_port, 40443)
+        self.assertEqual(proxy.config["LISTEN_PORT"], 40443)
+        ctrl.stop()
+        self.assertTrue(proxy.stopped)
+        self.assertTrue(xray.stopped)
+
+    def test_count_callback_forwarded(self):
+        ctrl = EngineController({"connection_mode": "SNI Only"})
+        counts = []
+        ctrl.on_count = lambda a, t: counts.append((a, t))
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        # simulate the proxy reporting a new connection
+        FakeProxy.last_instance.on_connection_count_change(3, 10)
+        self.assertIn((3, 10), counts)
+        ctrl.stop()
+
+    def test_double_start_is_noop(self):
+        ctrl = EngineController({"connection_mode": "SNI Only"})
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        first = FakeProxy.last_instance
+        ctrl.start()  # should not spin up a second proxy
+        time.sleep(0.1)
+        self.assertIs(FakeProxy.last_instance, first)
+        ctrl.stop()
+
+    def test_stop_when_idle_is_safe(self):
+        ctrl = EngineController({"connection_mode": "SNI Only"})
+        ctrl.stop()  # must not raise
+        self.assertEqual(ctrl.status, STATUS_IDLE)
+
+
+if __name__ == "__main__":
+    unittest.main()

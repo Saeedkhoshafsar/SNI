@@ -16,16 +16,23 @@ step 3; dynamic animations land in step 2.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QVBoxLayout,
-    QWidget,
+    QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QSpinBox,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from ui import win_effects
 from ui.theme import get_palette, build_qss
 from ui.widgets import Card, NavItem, PowerButton, TitleBar, Toast
 from ui.animations import CountUp, PulseDot, stagger_in
+
+from core.config_store import ConfigStore
+from core.engine import EngineController
+from core.profile import Profile
+from core.share_link import parse_link, parse_subscription, ShareLinkError
+from ui.engine_bridge import EngineBridge
 
 
 # ---------------------------------------------------------------------------
@@ -93,11 +100,19 @@ def _stat_card(value: str, label: str, accent_color: str | None = None) -> Card:
 
 
 class DashboardPage(QWidget):
-    """Hero status + quick stats + the big animated Start/Stop control."""
+    """Hero status + quick stats + the big animated Start/Stop control.
+
+    Wired to the real engine in step 5: the power button asks the host window
+    to start/stop the :class:`~core.engine.EngineController`; status, live
+    connection count and the active strategy are pushed back in via
+    :meth:`set_status`, :meth:`on_count` and :meth:`set_active_strategy`.
+    """
 
     def __init__(self, palette, parent=None):
         super().__init__(parent)
         self._palette = palette
+        # host window assigns this; called with "start" / "stop"
+        self.power_handler = None
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
         root.setSpacing(16)
@@ -147,27 +162,12 @@ class DashboardPage(QWidget):
     def play_intro(self):
         stagger_in([self.header, self.hero, *self.stat_cards], step=70)
 
-    # -- power button flow (preview/simulation until core wiring in step 5)-
+    # -- power button → delegate to the engine via the host window ---------
     def _on_power(self, action: str):
-        for t in self._sim_timers:
-            t.stop()
-        self._sim_timers.clear()
-        if action == "start":
-            self.set_status("connecting")
-            t1 = QTimer(self); t1.setSingleShot(True)
-            t1.timeout.connect(lambda: self._activate())
-            t1.start(1400)
-            self._sim_timers.append(t1)
-        else:
-            self.set_status("idle")
-            self._count.to(0)
-            self._toast("اتصال قطع شد", "warn")
+        if self.power_handler:
+            self.power_handler(action)
 
-    def _activate(self):
-        self.set_status("active")
-        self._count.to(7)
-        self._toast("اتصال برقرار شد — spoofing فعال", "ok")
-
+    # -- live updates pushed in from the engine bridge ---------------------
     def set_status(self, state: str):
         self.status_dot.set_state(state)
         self.btn_start.set_state(state)
@@ -177,6 +177,16 @@ class DashboardPage(QWidget):
             "active": "متصل — تونل فعال",
             "error": "خطا — تلاش دوباره",
         }.get(state, "آماده — متوقف"))
+
+    def on_count(self, active: int, total: int):
+        """Slot for the engine's connection-count signal."""
+        self._count.to(active)
+
+    def set_active_strategy(self, key: str):
+        self.stat_strategy.value_label.setText(key)
+
+    def set_mode(self, mode: str):
+        self.stat_mode.value_label.setText(mode)
 
     def _toast(self, text: str, kind: str):
         win = self.window()
@@ -234,6 +244,28 @@ class SettingsPage(QWidget):
         root.addWidget(card)
         root.addStretch(1)
 
+    # -- config <-> widgets ------------------------------------------------
+    def load_from(self, cfg: dict) -> None:
+        """Populate the widgets from a config dict."""
+        mode = cfg.get("connection_mode", "SNI Only")
+        i = self.mode.findText(mode)
+        if i >= 0:
+            self.mode.setCurrentIndex(i)
+        self.sni.setCurrentText(cfg.get("FAKE_SNI", "www.speedtest.net"))
+        self.spin_listen.setValue(int(cfg.get("LISTEN_PORT", 40443)))
+        self.spin_socks.setValue(int(cfg.get("socks_port", 10808)))
+        self.connect_ip.setText(str(cfg.get("CONNECT_IP", "")))
+
+    def collect(self) -> dict:
+        """Read the widgets back into a config dict fragment."""
+        return {
+            "connection_mode": self.mode.currentText(),
+            "FAKE_SNI": self.sni.currentText().strip(),
+            "LISTEN_PORT": self.spin_listen.value(),
+            "socks_port": self.spin_socks.value(),
+            "CONNECT_IP": self.connect_ip.text().strip(),
+        }
+
     def _field_label(self, t: str) -> QLabel:
         lbl = QLabel(t)
         lbl.setObjectName("Muted")
@@ -251,6 +283,170 @@ class SettingsPage(QWidget):
         lay.addWidget(sp)
         setattr(self, f"spin_{out}", sp)
         return w
+
+
+class ProfilesPage(QWidget):
+    """Import + manage server profiles (share links / subscriptions).
+
+    v2rayN-style: the user pastes a ``vless://`` / ``vmess://`` / ``trojan://``
+    / ``ss://`` link or a subscription URL; the page parses it via
+    :mod:`core.share_link` and stores the resulting :class:`Profile`(s). The
+    selected profile is what the engine chains xray + spoofing under.
+    """
+
+    def __init__(self, store: ConfigStore, parent=None):
+        super().__init__(parent)
+        self._store = store
+        # host window assigns this; called when the selected profile changes
+        self.on_selection_changed = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(26, 22, 26, 22)
+        root.setSpacing(16)
+
+        root.addWidget(_section_title(
+            "پروفایل‌ها", "وارد کردن لینک اشتراک‌گذاری یا سابسکریپشن (vless/vmess/trojan/ss)"))
+
+        # --- import card ---
+        imp = Card()
+        ib = imp.body()
+        self.input = QLineEdit()
+        self.input.setPlaceholderText(
+            "vless://… یا trojan://… یا لینک سابسکریپشن را اینجا بچسبانید")
+        ib.addWidget(self.input)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        self.btn_import = QPushButton("افزودن لینک")
+        self.btn_import.setObjectName("Primary")
+        self.btn_paste = QPushButton("از کلیپ‌بورد")
+        self.btn_paste.setObjectName("Ghost")
+        self.btn_sub = QPushButton("افزودن سابسکریپشن")
+        self.btn_sub.setObjectName("Ghost")
+        btn_row.addWidget(self.btn_import)
+        btn_row.addWidget(self.btn_paste)
+        btn_row.addWidget(self.btn_sub)
+        btn_row.addStretch(1)
+        ib.addLayout(btn_row)
+        root.addWidget(imp)
+
+        # --- profiles list card ---
+        listc = Card()
+        lb = listc.body()
+        lb.addWidget(self._field_label("سرورهای ذخیره‌شده"))
+        self.list = QListWidget()
+        self.list.setObjectName("ProfileList")
+        lb.addWidget(self.list)
+
+        del_row = QHBoxLayout()
+        del_row.addStretch(1)
+        self.btn_delete = QPushButton("حذف انتخاب‌شده")
+        self.btn_delete.setObjectName("Ghost")
+        del_row.addWidget(self.btn_delete)
+        lb.addLayout(del_row)
+        root.addWidget(listc, 1)
+
+        # wiring
+        self.btn_import.clicked.connect(self._import_link)
+        self.input.returnPressed.connect(self._import_link)
+        self.btn_paste.clicked.connect(self._paste)
+        self.btn_sub.clicked.connect(self._import_subscription)
+        self.btn_delete.clicked.connect(self._delete_selected)
+        self.list.currentRowChanged.connect(self._row_changed)
+
+        self.refresh()
+
+    def _field_label(self, t: str) -> QLabel:
+        lbl = QLabel(t)
+        lbl.setObjectName("Muted")
+        return lbl
+
+    # -- list rendering ----------------------------------------------------
+    def refresh(self) -> None:
+        self.list.blockSignals(True)
+        self.list.clear()
+        for p in self._store.profiles:
+            badge = p.protocol.upper()
+            QListWidgetItem(f"[{badge}]  {p.display_name}", self.list)
+        if 0 <= self._store.selected_index < self.list.count():
+            self.list.setCurrentRow(self._store.selected_index)
+        self.list.blockSignals(False)
+
+    # -- actions -----------------------------------------------------------
+    def _toast(self, text: str, kind: str = "info"):
+        Toast.show_message(self.window(), text, kind)
+
+    def _import_link(self):
+        text = self.input.text().strip()
+        if not text:
+            return
+        try:
+            profile = parse_link(text)
+        except ShareLinkError as exc:
+            self._toast(f"لینک نامعتبر: {exc}", "err")
+            return
+        errs = profile.validate()
+        if errs:
+            self._toast("؛ ".join(errs), "err")
+            return
+        self._store.add_profile(profile, select=True)
+        self.input.clear()
+        self.refresh()
+        self._toast(f"پروفایل افزوده شد: {profile.display_name}", "ok")
+        self._emit_selection()
+
+    def _import_subscription(self):
+        text = self.input.text().strip()
+        if not text:
+            self._toast("ابتدا متن/URL سابسکریپشن را وارد کنید", "warn")
+            return
+        blob = text
+        if text.startswith("http://") or text.startswith("https://"):
+            blob = self._fetch(text)
+            if blob is None:
+                return
+        profiles = parse_subscription(blob)
+        if not profiles:
+            self._toast("هیچ پروفایل معتبری در سابسکریپشن یافت نشد", "warn")
+            return
+        added = self._store.add_profiles(profiles)
+        self.input.clear()
+        self.refresh()
+        self._toast(f"{added} پروفایل از سابسکریپشن افزوده شد", "ok")
+        self._emit_selection()
+
+    def _fetch(self, url: str) -> str | None:
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            self._toast(f"واکشی سابسکریپشن ناموفق: {exc}", "err")
+            return None
+
+    def _paste(self):
+        cb = QGuiApplication.clipboard()
+        self.input.setText(cb.text().strip())
+
+    def _delete_selected(self):
+        row = self.list.currentRow()
+        if row < 0:
+            return
+        self._store.remove_profile(row)
+        self.refresh()
+        self._emit_selection()
+        self._toast("پروفایل حذف شد", "warn")
+
+    def _row_changed(self, row: int):
+        if 0 <= row < len(self._store.profiles):
+            self._store.select(row)
+            self._emit_selection()
+
+    def _emit_selection(self):
+        if self.on_selection_changed:
+            self.on_selection_changed(self._store.selected_profile)
 
 
 class StrategyPage(QWidget):
@@ -331,7 +527,26 @@ class LogPage(QWidget):
             "[init] منتظر شروع تونل…\n"
         )
         b.addWidget(self.log)
+
+        clr = QHBoxLayout()
+        clr.addStretch(1)
+        self.btn_clear = QPushButton("پاک‌سازی")
+        self.btn_clear.setObjectName("Ghost")
+        self.btn_clear.clicked.connect(lambda: self.log.clear())
+        clr.addWidget(self.btn_clear)
+        b.addLayout(clr)
+
         root.addWidget(card, 1)
+
+    def append(self, line: str) -> None:
+        """Slot for the engine's log signal (thread-safe via Qt queued conn)."""
+        # keep the buffer bounded so long sessions stay responsive
+        doc = self.log.document()
+        if doc.blockCount() > 1500:
+            self.log.clear()
+        self.log.appendPlainText(line)
+        sb = self.log.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
 
 # ---------------------------------------------------------------------------
@@ -340,10 +555,15 @@ class LogPage(QWidget):
 
 class MainWindow(QWidget):
 
-    def __init__(self, theme: str = "dark"):
+    def __init__(self, theme: str | None = None):
         super().__init__()
-        self._theme = theme
-        self._palette = get_palette(theme)
+        # --- core: persistent store + engine bridge ---
+        self.store = ConfigStore()
+        self._theme = theme or self.store.get("theme", "dark")
+        self.engine = EngineBridge(EngineController(self.store.config))
+        self.engine.set_profile(self.store.selected_profile)
+
+        self._palette = get_palette(self._theme)
         self.setObjectName("RootBackdrop")
         self.setWindowTitle("SNI Spoofer")
         self.resize(940, 620)
@@ -373,10 +593,11 @@ class MainWindow(QWidget):
 
         self.stack = QStackedWidget()
         self.page_dashboard = DashboardPage(self._palette)
+        self.page_profiles = ProfilesPage(self.store)
         self.page_settings = SettingsPage()
         self.page_strategy = StrategyPage()
         self.page_log = LogPage()
-        for p in (self.page_dashboard, self.page_settings,
+        for p in (self.page_dashboard, self.page_profiles, self.page_settings,
                   self.page_strategy, self.page_log):
             self.stack.addWidget(p)
         self.stack.currentChanged.connect(self._on_page_changed)
@@ -384,9 +605,72 @@ class MainWindow(QWidget):
 
         outer.addLayout(body, 1)
 
+        self._wire_core()
         self._apply_theme()
         # play the dashboard entrance once the window is up
         QTimer.singleShot(60, self.page_dashboard.play_intro)
+
+    # ------------------------------------------------------------------ core
+    def _wire_core(self):
+        """Connect UI pages to the engine bridge + config store (step 5)."""
+        # engine → UI (signals are marshalled to the GUI thread by Qt)
+        self.engine.log.connect(self.page_log.append)
+        self.engine.status.connect(self.page_dashboard.set_status)
+        self.engine.status.connect(self._on_status)
+        self.engine.count.connect(self.page_dashboard.on_count)
+
+        # UI → engine
+        self.page_dashboard.power_handler = self._on_power
+        self.page_profiles.on_selection_changed = self._on_profile_selected
+        self.page_settings.btn_save.clicked.connect(self._save_settings)
+
+        # initialise widgets from persisted state
+        self.page_settings.load_from(self.store.config)
+        self.page_dashboard.set_mode(
+            self.store.get("connection_mode", "SNI Only"))
+        self.page_dashboard.set_active_strategy(
+            self.store.get("bypass_method", "wrong_seq"))
+        sel = self.store.selected_profile
+        if sel:
+            self.page_log.append(f"[init] پروفایل فعال: {sel.display_name}")
+        else:
+            self.page_log.append("[init] پروفایلی انتخاب نشده — حالت SNI Only")
+
+    def _on_power(self, action: str):
+        if action == "start":
+            # push the freshest settings + profile into the engine first
+            self.engine.update_config(self.store.config)
+            self.engine.set_profile(self.store.selected_profile)
+            if (self.store.get("connection_mode") != "SNI Only"
+                    and self.store.selected_profile is None):
+                Toast.show_message(
+                    self, "ابتدا یک پروفایل وارد و انتخاب کنید", "warn")
+                self.page_dashboard.set_status("idle")
+                return
+            self.engine.start()
+        else:
+            self.engine.stop()
+
+    def _on_status(self, status: str):
+        if status == "active":
+            Toast.show_message(self, "اتصال برقرار شد — spoofing فعال", "ok")
+        elif status == "idle":
+            Toast.show_message(self, "اتصال قطع شد", "warn")
+        elif status == "error":
+            Toast.show_message(self, "خطا در اتصال — لاگ را ببینید", "err")
+
+    def _on_profile_selected(self, profile):
+        self.engine.set_profile(profile)
+        if profile:
+            self.page_log.append(f"[profile] انتخاب شد: {profile.display_name}")
+
+    def _save_settings(self):
+        self.store.update(**self.page_settings.collect())
+        self.store.save_config()
+        self.engine.update_config(self.store.config)
+        self.page_dashboard.set_mode(
+            self.store.get("connection_mode", "SNI Only"))
+        Toast.show_message(self, "تنظیمات ذخیره شد", "ok")
 
     def _on_page_changed(self, index: int):
         # replay the dashboard intro when navigating back to it
@@ -406,10 +690,11 @@ class MainWindow(QWidget):
         self.nav_group.setExclusive(True)
 
         items = [
-            ("داشبورد", "\u25c9"),   # fisheye
-            ("تنظیمات", "\u2699"),    # gear
-            ("استراتژی", "\u29bf"),   # circled bullet
-            ("لاگ", "\u2261"),        # identical-to (log lines)
+            ("داشبورد", "\u25c9"),    # fisheye
+            ("پروفایل‌ها", "\u2630"),  # trigram (list)
+            ("تنظیمات", "\u2699"),     # gear
+            ("استراتژی", "\u29bf"),    # circled bullet
+            ("لاگ", "\u2261"),         # identical-to (log lines)
         ]
         for idx, (text, icon) in enumerate(items):
             btn = NavItem(text, icon)
@@ -446,3 +731,13 @@ class MainWindow(QWidget):
     def toggle_theme(self):
         self._theme = "light" if self._theme == "dark" else "dark"
         self._apply_theme()
+        self.store.set("theme", self._theme)
+        self.store.save_config()
+
+    def closeEvent(self, event):
+        """Stop the engine cleanly so no subprocess / thread is orphaned."""
+        try:
+            self.engine.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)

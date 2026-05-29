@@ -14,7 +14,7 @@ from __future__ import annotations
 import sys
 
 
-def main(theme: str = "dark") -> int:
+def main(theme: str | None = None) -> int:
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import Qt
 

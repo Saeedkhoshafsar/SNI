@@ -211,3 +211,5 @@ sni-spoofing-v3-atarevals/SNI-Spoofer-v3.exe
 
 # generated runtime config (built from profile at start)
 xray_config.json
+# per-user runtime state (imported servers + selection)
+profiles.json

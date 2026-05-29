@@ -247,6 +247,26 @@ def build_qss(p: Palette) -> str:
     QFrame#Toast[kind="warn"] QLabel#ToastIcon {{ color: {p.warning}; }}
     QFrame#Toast[kind="err"]  QLabel#ToastIcon {{ color: {p.danger}; }}
 
+    /* ---- Profile list ---- */
+    QListWidget#ProfileList {{
+        background: {p.surface_alt};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+        padding: 6px;
+    }}
+    QListWidget#ProfileList::item {{
+        padding: 9px 10px;
+        border-radius: {p.radius_sm}px;
+        color: {p.text};
+    }}
+    QListWidget#ProfileList::item:hover {{
+        background: {p.surface};
+    }}
+    QListWidget#ProfileList::item:selected {{
+        background: {p.accent};
+        color: {p.on_accent};
+    }}
+
     /* ---- Log view ---- */
     QPlainTextEdit#Log {{
         background: {p.surface_alt};
