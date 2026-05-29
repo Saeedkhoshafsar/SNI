@@ -59,6 +59,18 @@ class EngineBridge(QObject):
         """Live diagnostics snapshot (see :meth:`EngineController.diagnostics`)."""
         return self.controller.diagnostics()
 
+    # -- ping / strategy-test passthroughs (blocking; call on a worker) ----
+    def ping_profiles(self, profiles):
+        """Rank profiles by latency before connecting (see EngineController)."""
+        return self.controller.ping_profiles(profiles)
+
+    def ping_profile(self, profile):
+        return self.controller.ping_profile(profile)
+
+    def probe_strategies_for(self, profile, *, strategy: str | None = None):
+        """Test which bypass strategy connects/wins for a profile."""
+        return self.controller.probe_strategies_for(profile, strategy=strategy)
+
     @property
     def is_running(self) -> bool:
         return self.controller.is_running

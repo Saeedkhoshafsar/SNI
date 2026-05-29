@@ -428,5 +428,81 @@ class EngineControllerTest(unittest.TestCase):
         ctrl.stop()
 
 
+class EnginePingTest(unittest.TestCase):
+    """Engine-level ping / strategy-test (core.ping) with injected network."""
+
+    def setUp(self):
+        self._restore = _install_fakes()
+
+    def tearDown(self):
+        self._restore()
+
+    def _profile(self, address="srv.example.com", port=443, remark=""):
+        return Profile(protocol="vless", address=address, port=port,
+                       remark=remark, uuid="x")
+
+    def test_ping_profiles_ranked_via_engine(self):
+        import core.ping as ping_mod
+        saved = ping_mod.tcp_latency
+        ping_mod.tcp_latency = lambda h, p, t: {"fast": 10.0, "slow": 200.0}.get(h)
+        try:
+            ctrl = EngineController({"ping_samples": 1,
+                                     "ping_measure_download": False})
+            results = ctrl.ping_profiles([
+                self._profile("slow", remark="Slow"),
+                self._profile("fast", remark="Fast"),
+            ])
+            self.assertEqual([r.host for r in results], ["fast", "slow"])
+            self.assertEqual(results[0].label, "Fast")
+        finally:
+            ping_mod.tcp_latency = saved
+
+    def test_ping_single_profile_failsoft(self):
+        import core.ping as ping_mod
+        saved = ping_mod.tcp_latency
+        ping_mod.tcp_latency = lambda h, p, t: 42.0
+        try:
+            ctrl = EngineController({"ping_samples": 2,
+                                     "ping_measure_download": False})
+            res = ctrl.ping_profile(self._profile("h"))
+            self.assertIsNotNone(res)
+            self.assertTrue(res.reachable)
+            self.assertAlmostEqual(res.best_ms, 42.0)
+        finally:
+            ping_mod.tcp_latency = saved
+
+    def test_probe_strategies_via_engine_picks_winner(self):
+        import core.prober as prober_mod
+        from core.prober import ProbeResult, OK, RST
+        saved = prober_mod.tcp_probe
+        def fake(cand, host, port, timeout):
+            if cand.strategy == "fake_ttl":
+                return ProbeResult(cand, OK, latency_ms=15.0)
+            if cand.strategy == "wrong_seq":
+                return ProbeResult(cand, OK, latency_ms=90.0)
+            return ProbeResult(cand, RST)
+        prober_mod.tcp_probe = fake
+        try:
+            ctrl = EngineController({})
+            report = ctrl.probe_strategies_for(self._profile("h"))
+            self.assertTrue(report.any_connected)
+            self.assertEqual(report.best.strategy, "fake_ttl")
+        finally:
+            prober_mod.tcp_probe = saved
+
+    def test_probe_strategies_pinned_single(self):
+        import core.prober as prober_mod
+        from core.prober import ProbeResult, OK
+        saved = prober_mod.tcp_probe
+        prober_mod.tcp_probe = lambda c, h, p, t: ProbeResult(c, OK, latency_ms=5.0)
+        try:
+            ctrl = EngineController({"ping_strategy": "multi_fake"})
+            report = ctrl.probe_strategies_for(self._profile("h"))
+            self.assertEqual(len(report.results), 1)
+            self.assertEqual(report.best.strategy, "multi_fake")
+        finally:
+            prober_mod.tcp_probe = saved
+
+
 if __name__ == "__main__":
     unittest.main()

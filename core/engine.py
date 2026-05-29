@@ -161,6 +161,61 @@ class EngineController:
         from core.diagnostics import snapshot
         return snapshot(self)
 
+    # ------------------------------------------------------------------ ping
+
+    def _ping_tester(self):
+        """Build a :class:`core.ping.PingTester` from current config."""
+        from core.ping import PingTester, tcp_latency, tcp_throughput
+        measure_dl = bool(self.config.get("ping_measure_download", True))
+        return PingTester(
+            latency_fn=tcp_latency,
+            throughput_fn=tcp_throughput if measure_dl else None,
+            samples=int(self.config.get("ping_samples", 3)),
+            timeout=float(self.config.get("ping_timeout", 3.0)),
+            on_log=self.on_log,
+        )
+
+    def ping_profiles(self, profiles):
+        """Ping every profile; return PingResults sorted lowest-latency first.
+
+        Blocking (call on a worker thread). Fully fail-soft.
+        """
+        try:
+            tester = self._ping_tester()
+            measure_dl = bool(self.config.get("ping_measure_download", True))
+            return tester.ping_profiles(profiles, measure_download=measure_dl)
+        except Exception as exc:  # never raise into the UI
+            self._log(f"خطا در پینگ: {exc}")
+            return []
+
+    def ping_profile(self, profile):
+        """Ping a single profile. Blocking, fail-soft."""
+        results = self.ping_profiles([profile])
+        return results[0] if results else None
+
+    def probe_strategies_for(self, profile, *, strategy: str | None = None):
+        """Test bypass strategies against one profile (which connects / wins).
+
+        ``strategy`` pins a single strategy to ping with; ``None`` (or the
+        configured ``ping_strategy`` when set) selects the strategy set.
+        Returns a :class:`core.ping.StrategyPingReport`. Blocking, fail-soft.
+        """
+        from core.ping import probe_strategies_for_profile
+        pinned = strategy or (self.config.get("ping_strategy") or None)
+        strategies = [pinned] if pinned else None
+        try:
+            return probe_strategies_for_profile(
+                profile,
+                strategies=strategies,
+                timeout=float(self.config.get("probe_timeout", 5.0)),
+                on_log=self.on_log,
+            )
+        except Exception as exc:
+            self._log(f"خطا در تست استراتژی: {exc}")
+            from core.ping import StrategyPingReport, target_from_profile
+            t = target_from_profile(profile)
+            return StrategyPingReport(label=t.label, host=t.host, port=t.port)
+
     # ------------------------------------------------------------------ start
 
     def start(self) -> None:

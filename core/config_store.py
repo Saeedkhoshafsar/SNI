@@ -37,6 +37,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "gaming_mode": False,
     "auto_prober": False,
     "probe_timeout": 5.0,         # per-candidate probe timeout (seconds)
+    # ping / latency measurement (core.ping) — done *before* connecting
+    "ping_samples": 3,            # latency samples per server
+    "ping_timeout": 3.0,          # per-sample TCP timeout (seconds)
+    "ping_measure_download": True,  # also estimate download quality per server
+    "ping_strategy": "",          # pinned strategy for strategy-ping ("" = test all)
     # fragmentation layer (core.fragment) — independent of the inject method
     "fragment_tcp": False,        # split the real ClientHello across TCP segments
     "fragment_tls": False,        # rewrite the ClientHello as smaller TLS records
