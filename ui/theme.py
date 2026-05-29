@@ -235,6 +235,18 @@ def build_qss(p: Palette) -> str:
     QScrollBar::handle:vertical:hover {{ background: {p.text_muted}; }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 
+    /* ---- Toast (transient notifications) ---- */
+    QFrame#Toast {{
+        background: {p.elevated};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+    }}
+    QLabel#ToastText {{ color: {p.text}; font-weight: 500; }}
+    QLabel#ToastIcon {{ color: {p.accent}; font-size: 13px; }}
+    QFrame#Toast[kind="ok"]   QLabel#ToastIcon {{ color: {p.success}; }}
+    QFrame#Toast[kind="warn"] QLabel#ToastIcon {{ color: {p.warning}; }}
+    QFrame#Toast[kind="err"]  QLabel#ToastIcon {{ color: {p.danger}; }}
+
     /* ---- Log view ---- */
     QPlainTextEdit#Log {{
         background: {p.surface_alt};

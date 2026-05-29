@@ -15,7 +15,7 @@ step 3; dynamic animations land in step 2.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QVBoxLayout,
@@ -24,7 +24,8 @@ from PySide6.QtWidgets import (
 
 from ui import win_effects
 from ui.theme import get_palette, build_qss
-from ui.widgets import Card, NavItem, TitleBar
+from ui.widgets import Card, NavItem, PowerButton, TitleBar, Toast
+from ui.animations import CountUp, PulseDot, stagger_in
 
 
 # ---------------------------------------------------------------------------
@@ -87,20 +88,23 @@ def _stat_card(value: str, label: str, accent_color: str | None = None) -> Card:
     cap.setObjectName("Muted")
     b.addWidget(v)
     b.addWidget(cap)
+    c.value_label = v   # exposed so callers can animate it (CountUp)
     return c
 
 
 class DashboardPage(QWidget):
-    """Hero status + quick stats + the big Start/Stop control."""
+    """Hero status + quick stats + the big animated Start/Stop control."""
 
-    def __init__(self, parent=None):
+    def __init__(self, palette, parent=None):
         super().__init__(parent)
+        self._palette = palette
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
         root.setSpacing(16)
 
-        root.addWidget(_section_title(
-            "داشبورد", "وضعیت زنده‌ی تونل و کنترل سریع روشن/خاموش"))
+        self.header = _section_title(
+            "داشبورد", "وضعیت زنده‌ی تونل و کنترل سریع روشن/خاموش")
+        root.addWidget(self.header)
 
         # --- status hero card ---
         hero = Card()
@@ -108,34 +112,80 @@ class DashboardPage(QWidget):
         row = QHBoxLayout()
         row.setSpacing(14)
 
-        self.status_dot = QLabel("\u25cf")
-        self.status_dot.setStyleSheet("font-size:18px; color:#9aa0b0;")
+        self.status_dot = PulseDot(diameter=12)
         self.status_label = QLabel("آماده — متوقف")
         self.status_label.setObjectName("H2")
         row.addWidget(self.status_dot)
         row.addWidget(self.status_label)
         row.addStretch(1)
 
-        self.btn_start = QPushButton("شروع")
-        self.btn_start.setObjectName("Primary")
-        self.btn_start.setCursor(Qt.PointingHandCursor)
-        self.btn_start.setMinimumWidth(130)
+        self.btn_start = PowerButton(palette)
+        self.btn_start.request.connect(self._on_power)
         row.addWidget(self.btn_start)
         hb.addLayout(row)
+        self.hero = hero
         root.addWidget(hero)
 
         # --- quick stats row ---
         stats = QHBoxLayout()
         stats.setSpacing(14)
         self.stat_conns = _stat_card("0", "اتصالات فعال",
-                                     accent_color=get_palette("dark").accent)
+                                     accent_color=palette.accent)
         self.stat_mode = _stat_card("SNI Only", "حالت")
         self.stat_strategy = _stat_card("wrong_seq", "استراتژی فعال")
-        for c in (self.stat_conns, self.stat_mode, self.stat_strategy):
+        self.stat_cards = [self.stat_conns, self.stat_mode, self.stat_strategy]
+        for c in self.stat_cards:
             stats.addWidget(c)
         root.addLayout(stats)
 
         root.addStretch(1)
+
+        self._count = CountUp(self.stat_conns.value_label)
+        self._sim_timers: list = []
+
+    # -- entrance animation (called when page becomes visible) -------------
+    def play_intro(self):
+        stagger_in([self.header, self.hero, *self.stat_cards], step=70)
+
+    # -- power button flow (preview/simulation until core wiring in step 5)-
+    def _on_power(self, action: str):
+        for t in self._sim_timers:
+            t.stop()
+        self._sim_timers.clear()
+        if action == "start":
+            self.set_status("connecting")
+            t1 = QTimer(self); t1.setSingleShot(True)
+            t1.timeout.connect(lambda: self._activate())
+            t1.start(1400)
+            self._sim_timers.append(t1)
+        else:
+            self.set_status("idle")
+            self._count.to(0)
+            self._toast("اتصال قطع شد", "warn")
+
+    def _activate(self):
+        self.set_status("active")
+        self._count.to(7)
+        self._toast("اتصال برقرار شد — spoofing فعال", "ok")
+
+    def set_status(self, state: str):
+        self.status_dot.set_state(state)
+        self.btn_start.set_state(state)
+        self.status_label.setText({
+            "idle": "آماده — متوقف",
+            "connecting": "در حال اتصال…",
+            "active": "متصل — تونل فعال",
+            "error": "خطا — تلاش دوباره",
+        }.get(state, "آماده — متوقف"))
+
+    def _toast(self, text: str, kind: str):
+        win = self.window()
+        Toast.show_message(win, text, kind)
+
+    def set_palette(self, palette):
+        self._palette = palette
+        self.btn_start.set_palette(palette)
+        self.stat_conns.value_label.setStyleSheet(f"color:{palette.accent};")
 
 
 class SettingsPage(QWidget):
@@ -293,6 +343,7 @@ class MainWindow(QWidget):
     def __init__(self, theme: str = "dark"):
         super().__init__()
         self._theme = theme
+        self._palette = get_palette(theme)
         self.setObjectName("RootBackdrop")
         self.setWindowTitle("SNI Spoofer")
         self.resize(940, 620)
@@ -321,18 +372,26 @@ class MainWindow(QWidget):
         body.addWidget(self._build_nav())
 
         self.stack = QStackedWidget()
-        self.page_dashboard = DashboardPage()
+        self.page_dashboard = DashboardPage(self._palette)
         self.page_settings = SettingsPage()
         self.page_strategy = StrategyPage()
         self.page_log = LogPage()
         for p in (self.page_dashboard, self.page_settings,
                   self.page_strategy, self.page_log):
             self.stack.addWidget(p)
+        self.stack.currentChanged.connect(self._on_page_changed)
         body.addWidget(self.stack, 1)
 
         outer.addLayout(body, 1)
 
         self._apply_theme()
+        # play the dashboard entrance once the window is up
+        QTimer.singleShot(60, self.page_dashboard.play_intro)
+
+    def _on_page_changed(self, index: int):
+        # replay the dashboard intro when navigating back to it
+        if self.stack.widget(index) is self.page_dashboard:
+            self.page_dashboard.play_intro()
 
     # --- navigation -------------------------------------------------------
     def _build_nav(self) -> QWidget:
@@ -369,7 +428,10 @@ class MainWindow(QWidget):
     # --- theming ----------------------------------------------------------
     def _apply_theme(self):
         palette = get_palette(self._theme)
+        self._palette = palette
         self.setStyleSheet(build_qss(palette))
+        # propagate the palette to widgets that paint inline (not via QSS)
+        self.page_dashboard.set_palette(palette)
         try:
             hwnd = int(self.winId())
             win_effects.set_dark_titlebar(hwnd, palette.is_dark)

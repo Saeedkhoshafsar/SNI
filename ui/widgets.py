@@ -6,11 +6,11 @@ ripple) lives in ``animations.py`` and is layered on top of these in step 2.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QPoint, Signal
+from PySide6.QtCore import Qt, QPoint, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QPushButton,
-    QVBoxLayout, QWidget,
+    QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QHBoxLayout,
+    QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
 
@@ -131,3 +131,151 @@ class NavItem(QPushButton):
         self.setObjectName("NavItem")
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
+
+
+# ---------------------------------------------------------------------------
+#  Power button — large Start/Stop control with smooth colour transitions
+# ---------------------------------------------------------------------------
+
+class PowerButton(QPushButton):
+    """The hero Start/Stop control.
+
+    Drives four visual states (``idle`` / ``connecting`` / ``active`` /
+    ``error``) with an animated background-colour transition between them.
+    Emits :pyattr:`toggled_state` with the requested *next* action when the
+    user clicks (``"start"`` from idle, ``"stop"`` from active/connecting).
+    """
+
+    request = Signal(str)  # "start" | "stop"
+
+    _LABELS = {
+        "idle": "شروع",
+        "connecting": "در حال اتصال…",
+        "active": "قطع اتصال",
+        "error": "تلاش دوباره",
+    }
+
+    def __init__(self, palette, parent: QWidget | None = None):
+        super().__init__(self._LABELS["idle"], parent)
+        self.setObjectName("Power")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumSize(150, 44)
+        self._palette = palette
+        self._state = "idle"
+        # lazy import to avoid a hard cycle at module import time
+        from ui.animations import ColorTransition
+        self._ct = ColorTransition(self)
+        self._color = self._target_color("idle")
+        self._apply_color(self._color)
+        self.clicked.connect(self._on_click)
+
+    # -- public API --------------------------------------------------------
+    def set_palette(self, palette):
+        self._palette = palette
+        self._color = self._target_color(self._state)
+        self._apply_color(self._color)
+
+    def set_state(self, state: str):
+        if state == self._state:
+            return
+        prev = self._color
+        self._state = state
+        self.setText(self._LABELS.get(state, "شروع"))
+        self._ct.run(prev, self._target_color(state), self._on_frame)
+
+    def state(self) -> str:
+        return self._state
+
+    # -- internals ---------------------------------------------------------
+    def _target_color(self, state: str) -> str:
+        p = self._palette
+        return {
+            "idle": p.accent,
+            "connecting": p.warning,
+            "active": p.danger,
+            "error": p.danger,
+        }.get(state, p.accent)
+
+    def _on_frame(self, qcolor: QColor):
+        self._color = qcolor.name()
+        self._apply_color(self._color)
+
+    def _apply_color(self, color: str):
+        on = self._palette.on_accent
+        # derive a slightly brighter hover/pressed from the base colour
+        c = QColor(color)
+        hover = c.lighter(115).name()
+        press = c.darker(112).name()
+        self.setStyleSheet(
+            f"""
+            QPushButton#Power {{
+                background: {color}; color: {on}; border: none;
+                border-radius: 11px; font-weight: 700; font-size: 15px;
+                padding: 10px 22px;
+            }}
+            QPushButton#Power:hover  {{ background: {hover}; }}
+            QPushButton#Power:pressed {{ background: {press}; }}
+            """)
+
+    def _on_click(self):
+        if self._state in ("idle", "error"):
+            self.request.emit("start")
+        else:
+            self.request.emit("stop")
+
+
+# ---------------------------------------------------------------------------
+#  Toast — transient, auto-dismissing notification overlay
+# ---------------------------------------------------------------------------
+
+class Toast(QFrame):
+    """A small floating message that fades in, waits, then fades out.
+
+    Anchored to the bottom-centre of its parent. Use :func:`Toast.show_message`
+    to fire-and-forget; the toast cleans itself up.
+    """
+
+    _KIND_ICON = {"info": "\u25cf", "ok": "\u2714", "warn": "\u26a0", "err": "\u2715"}
+
+    def __init__(self, parent: QWidget, text: str, kind: str = "info"):
+        super().__init__(parent)
+        self.setObjectName("Toast")
+        self.setProperty("kind", kind)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 9, 16, 9)
+        lay.setSpacing(8)
+        icon = QLabel(self._KIND_ICON.get(kind, "\u25cf"))
+        icon.setObjectName("ToastIcon")
+        msg = QLabel(text)
+        msg.setObjectName("ToastText")
+        lay.addWidget(icon)
+        lay.addWidget(msg)
+        self.adjustSize()
+        self._eff = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._eff)
+        self._eff.setOpacity(0.0)
+
+    def _reposition(self):
+        if not self.parent():
+            return
+        pw = self.parent().width()
+        ph = self.parent().height()
+        self.adjustSize()
+        x = (pw - self.width()) // 2
+        y = ph - self.height() - 28
+        self.move(x, y)
+
+    @classmethod
+    def show_message(cls, parent: QWidget, text: str, kind: str = "info",
+                     duration: int = 2200) -> "Toast":
+        from ui.animations import fade_in, fade_out
+        t = cls(parent, text, kind)
+        t._reposition()
+        t.show()
+        t.raise_()
+        fade_in(t, 200)
+        QTimer.singleShot(
+            duration,
+            lambda: fade_out(t, 260, on_done=t.deleteLater))
+        return t
