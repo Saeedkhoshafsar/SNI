@@ -29,11 +29,13 @@ class _FakeTcp:
         self.psh = False
         self.payload = b""
         self.seq_num = 0
+        self.checksum = 0x1234  # a "valid-looking" starting value
 
 
 class _FakeIp:
-    def __init__(self, packet_len=40):
+    def __init__(self, packet_len=40, ttl=64):
         self.packet_len = packet_len
+        self.ttl = ttl
 
 
 class _FakeIpv4:
@@ -41,13 +43,20 @@ class _FakeIpv4:
         self.ident = ident
 
 
+class _FakeIpv6:
+    def __init__(self, hop_limit=64):
+        self.hop_limit = hop_limit
+
+
 class _FakePacket:
     """Minimal stand-in for pydivert.Packet."""
 
-    def __init__(self, packet_len=40, ident=100, with_ipv4=True):
+    def __init__(self, packet_len=40, ident=100, with_ipv4=True,
+                 with_ipv6=False):
         self.tcp = _FakeTcp()
         self.ip = _FakeIp(packet_len)
         self.ipv4 = _FakeIpv4(ident) if with_ipv4 else None
+        self.ipv6 = _FakeIpv6() if with_ipv6 else None
 
 
 class _FakeConnection:
@@ -108,9 +117,18 @@ def test_get_strategy_unknown_raises_keyerror():
         raise AssertionError("expected KeyError")
 
 
+EXPECTED_KEYS = {
+    "wrong_seq", "wrong_checksum", "fake_ttl", "multi_fake", "fake_disorder",
+}
+
+
 def test_all_strategies_contains_wrong_seq():
     keys = [s.meta.key for s in all_strategies()]
     assert "wrong_seq" in keys
+
+
+def test_all_expected_strategies_registered():
+    assert EXPECTED_KEYS <= set(REGISTRY)
 
 
 def test_all_strategies_implemented_only():
@@ -252,6 +270,157 @@ def test_base_mutate_not_implemented():
 
 def test_base_default_score():
     assert BypassStrategy().score() == 0.5
+
+
+# ---------------------------------------------------------------------------
+#  shared helper
+# ---------------------------------------------------------------------------
+
+def test_apply_fake_payload_shared_prologue():
+    pkt = _FakePacket(packet_len=40, ident=7)
+    conn = _FakeConnection(fake_data=b"12345")  # 5 bytes
+    BypassStrategy.apply_fake_payload(pkt, conn)
+    assert pkt.tcp.psh is True
+    assert pkt.tcp.payload == b"12345"
+    assert pkt.ip.packet_len == 45
+    assert pkt.ipv4.ident == 8
+
+
+# ---------------------------------------------------------------------------
+#  wrong_checksum
+# ---------------------------------------------------------------------------
+
+def test_wrong_checksum_metadata_and_score():
+    s = get_strategy("wrong_checksum")
+    assert s.meta.title == "Wrong Checksum"
+    assert s.score() == 0.6
+    assert "no-recalc" in s.meta.tags
+
+
+def test_wrong_checksum_corrupts_checksum_and_keeps_inwindow_seq():
+    s = get_strategy("wrong_checksum")
+    pkt = _FakePacket()
+    conn = _FakeConnection(syn_seq=2000, fake_data=b"hello")
+    s.mutate_fake_packet(pkt, conn)
+    assert pkt.tcp.payload == b"hello"
+    assert pkt.tcp.checksum == 0x0000          # deliberately wrong
+    assert pkt.tcp.seq_num == (2000 + 1) & 0xFFFFFFFF  # in-window
+
+
+def test_wrong_checksum_sends_without_recalc():
+    # CRITICAL: must send recalc=False so WinDivert keeps the bad checksum
+    s = get_strategy("wrong_checksum")
+    pkt = _FakePacket()
+    conn = _FakeConnection()
+    inj = _FakeInjector()
+    s.send_fake(inj, pkt, conn)
+    assert conn.fake_sent is True
+    assert inj.sent == [(pkt, False)]
+
+
+# ---------------------------------------------------------------------------
+#  fake_ttl
+# ---------------------------------------------------------------------------
+
+def test_fake_ttl_metadata_and_score():
+    s = get_strategy("fake_ttl")
+    assert s.meta.title == "Fake TTL"
+    assert s.score() == 0.55
+
+
+def test_fake_ttl_sets_low_ipv4_ttl():
+    s = get_strategy("fake_ttl")
+    pkt = _FakePacket()  # ipv4 packet, no ipv6
+    conn = _FakeConnection(syn_seq=500)
+    s.mutate_fake_packet(pkt, conn)
+    assert pkt.ip.ttl == s.DEFAULT_TTL
+    assert pkt.tcp.seq_num == (500 + 1) & 0xFFFFFFFF
+
+
+def test_fake_ttl_per_connection_override():
+    s = get_strategy("fake_ttl")
+    pkt = _FakePacket()
+    conn = _FakeConnection()
+    conn.fake_ttl = 9
+    s.mutate_fake_packet(pkt, conn)
+    assert pkt.ip.ttl == 9
+
+
+def test_fake_ttl_sets_ipv6_hop_limit():
+    s = get_strategy("fake_ttl")
+    pkt = _FakePacket(with_ipv4=False, with_ipv6=True)
+    conn = _FakeConnection()
+    s.mutate_fake_packet(pkt, conn)
+    assert pkt.ipv6.hop_limit == s.DEFAULT_TTL
+
+
+# ---------------------------------------------------------------------------
+#  multi_fake
+# ---------------------------------------------------------------------------
+
+def test_multi_fake_metadata_and_score():
+    s = get_strategy("multi_fake")
+    assert s.meta.title == "Multi Fake"
+    assert s.score() == 0.65
+
+
+def test_multi_fake_uses_wrong_seq_formula():
+    s = get_strategy("multi_fake")
+    data = b"abcd"  # 4 bytes
+    pkt = _FakePacket()
+    conn = _FakeConnection(syn_seq=1000, fake_data=data)
+    s.mutate_fake_packet(pkt, conn)
+    assert pkt.tcp.seq_num == (1000 + 1 - 4) & 0xFFFFFFFF
+
+
+def test_multi_fake_sends_multiple_copies():
+    s = get_strategy("multi_fake")
+    pkt = _FakePacket()
+    conn = _FakeConnection()
+    inj = _FakeInjector()
+    s.send_fake(inj, pkt, conn)
+    assert conn.fake_sent is True
+    assert len(inj.sent) == s.REPEAT
+    assert all(recalc is True for _, recalc in inj.sent)
+
+
+def test_multi_fake_per_connection_repeat():
+    s = get_strategy("multi_fake")
+    pkt = _FakePacket()
+    conn = _FakeConnection()
+    conn.fake_repeat = 5
+    inj = _FakeInjector()
+    s.send_fake(inj, pkt, conn)
+    assert len(inj.sent) == 5
+
+
+# ---------------------------------------------------------------------------
+#  fake_disorder
+# ---------------------------------------------------------------------------
+
+def test_fake_disorder_metadata_and_score():
+    s = get_strategy("fake_disorder")
+    assert s.meta.title == "Fake Disorder"
+    assert s.score() == 0.6
+
+
+def test_fake_disorder_sends_two_copies_with_different_seq():
+    s = get_strategy("fake_disorder")
+    data = b"payload!"  # 8 bytes
+    pkt = _FakePacket()
+    conn = _FakeConnection(syn_seq=3000, fake_data=data)
+    inj = _FakeInjector()
+    s.mutate_fake_packet(pkt, conn)
+    first_seq = pkt.tcp.seq_num
+    s.send_fake(inj, pkt, conn)
+    assert conn.fake_sent is True
+    assert len(inj.sent) == 2
+    # after send_fake the second copy's seq is nudged further back
+    expected_first = (3000 + 1 - len(data)) & 0xFFFFFFFF
+    expected_second = (3000 + 1 - 2 * len(data)) & 0xFFFFFFFF
+    assert first_seq == expected_first
+    assert pkt.tcp.seq_num == expected_second
+    assert expected_first != expected_second
 
 
 if __name__ == "__main__":
