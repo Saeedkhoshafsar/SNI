@@ -319,4 +319,13 @@ def build_qss(p: Palette) -> str:
         font-size: 12.5px;
         padding: 8px;
     }}
+    QPlainTextEdit#PingOutput {{
+        background: {p.surface_alt};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+        color: {p.text};
+        font-family: "Cascadia Code", "Consolas", monospace;
+        font-size: 12.5px;
+        padding: 8px;
+    }}
     """

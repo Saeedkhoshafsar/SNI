@@ -15,7 +15,7 @@ step 3; dynamic animations land in step 2.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -63,6 +63,105 @@ STRATEGIES = [
     ("multi_fake", "Multi Fake", "چند بسته جعلی پشت‌سرهم"),
     ("fake_disorder", "Fake Disorder", "بی‌نظمی عمدی در ترتیب بسته‌ها"),
 ]
+
+
+# ---------------------------------------------------------------------------
+#  Ping worker — runs latency / strategy-test off the GUI thread (step 18)
+# ---------------------------------------------------------------------------
+
+class PingWorker(QThread):
+    """Run a blocking ping / strategy-test via the engine on a worker thread.
+
+    Emits ``line(str)`` for each result row and ``done(str)`` with a final
+    summary. Three kinds:
+      * ``"ping_all"``  — ping every profile, ranked lowest-latency first.
+      * ``"ping_one"``  — ping a single profile.
+      * ``"strategy"``  — test bypass strategies against one profile (which
+                          connects / wins); ``strategy`` pins a single one.
+    """
+
+    line = Signal(str)
+    done = Signal(str)
+
+    def __init__(self, engine, kind: str, *, profile=None, profiles=None,
+                 strategy: str = "", parent=None):
+        super().__init__(parent)
+        self._engine = engine
+        self._kind = kind
+        self._profile = profile
+        self._profiles = list(profiles) if profiles else []
+        self._strategy = strategy
+
+    def run(self):  # pragma: no cover - exercised via Qt smoke, not unit
+        try:
+            if self._kind == "ping_all":
+                self._do_ping_all()
+            elif self._kind == "ping_one":
+                self._do_ping_one()
+            elif self._kind == "strategy":
+                self._do_strategy()
+            else:
+                self.done.emit("نوع سنجش ناشناخته")
+        except Exception as exc:
+            self.line.emit(f"خطا: {exc}")
+            self.done.emit("سنجش با خطا متوقف شد")
+
+    # -- helpers ----------------------------------------------------------
+    @staticmethod
+    def fmt_ping(res, *, rank=None) -> str:
+        prefix = f"#{rank} " if rank is not None else ""
+        if not res.reachable:
+            return f"{prefix}✖ {res.label} — بدون پاسخ"
+        parts = [f"{res.best_ms:.0f}ms", f"avg {res.avg_ms:.0f}",
+                 f"jitter {res.jitter_ms:.0f}"]
+        if res.loss > 0:
+            parts.append(f"loss {res.loss*100:.0f}%")
+        if res.download_kbps is not None:
+            parts.append(f"dl≈{res.download_kbps:.0f}KB/s")
+        return f"{prefix}✔ {res.label} — " + " · ".join(parts)
+
+    def _do_ping_all(self):
+        from core.ping import PingTester
+        results = self._engine.ping_profiles(self._profiles)
+        if not results:
+            self.done.emit("هیچ نتیجه‌ای — پروفایلی نیست یا خطا رخ داد")
+            return
+        for i, res in enumerate(results, 1):
+            self.line.emit(self.fmt_ping(res, rank=i))
+        best = PingTester.best(results)
+        if best is None:
+            self.done.emit("هیچ سروری پاسخ نداد")
+        else:
+            self.done.emit(f"بهترین سرور: {best.label} ({best.best_ms:.0f}ms)")
+
+    def _do_ping_one(self):
+        res = self._engine.ping_profile(self._profile)
+        if res is None:
+            self.done.emit("نتیجه‌ای دریافت نشد")
+            return
+        self.line.emit(self.fmt_ping(res))
+        if res.reachable:
+            self.done.emit(f"{res.label}: {res.best_ms:.0f}ms")
+        else:
+            self.done.emit(f"{res.label}: بدون پاسخ")
+
+    def _do_strategy(self):
+        report = self._engine.probe_strategies_for(
+            self._profile, strategy=(self._strategy or None))
+        if not report.results:
+            self.done.emit("استراتژی‌ای تست نشد (آدرس/کاندیدا نامعتبر)")
+            return
+        for r in report.results:
+            mark = "✔" if r.ok else "✖"
+            extra = (f"{r.latency_ms:.0f}ms · score={r.score:.2f}"
+                     if r.ok else r.outcome)
+            self.line.emit(f"{mark} {r.strategy:14} — {extra}")
+        best = report.best
+        if best is None:
+            self.done.emit("هیچ استراتژی‌ای وصل نشد")
+        else:
+            self.done.emit(
+                f"بهترین استراتژی: {best.strategy} ({best.latency_ms:.0f}ms)")
 
 
 # ---------------------------------------------------------------------------
@@ -295,9 +394,11 @@ class ProfilesPage(QWidget):
     selected profile is what the engine chains xray + spoofing under.
     """
 
-    def __init__(self, store: ConfigStore, parent=None):
+    def __init__(self, store: ConfigStore, engine=None, parent=None):
         super().__init__(parent)
         self._store = store
+        self._engine = engine          # EngineBridge — used for ping (optional)
+        self._ping_worker = None       # live PingWorker (kept to avoid GC)
         # host window assigns this; called when the selected profile changes
         self.on_selection_changed = None
 
@@ -350,6 +451,51 @@ class ProfilesPage(QWidget):
         lb.addLayout(del_row)
         root.addWidget(listc, 1)
 
+        # --- ping / strategy-test card (feedback 9) ---
+        pingc = Card()
+        pb = pingc.body()
+        pb.addWidget(_section_title(
+            "سنجش پیش از اتصال",
+            "ببین کدوم سرور پینگ پایین‌تر/دانلود بهتری دارد و کدوم استراتژی وصل می‌شود"))
+
+        ping_btns = QHBoxLayout()
+        ping_btns.setSpacing(10)
+        self.btn_ping_all = QPushButton("\U0001f4e1  پینگ همه")
+        self.btn_ping_all.setObjectName("Primary")
+        self.btn_ping_one = QPushButton("\U0001f4e1  پینگ این سرور")
+        self.btn_ping_one.setObjectName("Ghost")
+        ping_btns.addWidget(self.btn_ping_all)
+        ping_btns.addWidget(self.btn_ping_one)
+        ping_btns.addStretch(1)
+        pb.addLayout(ping_btns)
+
+        # strategy-ping row: choose a strategy (or "all") to test connectivity with
+        strat_row = QHBoxLayout()
+        strat_row.setSpacing(10)
+        strat_lbl = QLabel("استراتژی برای تست:")
+        strat_lbl.setObjectName("Muted")
+        self.cmb_ping_strategy = QComboBox()
+        self.cmb_ping_strategy.addItem("همه‌ی استراتژی‌ها", "")
+        for key, title, _desc in STRATEGIES:
+            self.cmb_ping_strategy.addItem(title, key)
+        self.btn_test_strategies = QPushButton("\U0001f9ea  تست استراتژی‌ها")
+        self.btn_test_strategies.setObjectName("Ghost")
+        strat_row.addWidget(strat_lbl)
+        strat_row.addWidget(self.cmb_ping_strategy, 1)
+        strat_row.addWidget(self.btn_test_strategies)
+        pb.addLayout(strat_row)
+
+        self.ping_status = QLabel("")
+        self.ping_status.setObjectName("Muted")
+        pb.addWidget(self.ping_status)
+        self.ping_output = QPlainTextEdit()
+        self.ping_output.setObjectName("PingOutput")
+        self.ping_output.setReadOnly(True)
+        self.ping_output.setMaximumHeight(150)
+        self.ping_output.setPlaceholderText("نتیجه‌ی پینگ/تست استراتژی اینجا نمایش داده می‌شود …")
+        pb.addWidget(self.ping_output)
+        root.addWidget(pingc)
+
         # wiring
         self.btn_import.clicked.connect(self._import_link)
         self.input.returnPressed.connect(self._import_link)
@@ -359,6 +505,9 @@ class ProfilesPage(QWidget):
         self.btn_delete.clicked.connect(self._delete_selected)
         self.list.currentRowChanged.connect(self._row_changed)
         self.list.itemDoubleClicked.connect(lambda *_: self._edit_selected())
+        self.btn_ping_all.clicked.connect(self._ping_all)
+        self.btn_ping_one.clicked.connect(self._ping_one)
+        self.btn_test_strategies.clicked.connect(self._test_strategies)
 
         self.refresh()
 
@@ -493,6 +642,60 @@ class ProfilesPage(QWidget):
     def _emit_selection(self):
         if self.on_selection_changed:
             self.on_selection_changed(self._store.selected_profile)
+
+    # -- ping / strategy-test (feedback 9) ---------------------------------
+    def _ping_busy(self, busy: bool):
+        for b in (self.btn_ping_all, self.btn_ping_one, self.btn_test_strategies):
+            b.setEnabled(not busy)
+
+    def _start_ping_job(self, kind: str, *, profile=None, strategy: str = ""):
+        """Run a ping/strategy-test job on a background thread (GUI stays live)."""
+        if self._engine is None:
+            self._toast("موتور در دسترس نیست", "err")
+            return
+        if self._ping_worker is not None and self._ping_worker.isRunning():
+            self._toast("یک سنجش در حال اجراست …", "warn")
+            return
+        # push freshest ping config into the engine before measuring
+        self._engine.update_config(self._store.config)
+        self.ping_output.clear()
+        self.ping_status.setText("در حال سنجش …")
+        self._ping_busy(True)
+        worker = PingWorker(self._engine, kind, profile=profile,
+                            profiles=list(self._store.profiles),
+                            strategy=strategy)
+        worker.line.connect(self._ping_line)
+        worker.done.connect(self._ping_done)
+        self._ping_worker = worker
+        worker.start()
+
+    def _ping_line(self, text: str):
+        self.ping_output.appendPlainText(text)
+
+    def _ping_done(self, summary: str):
+        self.ping_status.setText(summary)
+        self._ping_busy(False)
+
+    def _ping_all(self):
+        if not self._store.profiles:
+            self._toast("هیچ پروفایلی برای پینگ نیست", "warn")
+            return
+        self._start_ping_job("ping_all")
+
+    def _ping_one(self):
+        prof = self._store.selected_profile
+        if prof is None:
+            self._toast("ابتدا یک سرور را انتخاب کنید", "warn")
+            return
+        self._start_ping_job("ping_one", profile=prof)
+
+    def _test_strategies(self):
+        prof = self._store.selected_profile
+        if prof is None:
+            self._toast("ابتدا یک سرور را انتخاب کنید", "warn")
+            return
+        strategy = self.cmb_ping_strategy.currentData() or ""
+        self._start_ping_job("strategy", profile=prof, strategy=strategy)
 
 
 class StrategyPage(QWidget):
@@ -808,7 +1011,7 @@ class MainWindow(QWidget):
 
         self.stack = QStackedWidget()
         self.page_dashboard = DashboardPage(self._palette)
-        self.page_profiles = ProfilesPage(self.store)
+        self.page_profiles = ProfilesPage(self.store, engine=self.engine)
         self.page_settings = SettingsPage()
         self.page_strategy = StrategyPage(self.store)
         self.page_strategy.auto_prober_changed.connect(self._on_auto_prober_changed)
