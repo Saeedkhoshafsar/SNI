@@ -39,7 +39,7 @@
 - [x] استپ ۶ — StrategyEngine: استخراج interface تکنیک + ثبت تکنیک‌های موجود (wrong_seq)  ✅ 2026-05-29
 - [x] استپ ۷ — افزودن تکنیک‌ها: wrong_checksum (فعال‌سازی)، fake_ttl، multi-fake، split/disorder  ✅ 2026-05-29
 - [x] استپ ۸ — لایه‌ی fragmentation: TCP split + TLS record fragmentation (مستقل از موقعیت)  ✅ 2026-05-29
-- [ ] استپ ۹ — **غول آخر: Auto-Prober** — تست خودکار استراتژی‌ها، ranking، انتخاب/قفل خودکار
+- [x] استپ ۹ — **غول آخر: Auto-Prober** — تست خودکار استراتژی‌ها، ranking، انتخاب/قفل خودکار  ✅ 2026-05-29
 - [ ] استپ ۱۰ — تاب‌آوری: تشخیص RST جعلی، throttle، چرخش CONNECT_IP/استراتژی، fallback chain
 - [ ] استپ ۱۱ — strategies.json از راه دور (mirror + امضا) برای آپدیت بدون انتشار اپ
 - [ ] استپ ۱۲ — صفحه‌ی Strategy/Diagnostics در UI (نمایش استراتژی فعال، نمودار سلامت، probeها)
@@ -148,6 +148,20 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **`core/config_store.py`** — کلیدهای `fragment_tcp`/`fragment_tls`/`fragment_tls_chunk` به `DEFAULT_CONFIG` اضافه شد تا تنظیمات persist شود و نقطه‌ی wiring صریح باشد (اعمال زنده در ProxyServer که pydivert لازم دارد، به‌طور طبیعی کنار Auto-Prober استپ ۹ سیم‌کشی می‌شود).
 - **باگ یافته‌شده و حل‌شده (همین استپ):** نسخه‌ی record-layer در ClientHelloِ tool‏ مقدار `0x0301` است نه `0x0303` (TLS 1.3 برای سازگاری). دو تست که `0x0303` را hard-code کرده بودند fail شدند؛ به استخراج version واقعیِ همان record اصلاح شدند. ضمناً فرض اشتباه «byte-identical بودن stream بعد از TLS-fragmentation» در دو تست اصلاح شد (stream رشد می‌کند، فقط بازچینیِ بدنه lossless است).
 - تست‌ها: `tests/test_fragment.py` (۲۲ تست، روی ClientHelloِ واقعی ۵۱۷ بایتی) — پارس هدر، یافتن SNI با طول‌های مختلف + ورودی غیر-TLS/کوتاه، segmentation و straddle شدن SNI، fragmentation رکورد و صحت هدر/اندازه‌ها، رد chunk_size نامعتبر، و ترکیب دو لایه. مجموعاً **۹۴ تست سبز**.
+
+## ✅ استپ ۹ — جزئیات پیاده‌سازی (2026-05-29)
+- **`core/prober.py`** — Auto-Prober، UI-agnostic و **شبکه تزریق‌پذیر** (probe_fn) تا کل منطق ranking/selection/health بدون socket روی sandbox تست شود:
+  - `Candidate` (استراتژی inject + گزینه‌های fragmentation، با `key` یکتا مثل `wrong_seq+ftcp+ftls48`).
+  - `ProbeResult` با `outcome` (OK/RST/TIMEOUT/ERROR) و `score()` آگاه به latency (۱.۰ در ۰ms، نزولی ملایم).
+  - `HealthWindow` — sliding-window کران‌دار با `success_rate`/`mean_score`/`healthy` (آستانه ۰.۵).
+  - `AutoProber` — `probe_all` (probe همه + ثبت health)، `select_best` (انتخاب بیشترین mean_score + قفل، tie-break تصادفی برای نبود امضای ثابت)، `run`، و برای پایش زنده: `record_live`/`needs_reprobe`/`fallback_order`. probeِ پرتابی هرگز run را نمی‌کشد (به ERROR تبدیل می‌شود).
+  - `tcp_probe` — probe واقعی stdlib-only (فقط روی ویندوز اجرا؛ در sandbox با fake جایگزین می‌شود).
+  - `build_candidates` — ساخت لیست کاندیدا از کلیدها + واریانت fragmentation.
+- **`core/engine.py`** — متد `_choose_bypass_method(host, port)`: اگر `auto_prober` روشن باشد کاندیداها را از استراتژی‌های implemented (مرتب بر اساس prior = `score()`) می‌سازد، probe می‌کند و بهترین را قفل می‌کند؛ روی هر خطا/نبود host به‌صورت fail-soft به روش پیکربندی‌شده برمی‌گردد (Start هرگز روی prober بلاک نمی‌شود). `self._prober` در `__init__` مقداردهی شد.
+- **`core/config_store.py`** — کلید `probe_timeout` (پیش‌فرض ۵.۰ ثانیه) به `DEFAULT_CONFIG`.
+- **`ui/window.py`** — toggle «پراب خودکار» در StrategyPage حالا واقعی است: checkable، وضعیت اولیه از store، با `_on_autoprobe_toggled` مقدار `auto_prober` را persist می‌کند و سیگنال `auto_prober_changed` می‌دهد؛ MainWindow آن را به `engine.update_config` وصل می‌کند (toggle ↔ config ↔ engine، تست‌شده end-to-end به‌صورت headless).
+- تست‌ها: `tests/test_prober.py` (۲۰ تست، probe جعلی دترمینیستیک) + ۲ تست integration در `tests/test_engine.py` (انتخاب برنده با probe جعلی، و fallback وقتی همه شکست می‌خورند). مجموعاً **۱۱۶ تست سبز**.
+- **یادداشت بازیابی (2026-05-29):** پس از ری‌ست sandbox، کار استپ ۹ از بکاپ کاربر (`ZInsV2ss`) بازیابی شد. بکاپ شامل تغییرات `engine.py`/`config_store.py`/`ui/window.py`/`ARCHITECTURE.md`/`test_engine.py` بود؛ فایل‌های `core/prober.py` و `tests/test_prober.py` (که در بکاپ نبودند) از محتوای جلسه بازسازی شدند. صحت‌سنجی: ۱۱۶ تست سبز + smoke test موفق UI.
 
 ## 📌 یادداشت‌های فنی
 - WinDivert نیاز به admin دارد (`_ensure_admin` موجود حفظ شود).
