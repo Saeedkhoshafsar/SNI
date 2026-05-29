@@ -267,6 +267,16 @@ def build_qss(p: Palette) -> str:
         color: {p.on_accent};
     }}
 
+    /* ---- Profile editor dialog ---- */
+    QDialog#ProfileDialog {{
+        background: {p.base};
+        border: 1px solid {p.border};
+        border-radius: {p.radius}px;
+    }}
+    QDialog#ProfileDialog QLabel {{ color: {p.text}; }}
+    QScrollArea#DialogScroll {{ border: none; background: transparent; }}
+    QScrollArea#DialogScroll > QWidget > QWidget {{ background: transparent; }}
+
     /* ---- Log view ---- */
     QPlainTextEdit#Log {{
         background: {p.surface_alt};

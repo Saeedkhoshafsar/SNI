@@ -33,6 +33,7 @@ from core.engine import EngineController
 from core.profile import Profile
 from core.share_link import parse_link, parse_subscription, ShareLinkError
 from ui.engine_bridge import EngineBridge
+from ui.profile_dialog import ProfileDialog
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +341,11 @@ class ProfilesPage(QWidget):
 
         del_row = QHBoxLayout()
         del_row.addStretch(1)
-        self.btn_delete = QPushButton("حذف انتخاب‌شده")
+        self.btn_edit = QPushButton("\u270e  ویرایش")
+        self.btn_edit.setObjectName("Ghost")
+        self.btn_delete = QPushButton("\U0001f5d1  حذف انتخاب‌شده")
         self.btn_delete.setObjectName("Ghost")
+        del_row.addWidget(self.btn_edit)
         del_row.addWidget(self.btn_delete)
         lb.addLayout(del_row)
         root.addWidget(listc, 1)
@@ -351,8 +355,10 @@ class ProfilesPage(QWidget):
         self.input.returnPressed.connect(self._import_link)
         self.btn_paste.clicked.connect(self._paste)
         self.btn_sub.clicked.connect(self._import_subscription)
+        self.btn_edit.clicked.connect(self._edit_selected)
         self.btn_delete.clicked.connect(self._delete_selected)
         self.list.currentRowChanged.connect(self._row_changed)
+        self.list.itemDoubleClicked.connect(lambda *_: self._edit_selected())
 
         self.refresh()
 
@@ -377,6 +383,11 @@ class ProfilesPage(QWidget):
         Toast.show_message(self.window(), text, kind)
 
     def _import_link(self):
+        """Paste a link → parse → open the editable dialog pre-filled.
+
+        The user no longer types host/port by hand: every field is decoded
+        from the share link and shown for review/edit before it is stored.
+        """
         text = self.input.text().strip()
         if not text:
             return
@@ -385,15 +396,34 @@ class ProfilesPage(QWidget):
         except ShareLinkError as exc:
             self._toast(f"لینک نامعتبر: {exc}", "err")
             return
-        errs = profile.validate()
-        if errs:
-            self._toast("؛ ".join(errs), "err")
+        dlg = ProfileDialog(profile, self.window(), title="افزودن پروفایل جدید")
+        if dlg.exec() != ProfileDialog.Accepted:
+            self._toast("افزودن لغو شد", "info")
             return
-        self._store.add_profile(profile, select=True)
+        edited = dlg.result_profile
+        self._store.add_profile(edited, select=True)
         self.input.clear()
         self.refresh()
-        self._toast(f"پروفایل افزوده شد: {profile.display_name}", "ok")
+        self._toast(f"پروفایل افزوده شد: {edited.display_name}", "ok")
         self._emit_selection()
+
+    def _edit_selected(self):
+        """Open the editor on the currently selected profile and save edits."""
+        row = self.list.currentRow()
+        if not (0 <= row < len(self._store.profiles)):
+            self._toast("ابتدا یک پروفایل را انتخاب کنید", "warn")
+            return
+        current = self._store.profiles[row]
+        dlg = ProfileDialog(current, self.window(), title="ویرایش پروفایل")
+        if dlg.exec() != ProfileDialog.Accepted:
+            return
+        self._store.profiles[row] = dlg.result_profile
+        self._store.save_profiles()
+        self.refresh()
+        # re-emit so the engine picks up edits to the active profile
+        if row == self._store.selected_index:
+            self._emit_selection()
+        self._toast("پروفایل به‌روزرسانی شد", "ok")
 
     def _import_subscription(self):
         text = self.input.text().strip()
