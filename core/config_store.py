@@ -1,0 +1,188 @@
+"""Persistent application state — settings + saved profiles.
+
+A thin, dependency-free layer over two JSON files that live next to the exe
+(or in the project root during development, via :func:`get_runtime_dir`):
+
+  * ``config.json``   — connection settings (mode, ports, fake SNI, …)
+  * ``profiles.json`` — the list of imported :class:`~core.profile.Profile`
+    objects plus which one is currently selected.
+
+The UI never touches the filesystem directly; it goes through a single
+:class:`ConfigStore` instance so loading/saving is centralised and easy to
+test. All methods degrade gracefully: a missing or corrupt file falls back to
+sane defaults rather than raising.
+"""
+from __future__ import annotations
+
+import json
+import os
+from typing import Any
+
+from core.binary_utils import get_runtime_dir
+from core.profile import Profile
+
+
+# Default connection settings — mirror the legacy ``config.json`` so existing
+# behaviour is preserved when no file is present yet.
+DEFAULT_CONFIG: dict[str, Any] = {
+    "connection_mode": "SNI Only",
+    "LISTEN_HOST": "127.0.0.1",
+    "LISTEN_PORT": 40443,
+    "CONNECT_IP": "188.114.98.0",
+    "CONNECT_PORT": 443,
+    "FAKE_SNI": "www.speedtest.net",
+    "socks_port": 10808,
+    "http_port": 10809,
+    "bypass_method": "wrong_seq",
+    "gaming_mode": False,
+    "auto_prober": False,
+    "theme": "dark",
+}
+
+
+class ConfigStore:
+    """Load / save settings and profiles as JSON next to the executable."""
+
+    def __init__(self, runtime_dir: str | None = None):
+        self.runtime_dir = runtime_dir or get_runtime_dir()
+        self.config_path = os.path.join(self.runtime_dir, "config.json")
+        self.profiles_path = os.path.join(self.runtime_dir, "profiles.json")
+
+        self.config: dict[str, Any] = dict(DEFAULT_CONFIG)
+        self.profiles: list[Profile] = []
+        self.selected_index: int = -1
+
+        self.load()
+
+    # ------------------------------------------------------------------ config
+
+    def load(self) -> None:
+        """Load both config and profiles, tolerating missing/corrupt files."""
+        self._load_config()
+        self._load_profiles()
+
+    def _load_config(self) -> None:
+        data = _read_json(self.config_path)
+        if isinstance(data, dict):
+            # merge over defaults so new keys always exist
+            merged = dict(DEFAULT_CONFIG)
+            merged.update(data)
+            self.config = merged
+        else:
+            self.config = dict(DEFAULT_CONFIG)
+
+    def save_config(self) -> None:
+        _write_json(self.config_path, self.config)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.config.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        self.config[key] = value
+
+    def update(self, **kwargs: Any) -> None:
+        self.config.update(kwargs)
+
+    # ---------------------------------------------------------------- profiles
+
+    def _load_profiles(self) -> None:
+        data = _read_json(self.profiles_path)
+        profiles: list[Profile] = []
+        selected = -1
+        if isinstance(data, dict):
+            for d in data.get("profiles", []):
+                if isinstance(d, dict):
+                    try:
+                        profiles.append(Profile.from_dict(d))
+                    except Exception:
+                        continue
+            selected = int(data.get("selected_index", -1))
+        elif isinstance(data, list):  # tolerate a bare list
+            for d in data:
+                if isinstance(d, dict):
+                    try:
+                        profiles.append(Profile.from_dict(d))
+                    except Exception:
+                        continue
+        self.profiles = profiles
+        if profiles:
+            self.selected_index = selected if 0 <= selected < len(profiles) else 0
+        else:
+            self.selected_index = -1
+
+    def save_profiles(self) -> None:
+        _write_json(self.profiles_path, {
+            "selected_index": self.selected_index,
+            "profiles": [p.to_dict() for p in self.profiles],
+        })
+
+    # -- mutation helpers (each persists immediately) ---------------------
+
+    def add_profile(self, profile: Profile, *, select: bool = True) -> int:
+        """Append a profile, optionally selecting it. Returns its index."""
+        self.profiles.append(profile)
+        idx = len(self.profiles) - 1
+        if select or self.selected_index < 0:
+            self.selected_index = idx
+        self.save_profiles()
+        return idx
+
+    def add_profiles(self, profiles: list[Profile]) -> int:
+        """Append several profiles. Returns how many were added."""
+        if not profiles:
+            return 0
+        first_new = len(self.profiles)
+        self.profiles.extend(profiles)
+        if self.selected_index < 0:
+            self.selected_index = first_new
+        self.save_profiles()
+        return len(profiles)
+
+    def remove_profile(self, index: int) -> None:
+        if not (0 <= index < len(self.profiles)):
+            return
+        self.profiles.pop(index)
+        if not self.profiles:
+            self.selected_index = -1
+        elif self.selected_index >= len(self.profiles):
+            self.selected_index = len(self.profiles) - 1
+        elif index < self.selected_index:
+            self.selected_index -= 1
+        self.save_profiles()
+
+    def select(self, index: int) -> None:
+        if 0 <= index < len(self.profiles):
+            self.selected_index = index
+            self.save_profiles()
+
+    @property
+    def selected_profile(self) -> Profile | None:
+        if 0 <= self.selected_index < len(self.profiles):
+            return self.profiles[self.selected_index]
+        return None
+
+    def clear_profiles(self) -> None:
+        self.profiles.clear()
+        self.selected_index = -1
+        self.save_profiles()
+
+
+# ---------------------------------------------------------------------------
+#  tiny JSON helpers (fail-soft)
+# ---------------------------------------------------------------------------
+
+def _read_json(path: str) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            return json.load(fp)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json(path: str, data: Any) -> None:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, indent=2, ensure_ascii=False)
+    except OSError:
+        pass

@@ -35,7 +35,7 @@
 - [x] استپ ۲ — اجزای پویا: کارت‌های انیمیشن‌دار، دکمه‌ی Start/Stop با حالت‌گذار نرم، toast/log زنده  ✅ 2026-05-29
 - [x] استپ ۳ — **پارسر share-link + subscription** (vless/vmess/trojan/ss) → مدل پروفایل  ✅ 2026-05-29
 - [x] استپ ۴ — **یکپارچه‌سازی هسته v2rayN-style** + زنجیر خودکار spoofing زیر اتصال (حذف 127.0.0.1:40443 دستی)  ✅ 2026-05-29
-- [ ] استپ ۵ — اتصال UI به هسته (پروفایل‌ها/start/stop/callbackها) + مدیریت config
+- [x] استپ ۵ — اتصال UI به هسته (پروفایل‌ها/start/stop/callbackها) + مدیریت config  ✅ 2026-05-29
 - [ ] استپ ۶ — StrategyEngine: استخراج interface تکنیک + ثبت تکنیک‌های موجود (wrong_seq)
 - [ ] استپ ۷ — افزودن تکنیک‌ها: wrong_checksum (فعال‌سازی)، fake_ttl، multi-fake، split/disorder
 - [ ] استپ ۸ — لایه‌ی fragmentation: TCP split + TLS record fragmentation (مستقل از موقعیت)
@@ -111,6 +111,14 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 ## 🐛 باگ‌های یافته‌شده
 - [استپ ۱] آیکن‌های emoji رنگی در sandbox رندر نشدند (فونت emoji نصب نیست) — با گلیف‌های یونیکد geometric جایگزین شد که در فونت پایه هستند؛ روی ویندوز Segoe UI درست نمایش داده می‌شوند. حل‌شده در همین استپ، نیازی به استپ مجزا نیست.
 - [استپ ۲] تداخل دو graphics-effect: کارت دارای drop-shadow هنگام ورود، opacity-effect دوم می‌گرفت (خطای QPainter "not active"). — `_opacity_effect` اصلاح شد تا اگر ویجت از قبل eff﻿ect غیر-opacity دارد، fade را skip و فقط slide کند. حل‌شده در همین استپ.
+- [استپ ۵] monkeypatch ماژول‌سطح در `test_engine` (جایگزینی `XrayManager`/`main`) به `test_xray_config` نشت می‌کرد چون pytest همه را در یک پروسه اجرا می‌کند. — `_install_fakes` اکنون یک callable برای بازگردانی برمی‌گرداند و `tearDown` آن را صدا می‌زند تا تست‌ها ایزوله بمانند. حل‌شده در همین استپ.
+
+## ✅ استپ ۵ — جزئیات پیاده‌سازی (2026-05-29)
+- `core/config_store.py` — `ConfigStore`: بارگذاری/ذخیره‌ی `config.json` + `profiles.json` (لیست پروفایل + ایندکس انتخاب‌شده)، fail-soft روی فایل خراب/غایب.
+- `core/engine.py` — `EngineController`: قلب orchestration و UI-agnostic. یک‌کلیک v2rayN: انتخاب پورت آزاد loopback برای spoofer، اجرای `ProxyServer` با تزریق، و زنجیر خودکار `XrayManager` پشت آن (outbound → 127.0.0.1:spoof_port). در حالت «SNI Only» فقط فورواردر خام. start/stop روی thread جدا، idempotent.
+- `ui/engine_bridge.py` — `EngineBridge(QObject)`: callbackهای thread-affine موتور را به سیگنال‌های Qt (`log/status/count`) تبدیل می‌کند تا اتصال به ویجت‌ها روی thread اصلی GUI امن باشد.
+- `ui/window.py` — صفحه‌ی جدید `ProfilesPage` (import share-link/subscription، paste از clipboard، لیست + حذف/انتخاب). اتصال Dashboard (دکمه‌ی Power → start/stop واقعی، شمارش زنده، status)، Settings (load/save در ConfigStore)، Log (append زنده، bounded buffer). ذخیره‌ی تم. `closeEvent` موتور را تمیز متوقف می‌کند.
+- تست‌ها: `tests/test_config_store.py` (۹) + `tests/test_engine.py` (۶) — مجموعاً ۳۷ تست سبز (با fakeها برای ProxyServer/XrayManager چون WinDivert/xray.exe در sandbox نیستند).
 
 ## 📌 یادداشت‌های فنی
 - WinDivert نیاز به admin دارد (`_ensure_admin` موجود حفظ شود).
