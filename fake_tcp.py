@@ -37,23 +37,19 @@ class FakeTcpInjector(TcpInjector):
             if not connection.monitor:
                 return
 
-            packet.tcp.psh = True
-            packet.ip.packet_len = packet.ip.packet_len + len(connection.fake_data)
-            packet.tcp.payload = connection.fake_data
-            if packet.ipv4:
-                packet.ipv4.ident = (packet.ipv4.ident + 1) & 0xffff
-            # if connection.bypass_method == "wrong_checksum":
-            #     ...
-            if connection.bypass_method == "wrong_seq":
-                packet.tcp.seq_num = (connection.syn_seq + 1 - len(packet.tcp.payload)) & 0xffffffff
-                connection.fake_sent = True
-                self.w.send(packet, True)
-
-
-
-
-            else:
-                sys.exit("not implemented method!")
+            # Resolve the chosen technique from the strategy registry. This
+            # replaces the old hard-coded if/else (which sys.exit'd on anything
+            # other than wrong_seq). The strategy mutates the fake packet and
+            # performs the injected send.
+            from strategies import get_strategy
+            try:
+                strategy = get_strategy(connection.bypass_method)
+            except KeyError as exc:
+                # surface the problem without killing the whole process
+                print(f"[strategy] {exc}")
+                return
+            strategy.mutate_fake_packet(packet, connection)
+            strategy.send_fake(self, packet, connection)
 
     def on_unexpected_packet(self, packet: Packet, connection: FakeInjectiveConnection, info_m: str):
         print(info_m, packet)

@@ -36,7 +36,7 @@
 - [x] استپ ۳ — **پارسر share-link + subscription** (vless/vmess/trojan/ss) → مدل پروفایل  ✅ 2026-05-29
 - [x] استپ ۴ — **یکپارچه‌سازی هسته v2rayN-style** + زنجیر خودکار spoofing زیر اتصال (حذف 127.0.0.1:40443 دستی)  ✅ 2026-05-29
 - [x] استپ ۵ — اتصال UI به هسته (پروفایل‌ها/start/stop/callbackها) + مدیریت config  ✅ 2026-05-29
-- [ ] استپ ۶ — StrategyEngine: استخراج interface تکنیک + ثبت تکنیک‌های موجود (wrong_seq)
+- [x] استپ ۶ — StrategyEngine: استخراج interface تکنیک + ثبت تکنیک‌های موجود (wrong_seq)  ✅ 2026-05-29
 - [ ] استپ ۷ — افزودن تکنیک‌ها: wrong_checksum (فعال‌سازی)، fake_ttl، multi-fake، split/disorder
 - [ ] استپ ۸ — لایه‌ی fragmentation: TCP split + TLS record fragmentation (مستقل از موقعیت)
 - [ ] استپ ۹ — **غول آخر: Auto-Prober** — تست خودکار استراتژی‌ها، ranking، انتخاب/قفل خودکار
@@ -119,6 +119,14 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - `ui/engine_bridge.py` — `EngineBridge(QObject)`: callbackهای thread-affine موتور را به سیگنال‌های Qt (`log/status/count`) تبدیل می‌کند تا اتصال به ویجت‌ها روی thread اصلی GUI امن باشد.
 - `ui/window.py` — صفحه‌ی جدید `ProfilesPage` (import share-link/subscription، paste از clipboard، لیست + حذف/انتخاب). اتصال Dashboard (دکمه‌ی Power → start/stop واقعی، شمارش زنده، status)، Settings (load/save در ConfigStore)، Log (append زنده، bounded buffer). ذخیره‌ی تم. `closeEvent` موتور را تمیز متوقف می‌کند.
 - تست‌ها: `tests/test_config_store.py` (۹) + `tests/test_engine.py` (۶) — مجموعاً ۳۷ تست سبز (با fakeها برای ProxyServer/XrayManager چون WinDivert/xray.exe در sandbox نیستند).
+
+## ✅ استپ ۶ — جزئیات پیاده‌سازی (2026-05-29)
+- پکیج جدید `strategies/` — موتور ماژولار bypass، **بدون وابستگی سخت به pydivert در زمان import** تا روی هر OS (بدون WinDivert) قابل enumerate/تست/نمایش در UI باشد.
+- `strategies/base.py` — `StrategyMeta` (dataclass فریز‌شده: key/title/description/implemented/tags)، کلاس پایه‌ی `BypassStrategy` با هوک‌های `mutate_fake_packet` (abstract)، `send_fake` (پیش‌فرض: یک ارسال تزریقی با recalc)، `score` (پیش‌فرض ۰٫۵)؛ رجیستری `REGISTRY` + دکوریتور `@register` (نمونه‌سازی و ثبت با meta.key، خطای ValueError روی کلید تکراری) + `get_strategy` (KeyError با پیام فارسی شامل کلیدهای موجود) + `all_strategies(implemented_only=...)`.
+- `strategies/wrong_seq.py` — `WrongSeqStrategy`: استخراج عینی تکنیک قدیمی (psh + افزودن fake payload + bump ipv4.ident + `seq_num = (syn_seq + 1 - len(payload)) & 0xffffffff`)، `score()=0.8` (تا قبل از یادگیری prober اولویت اول).
+- `strategies/__init__.py` — API عمومی + import جانبی `wrong_seq` برای self-register.
+- `fake_tcp.py` — `fake_send_thread` بازنویسی شد: به‌جای `if bypass_method == "wrong_seq" … else sys.exit("not implemented")`، حالا از رجیستری استفاده می‌کند: `strategy = get_strategy(connection.bypass_method); strategy.mutate_fake_packet(...); strategy.send_fake(...)`. خطای کلید ناشناخته به‌جای کشتن پروسه فقط لاگ می‌شود. (`import sys` همچنان لازم است — در `inject()` برای "impossible direction!".)
+- تست‌ها: `tests/test_strategies.py` (۲۰ تست) با fakeهای duck-typed برای packet/connection/injector — رجیستری، KeyError، all_strategies، متادیتا/score، فرمول wrong_seq + wrap امضانشده ۳۲بیتی، bump و wrap ۱۶بیتی ipv4.ident، مسیر IPv6 (ipv4=None)، و رفتار `send_fake`. مجموعاً **۵۷ تست سبز** (هم direct-run هم pytest).
 
 ## 📌 یادداشت‌های فنی
 - WinDivert نیاز به admin دارد (`_ensure_admin` موجود حفظ شود).
