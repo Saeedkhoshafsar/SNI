@@ -33,7 +33,7 @@
 
 - [x] استپ ۱ — اسکلت UI حرفه‌ای PySide6 (تم لایت/دارک + شیشه‌ای/Mica + سایه + هدر/ناوبری)  ✅ 2026-05-29
 - [x] استپ ۲ — اجزای پویا: کارت‌های انیمیشن‌دار، دکمه‌ی Start/Stop با حالت‌گذار نرم، toast/log زنده  ✅ 2026-05-29
-- [ ] استپ ۳ — **پارسر share-link + subscription** (vless/vmess/trojan/ss) → مدل پروفایل
+- [x] استپ ۳ — **پارسر share-link + subscription** (vless/vmess/trojan/ss) → مدل پروفایل  ✅ 2026-05-29
 - [ ] استپ ۴ — **یکپارچه‌سازی هسته v2rayN-style** + زنجیر خودکار spoofing زیر اتصال (حذف 127.0.0.1:40443 دستی)
 - [ ] استپ ۵ — اتصال UI به هسته (پروفایل‌ها/start/stop/callbackها) + مدیریت config
 - [ ] استپ ۶ — StrategyEngine: استخراج interface تکنیک + ثبت تکنیک‌های موجود (wrong_seq)
