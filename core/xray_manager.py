@@ -1,40 +1,60 @@
-"""Configure and manage an Xray-core subprocess.
+"""Configure and manage an Xray-core subprocess from a unified Profile.
 
-The xray.exe binary is bundled inside the application – no download needed.
+v2rayN-style integration: the caller hands in a :class:`core.profile.Profile`
+(parsed from a share link / subscription) and the manager builds the full Xray
+config and runs the bundled ``xray.exe``. No hand-entered ports, no separate
+config file to wire up.
+
+**Auto-chained SNI spoofing.** When ``spoof_port`` is provided, the outbound is
+pointed at ``127.0.0.1:<spoof_port>`` instead of the real server. The SNI
+spoofer (``main.ProxyServer``) listens there and forwards — with the DPI-bypass
+injection — to the real ``profile.address:profile.port``. The TLS/SNI settings
+in the outbound still describe the real server, so the upstream handshake is
+correct. The user never sees or types ``127.0.0.1:40443``; the manager wires it
+internally.
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
 
 from core.binary_utils import get_bin_dir, get_runtime_dir
+from core.profile import Profile
+from core.xray_config import build_config
+
+
+def find_free_port(preferred: int | None = None) -> int:
+    """Return a free localhost TCP port, trying *preferred* first."""
+    if preferred:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", preferred))
+                return preferred
+            except OSError:
+                pass
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 class XrayManager:
+    """Runs Xray-core for a given profile, optionally chained behind a spoofer."""
 
     def __init__(
         self,
+        profile: Profile,
         socks_port: int = 10808,
         http_port: int = 10809,
-        server_address: str = "127.0.0.1",
-        server_port: int = 40443,
-        password: str = "",
-        sni: str = "",
-        transport: str = "ws",
-        ws_path: str = "/",
-        host: str = "",
+        spoof_port: int | None = None,
         gaming_mode: bool = False,
     ):
+        self.profile = profile
         self.socks_port = socks_port
         self.http_port = http_port
-        self.server_address = server_address
-        self.server_port = server_port
-        self.password = password
-        self.sni = sni
-        self.transport = transport
-        self.ws_path = ws_path
-        self.host = host or sni
+        # if a spoofer sits in front, the outbound connects here instead
+        self.spoof_port = spoof_port
         self.gaming_mode = gaming_mode
 
         self.xray_exe = os.path.join(get_bin_dir(), "xray.exe")
@@ -52,81 +72,32 @@ class XrayManager:
     def is_available(self) -> bool:
         return os.path.isfile(self.xray_exe)
 
+    @property
+    def real_server(self) -> tuple[str, int]:
+        """The real upstream the spoofer must forward to."""
+        return self.profile.address, self.profile.port
+
     # ----------------------------------------------------------------
 
     def generate_config(self) -> str:
-        """Write an xray JSON config and return its path."""
-        stream: dict = {
-            "network": self.transport,
-            "security": "tls",
-            "tlsSettings": {
-                "serverName": self.sni,
-                "allowInsecure": True,
-                "fingerprint": "chrome",
-            },
-        }
-        if self.transport == "ws":
-            stream["wsSettings"] = {
-                "path": self.ws_path,
-                "headers": {"Host": self.host},
-            }
-        elif self.transport == "grpc":
-            stream["grpcSettings"] = {
-                "serviceName": self.ws_path.strip("/"),
-                "multiMode": not self.gaming_mode,
-            }
+        """Write the Xray JSON config for this profile and return its path."""
+        if self.spoof_port is not None:
+            # route the outbound through the local spoofer
+            dest_address: str | None = "127.0.0.1"
+            dest_port: int | None = self.spoof_port
+        else:
+            dest_address = dest_port = None  # connect directly
 
-        if self.gaming_mode:
-            stream["sockopt"] = {
-                "tcpNoDelay": True,
-                "tcpFastOpen": True,
-                "tcpKeepAliveInterval": 5,
-            }
-
-        outbound: dict = {
-            "tag": "proxy",
-            "protocol": "trojan",
-            "settings": {
-                "servers": [{
-                    "address": self.server_address,
-                    "port": self.server_port,
-                    "password": self.password,
-                }],
-            },
-            "streamSettings": stream,
-            "mux": {"enabled": False},
-        }
-
-        config = {
-            "log": {"loglevel": "warning"},
-            "inbounds": [
-                {
-                    "tag": "socks-in",
-                    "port": self.socks_port,
-                    "listen": "127.0.0.1",
-                    "protocol": "socks",
-                    "settings": {"auth": "noauth", "udp": True},
-                    "sniffing": {
-                        "enabled": not self.gaming_mode,
-                        "destOverride": ["http", "tls"],
-                    },
-                },
-                {
-                    "tag": "http-in",
-                    "port": self.http_port,
-                    "listen": "127.0.0.1",
-                    "protocol": "http",
-                    "settings": {},
-                },
-            ],
-            "outbounds": [
-                outbound,
-                {"tag": "direct", "protocol": "freedom"},
-                {"tag": "block", "protocol": "blackhole"},
-            ],
-        }
-
-        with open(self.config_path, "w") as fp:
+        config = build_config(
+            self.profile,
+            socks_port=self.socks_port,
+            http_port=self.http_port,
+            dest_address=dest_address,
+            dest_port=dest_port,
+            gaming=self.gaming_mode,
+        )
+        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        with open(self.config_path, "w", encoding="utf-8") as fp:
             json.dump(config, fp, indent=2)
         return self.config_path
 
@@ -140,22 +111,35 @@ class XrayManager:
             self._log("ERROR: xray.exe not found (binary not bundled)")
             return
 
+        errs = self.profile.validate()
+        if errs:
+            self._log("ERROR: پروفایل نامعتبر — " + "؛ ".join(errs))
+            return
+
         self.generate_config()
         try:
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = subprocess.SW_HIDE
+            kwargs = {}
+            if sys.platform == "win32":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = subprocess.SW_HIDE
+                kwargs["startupinfo"] = si
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             self._process = subprocess.Popen(
                 [self.xray_exe, "run", "-config", self.config_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                startupinfo=si,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                **kwargs,
             )
             threading.Thread(target=self._pump_output, daemon=True).start()
+            chain = (f"  (chain → spoofer 127.0.0.1:{self.spoof_port}"
+                     f" → {self.profile.address}:{self.profile.port})"
+                     if self.spoof_port else
+                     f"  (direct → {self.profile.address}:{self.profile.port})")
             self._log(
-                f"Xray started  →  SOCKS5 127.0.0.1:{self.socks_port}"
-                f"  |  HTTP 127.0.0.1:{self.http_port}")
+                f"Xray started [{self.profile.protocol}]  →  "
+                f"SOCKS5 127.0.0.1:{self.socks_port}"
+                f"  |  HTTP 127.0.0.1:{self.http_port}{chain}")
         except Exception as exc:
             self._log(f"Failed to start Xray: {exc}")
 
