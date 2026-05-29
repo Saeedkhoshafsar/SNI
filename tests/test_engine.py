@@ -290,6 +290,90 @@ class EngineControllerTest(unittest.TestCase):
         self.assertIsNone(FakeProxy.last_instance.resilience)
         ctrl.stop()
 
+    # -- remote signed strategies integration ----------------------------
+
+    def test_remote_strategies_feed_the_prober(self):
+        """A verified remote manifest supplies the prober's candidate set."""
+        import core.strategies_remote as sr
+        import core.prober as prober_mod
+        from core.prober import ProbeResult, OK, RST
+        from tests.test_strategies_remote import _sign, _signed_manifest
+
+        seed = b"\x21" * 32
+        url = "https://mirror/strategies.json"
+        recipes = [
+            {"strategy": "fake_disorder", "score": 0.6},
+            {"strategy": "fake_ttl", "score": 0.9},
+        ]
+        raw, sig, pub = _signed_manifest(seed, 3, recipes)
+        store = {url: raw, url + ".sig": sig}
+
+        saved_pk = sr.TRUSTED_PUBLIC_KEY_HEX
+        saved_fetch = sr.urllib_fetcher
+        saved_probe = prober_mod.tcp_probe
+        sr.TRUSTED_PUBLIC_KEY_HEX = pub.hex()
+        sr.urllib_fetcher = lambda timeout=8.0: (lambda u: store[u])
+
+        # only fake_ttl (the manifest's top recipe) succeeds
+        def fake_probe(candidate, host, port, timeout):
+            if candidate.strategy == "fake_ttl":
+                return ProbeResult(candidate, OK, latency_ms=3.0)
+            return ProbeResult(candidate, RST)
+        prober_mod.tcp_probe = fake_probe
+        try:
+            ctrl = EngineController({
+                "connection_mode": "SNI Only", "LISTEN_PORT": 40443,
+                "CONNECT_IP": "9.9.9.9", "CONNECT_PORT": 443,
+                "auto_prober": True, "bypass_method": "wrong_seq",
+                "remote_strategies": True, "strategies_mirrors": [url],
+            })
+            ctrl.start()
+            self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+            self.assertEqual(FakeProxy.last_instance.bypass_method, "fake_ttl")
+            ctrl.stop()
+        finally:
+            sr.TRUSTED_PUBLIC_KEY_HEX = saved_pk
+            sr.urllib_fetcher = saved_fetch
+            prober_mod.tcp_probe = saved_probe
+
+    def test_remote_strategies_bad_signature_falls_back_to_local(self):
+        import core.strategies_remote as sr
+        import core.prober as prober_mod
+        from core.prober import ProbeResult, OK
+        from tests.test_strategies_remote import _signed_manifest
+
+        seed = b"\x22" * 32
+        url = "https://mirror/strategies.json"
+        raw, _sig, pub = _signed_manifest(seed, 3)
+        store = {url: raw, url + ".sig": bytes(64)}  # invalid signature
+
+        saved_pk = sr.TRUSTED_PUBLIC_KEY_HEX
+        saved_fetch = sr.urllib_fetcher
+        saved_probe = prober_mod.tcp_probe
+        sr.TRUSTED_PUBLIC_KEY_HEX = pub.hex()
+        sr.urllib_fetcher = lambda timeout=8.0: (lambda u: store[u])
+        # every local candidate succeeds; first by prior wins
+        prober_mod.tcp_probe = lambda c, h, p, t: ProbeResult(c, OK, latency_ms=1.0)
+        try:
+            ctrl = EngineController({
+                "connection_mode": "SNI Only", "LISTEN_PORT": 40443,
+                "CONNECT_IP": "9.9.9.9", "CONNECT_PORT": 443,
+                "auto_prober": True, "bypass_method": "wrong_seq",
+                "remote_strategies": True, "strategies_mirrors": [url],
+            })
+            logs = []
+            ctrl.on_log = logs.append
+            ctrl.start()
+            self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+            # rejected manifest → local registry was used (a known strategy)
+            from strategies import REGISTRY
+            self.assertIn(FakeProxy.last_instance.bypass_method, REGISTRY)
+            ctrl.stop()
+        finally:
+            sr.TRUSTED_PUBLIC_KEY_HEX = saved_pk
+            sr.urllib_fetcher = saved_fetch
+            prober_mod.tcp_probe = saved_probe
+
     def test_resilience_chain_includes_extra_ips(self):
         ctrl = EngineController({
             "connection_mode": "SNI Only",

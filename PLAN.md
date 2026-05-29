@@ -41,7 +41,7 @@
 - [x] استپ ۸ — لایه‌ی fragmentation: TCP split + TLS record fragmentation (مستقل از موقعیت)  ✅ 2026-05-29
 - [x] استپ ۹ — **غول آخر: Auto-Prober** — تست خودکار استراتژی‌ها، ranking، انتخاب/قفل خودکار  ✅ 2026-05-29
 - [x] استپ ۱۰ — تاب‌آوری: تشخیص RST جعلی، throttle، چرخش CONNECT_IP/استراتژی، fallback chain  ✅ 2026-05-29
-- [ ] استپ ۱۱ — strategies.json از راه دور (mirror + امضا) برای آپدیت بدون انتشار اپ
+- [x] استپ ۱۱ — strategies.json از راه دور (mirror + امضا) برای آپدیت بدون انتشار اپ  ✅ 2026-05-29
 - [ ] استپ ۱۲ — صفحه‌ی Strategy/Diagnostics در UI (نمایش استراتژی فعال، نمودار سلامت، probeها)
 - [ ] استپ ۱۳ — Packaging: PyInstaller (یک exe)، آیکون، تست build، bundle نهایی
 
@@ -173,6 +173,22 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **`core/config_store.py`** — کلیدهای `resilience` (پیش‌فرض True)، `rst_budget` (۳)، `throttle_ratio` (۰.۴) به `DEFAULT_CONFIG`.
 - تست‌ها: `tests/test_resilience.py` (۲۰ تست: کلاسبندی RST جعلی/واقعی/TTL، تشخیص/بازیابی throttle، بودجه/چرخش/پایان کنترلر) + ۳ تست integration در `tests/test_engine.py` (ساخت و تحویل کنترلر، خاموش‌کردن resilience، گنجاندن IPهای اضافی). مجموعاً **۱۳۹ تست سبز**.
 - **اعمال زنده:** خود drop کردن RST و چرخش استراتژی/IP در حین جلسه در runtime ویندوز (`fake_tcp.py`/`main.py` با pydivert) رخ می‌دهد؛ engine کنترلر و زنجیره‌ها را آماده/قفل می‌کند و آن را در اختیار proxy می‌گذارد (سیم‌کشی صریح، آزمون‌پذیر).
+
+## ✅ استپ ۱۱ — جزئیات پیاده‌سازی (2026-05-29)
+هدف: anti-dictation — وقتی سانسور یک ترفند را در سطح ملی مسدود کرد، با آپدیت یک فایل **داده** (نه کد) و **امضاشده** ترفند جدید پخش شود، بدون انتشار نسخه‌ی جدید اپ.
+- **`core/ed25519.py`** — وریفایر Ed25519 (RFC 8032) **خالص پایتون، فقط verify**، بدون هیچ وابستگی (نه `cryptography` نه `PyNaCl`) تا exia تک‌فایلی PyInstaller سبک بماند و کد قابل‌ممیزی باشد. کلید خصوصی آفلاین نزد maintainer می‌ماند؛ اپ فقط داده‌ی عمومیِ منتشرشده را verify می‌کند. روی بردار تست RFC 8032 و round-trip با signer تست‌شده.
+- **`core/strategies_remote.py`** — کانال آپدیت امضاشده، **داده‌ی خالص و شبکه‌تزریق‌پذیر** (fetcher بیرونی → روی sandbox بدون HTTP واقعی تست می‌شود):
+  - `Recipe` — رسپیِ اعلانی = کلید استراتژیِ شناخته‌شده + پارامترهای fragmentation (هیچ کد اجرایی؛ mirror آلوده نمی‌تواند چیزی اجرا کند). `key` مثل `fake_ttl+ftcp+ftls48`.
+  - `Manifest.parse` — اعتبارسنجی ساختاری سخت (version صحیح، recipes غیرخالی، strategy ناخالی، tls_chunk مثبت...).
+  - `canonical_bytes` — سریال‌سازی canonical (sorted keys، بدون whitespace) به‌عنوان پیام امضا تا signer/verifier بایت‌به‌بایت توافق کنند فارغ از فرمت فایل.
+  - `verify_manifest` / `trusted_public_key` (کلید عمومیِ embed‌شده) / `urllib_fetcher` (fetcher واقعیِ stdlib برای runtime).
+  - `StrategiesUpdater` — چند mirror را به‌ترتیب امتحان می‌کند؛ اولین payloadِ **به‌درستی امضاشده** با `version` اکیداً بزرگ‌تر را می‌پذیرد؛ هر شکست fetch/verify/parse فقط log و skip می‌شود (fail-closed روی trust؛ mirror بد نه downgrade می‌کند نه خراب). `to_candidates`/`score_priors` رسپی‌ها را به `Candidate` پرابر نگاشت می‌کند و استراتژی‌های ناشناختهٔ remote را بی‌سروصدا فیلتر می‌کند.
+- **`core/engine.py`** — `_load_remote_strategies()`: اگر `remote_strategies` روشن و mirror تنظیم باشد، manifest را fetch/verify می‌کند؛ `_choose_bypass_method` در صورت موفقیت، **مجموعه‌ی کاندیدا + priorها** را از manifest می‌گیرد (وگرنه رجیستری محلی). fail-soft کامل (Start هرگز بلاک نمی‌شود).
+- **`core/config_store.py`** — کلیدهای `remote_strategies` (پیش‌فرض False) و `strategies_mirrors` (لیست URLها).
+- **`tools/sign_strategies.py`** — ابزار آفلاینِ maintainer: `keygen` (تولید جفت‌کلید + چاپ کلید عمومی برای embed) و `sign` (امضای manifest + self-verify). signerِ RFC 8032 خودکفا روی همان field-mathِ وریفایر، بدون وابستگی.
+- **`strategies.example.json`** — نمونه‌ی فرمت manifest.
+- تست‌ها: `tests/test_strategies_remote.py` (۲۴ تست: وریفایر Ed25519 + بردار RFC، sign/verify round-trip، رد امضا/کلید/دادهٔ دستکاری‌شده، parse/validation، canonicalization، mirror-walk/version/trust، نگاشت candidate) + ۲ تست integration در `tests/test_engine.py` (تغذیه‌ی پرابر از manifest امضاشده، fallback روی امضای بد). مجموعاً **۱۶۵ تست سبز** + round-trip واقعی keygen→sign→load با ابزار.
+- **اعمال داغ زنده** (re-fetch دوره‌ای حین اجرا) به‌صورت طبیعی در استپ UI/runtime آینده اضافه می‌شود؛ منطق load/verify/merge اینجا کامل و آزمون‌پذیر است.
 
 ## 📌 یادداشت‌های فنی
 - WinDivert نیاز به admin دارد (`_ensure_admin` موجود حفظ شود).
