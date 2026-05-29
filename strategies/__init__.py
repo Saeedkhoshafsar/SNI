@@ -22,6 +22,10 @@ from strategies.base import (
 
 # Importing the implementations registers them as a side effect.
 from strategies import wrong_seq as _wrong_seq  # noqa: F401
+from strategies import wrong_checksum as _wrong_checksum  # noqa: F401
+from strategies import fake_ttl as _fake_ttl  # noqa: F401
+from strategies import multi_fake as _multi_fake  # noqa: F401
+from strategies import fake_disorder as _fake_disorder  # noqa: F401
 
 __all__ = [
     "BypassStrategy", "StrategyMeta", "register", "get_strategy",

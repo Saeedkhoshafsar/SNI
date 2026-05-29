@@ -47,6 +47,24 @@ class BypassStrategy:
     meta: StrategyMeta = StrategyMeta(
         key="base", title="Base", description="(abstract)", implemented=False)
 
+    # -- shared building block --------------------------------------------
+    @staticmethod
+    def apply_fake_payload(packet: Any, connection: Any) -> None:
+        """Common mutation shared by every fake-injection technique.
+
+        Turns the cloned ACK into a PSH segment carrying ``connection.fake_data``
+        (the bogus 517-byte ClientHello), grows the IP length accordingly, and
+        bumps the IPv4 identification field so the fake looks like a fresh
+        datagram. This is exactly the prologue that the original code ran for
+        *every* method before the wrong-seq tweak; strategies layer their own
+        distinguishing mutation (seq / checksum / TTL / ordering) on top.
+        """
+        packet.tcp.psh = True
+        packet.ip.packet_len = packet.ip.packet_len + len(connection.fake_data)
+        packet.tcp.payload = connection.fake_data
+        if getattr(packet, "ipv4", None) is not None:
+            packet.ipv4.ident = (packet.ipv4.ident + 1) & 0xFFFF
+
     # -- core hook --------------------------------------------------------
     def mutate_fake_packet(self, packet: Any, connection: Any) -> None:
         """Mutate *packet* in place for injection. Override in subclasses.

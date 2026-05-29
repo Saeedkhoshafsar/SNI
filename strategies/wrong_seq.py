@@ -28,12 +28,8 @@ class WrongSeqStrategy(BypassStrategy):
     )
 
     def mutate_fake_packet(self, packet: Any, connection: Any) -> None:
-        # mark as data push and append the fake payload
-        packet.tcp.psh = True
-        packet.ip.packet_len = packet.ip.packet_len + len(connection.fake_data)
-        packet.tcp.payload = connection.fake_data
-        if getattr(packet, "ipv4", None) is not None:
-            packet.ipv4.ident = (packet.ipv4.ident + 1) & 0xFFFF
+        # mark as data push and append the fake payload (shared prologue)
+        self.apply_fake_payload(packet, connection)
         # the defining move: a sequence number before the window
         packet.tcp.seq_num = (
             connection.syn_seq + 1 - len(packet.tcp.payload)) & 0xFFFFFFFF

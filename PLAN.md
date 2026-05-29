@@ -37,7 +37,7 @@
 - [x] استپ ۴ — **یکپارچه‌سازی هسته v2rayN-style** + زنجیر خودکار spoofing زیر اتصال (حذف 127.0.0.1:40443 دستی)  ✅ 2026-05-29
 - [x] استپ ۵ — اتصال UI به هسته (پروفایل‌ها/start/stop/callbackها) + مدیریت config  ✅ 2026-05-29
 - [x] استپ ۶ — StrategyEngine: استخراج interface تکنیک + ثبت تکنیک‌های موجود (wrong_seq)  ✅ 2026-05-29
-- [ ] استپ ۷ — افزودن تکنیک‌ها: wrong_checksum (فعال‌سازی)، fake_ttl، multi-fake، split/disorder
+- [x] استپ ۷ — افزودن تکنیک‌ها: wrong_checksum (فعال‌سازی)، fake_ttl، multi-fake، split/disorder  ✅ 2026-05-29
 - [ ] استپ ۸ — لایه‌ی fragmentation: TCP split + TLS record fragmentation (مستقل از موقعیت)
 - [ ] استپ ۹ — **غول آخر: Auto-Prober** — تست خودکار استراتژی‌ها، ranking، انتخاب/قفل خودکار
 - [ ] استپ ۱۰ — تاب‌آوری: تشخیص RST جعلی، throttle، چرخش CONNECT_IP/استراتژی، fallback chain
@@ -127,6 +127,16 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - `strategies/__init__.py` — API عمومی + import جانبی `wrong_seq` برای self-register.
 - `fake_tcp.py` — `fake_send_thread` بازنویسی شد: به‌جای `if bypass_method == "wrong_seq" … else sys.exit("not implemented")`، حالا از رجیستری استفاده می‌کند: `strategy = get_strategy(connection.bypass_method); strategy.mutate_fake_packet(...); strategy.send_fake(...)`. خطای کلید ناشناخته به‌جای کشتن پروسه فقط لاگ می‌شود. (`import sys` همچنان لازم است — در `inject()` برای "impossible direction!".)
 - تست‌ها: `tests/test_strategies.py` (۲۰ تست) با fakeهای duck-typed برای packet/connection/injector — رجیستری، KeyError، all_strategies، متادیتا/score، فرمول wrong_seq + wrap امضانشده ۳۲بیتی، bump و wrap ۱۶بیتی ipv4.ident، مسیر IPv6 (ipv4=None)، و رفتار `send_fake`. مجموعاً **۵۷ تست سبز** (هم direct-run هم pytest).
+
+## ✅ استپ ۷ — جزئیات پیاده‌سازی (2026-05-29)
+- **هلپر مشترک** در `strategies/base.py`: متد استاتیک `apply_fake_payload(packet, connection)` که پرولوگ مشترک همه‌ی تکنیک‌های fake را اجرا می‌کند (psh + افزودن fake payload + رشد packet_len + bump ipv4.ident). `wrong_seq` هم بازآرایی شد تا از همین هلپر استفاده کند (رفتار دست‌نخورده).
+- **`strategies/wrong_checksum.py`** — `WrongChecksumStrategy`: seq داخل پنجره + checksum عمداً نامعتبر (`0x0000`)؛ سرور بسته را دور می‌ریزد ولی DPIِ بی‌توجه به checksum، SNI جعلی را ثبت می‌کند. **بحرانی:** `send_fake` با `recalc=False` ارسال می‌کند تا WinDivert checksum را «تعمیر» نکند. `score()=0.6`.
+- **`strategies/fake_ttl.py`** — `FakeTTLStrategy`: TTL پایین (پیش‌فرض ۴، قابل override با `connection.fake_ttl`) تا بسته فقط به DPI برسد نه سرور؛ مسیر IPv6 از `ipv6.hop_limit` استفاده می‌کند. `score()=0.55`.
+- **`strategies/multi_fake.py`** — `MultiFakeStrategy`: همان mutation wrong_seq + ارسال چندباره (پیش‌فرض ۳، قابل override با `connection.fake_repeat`) در `send_fake`. `score()=0.65`.
+- **`strategies/fake_disorder.py`** — `FakeDisorderStrategy`: دو کپی نامرتب با seqهای متفاوت (هر دو خارج از پنجره) برای مختل‌کردن بازچینی DPI. `score()=0.6`.
+- **`strategies/__init__.py`** — هر چهار تکنیک جدید side-effect import شدند تا self-register شوند. حالا REGISTRY شامل ۵ استراتژی است.
+- **هم‌خوانی با UI:** `STRATEGIES` در `ui/window.py` (که از قبل هر ۵ کلید را لیست کرده بود) حالا کاملاً با پیاده‌سازی‌های واقعی پشتیبانی می‌شود — هیچ منوی «coming soon» باقی نمانده.
+- تست‌ها: `tests/test_strategies.py` گسترش یافت (۳۵ تست) — fakeها حالا `checksum`/`ttl`/`ipv6.hop_limit` دارند؛ تست متادیتا/score هر تکنیک، corrupt-checksum + ارسال recalc=False، TTL/hop_limit + override، تعداد ارسال multi_fake + override، دو کپی fake_disorder با seq متفاوت، و شبیه‌سازی ترتیب dispatch واقعی. مجموعاً **۷۲ تست سبز**.
 
 ## 📌 یادداشت‌های فنی
 - WinDivert نیاز به admin دارد (`_ensure_admin` موجود حفظ شود).
