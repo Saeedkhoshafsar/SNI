@@ -43,7 +43,7 @@
 - [x] استپ ۱۰ — تاب‌آوری: تشخیص RST جعلی، throttle، چرخش CONNECT_IP/استراتژی، fallback chain  ✅ 2026-05-29
 - [x] استپ ۱۱ — strategies.json از راه دور (mirror + امضا) برای آپدیت بدون انتشار اپ  ✅ 2026-05-29
 - [x] استپ ۱۲ — صفحه‌ی Strategy/Diagnostics در UI (نمایش استراتژی فعال، نمودار سلامت، probeها)  ✅ 2026-05-29
-- [ ] استپ ۱۳ — Packaging: PyInstaller (یک exe)، آیکون، تست build، bundle نهایی
+- [x] استپ ۱۳ — Packaging: PyInstaller (یک exe)، آیکون، self-elevate admin، تست build، bundle نهایی  ✅ 2026-05-29
 
 ---
 
@@ -201,8 +201,22 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **`ui/window.py`** — صفحه‌ی جدید **`DiagnosticsPage`**: یک **renderer نازک** که `engine.diagnostics()` را روی `QTimer` (هر ۱ ثانیه) poll می‌کند و فقط هنگام نمایشِ صفحه فعال است (`start_polling`/`stop_polling` در `_on_page_changed`). نمایش: کارت خلاصه (استراتژی فعال + وضعیت + پورت)، کارت throughput (نوار درصدِ recent/baseline + برچسب throttle + شمارش RST جعلی/بودجه + زنجیره‌های fallback)، و جدول کاندیداها (امتیاز/موفقیت/نمونه/outcome با نشانگر ★ برای انتخاب‌شده). آیتم navigation ششم «تشخیص» اضافه شد (Log به انتها رفت).
 - تست‌ها: `tests/test_diagnostics.py` (۷ تست هسته با AutoProber/ResilienceController واقعی) + `tests/test_diagnostics_page.py` (۵ تست render headless آف‌اسکرین، با skip مودبانه در نبود Qt). مجموعاً **۱۷۷ تست سبز** + smoke test موفق MainWindow (۶ صفحه، toggle شدن polling).
 
+## ✅ استپ ۱۳ — جزئیات پیاده‌سازی (2026-05-29) — استپِ آخرِ roadmap
+هدف: تبدیل پروژه به یک **exe تک‌فایلیِ ویندوزی** با PyInstaller که باینری‌ها (xray/vwarp/wintun + WinDivert) را embed می‌کند، آیکون دارد و در صورت نبودِ دسترسی Administrator خودش را **elevate** می‌کند.
+- **`core/admin.py`** — هلپرِ self-elevation **خالص و قابل‌تست روی هر OS**؛ فقط فراخوانیِ واقعیِ `ShellExecuteW` ویندوز-اونلی است:
+  - `is_windows()` / `is_frozen()` (تشخیص `sys.frozen`).
+  - `is_admin(checker=None)` — پیش‌فرض `ctypes.windll.shell32.IsUserAnAdmin()`؛ غیرِویندوز True (چیزی برای elevate نیست). `checker` برای تست تزریق می‌شود.
+  - `relaunch_params(argv, frozen)` — مونتاژِ خالصِ `(exe, params)`: بیلدِ frozen آرگ‌ها را از `argv[1:]` می‌گیرد، حالتِ dev کلِ `argv`. از `subprocess.list2cmdline` برای quoting صحیح استفاده می‌کند.
+  - `ensure_admin(argv, *, is_admin_checker, runner)` — فقط روی ویندوز و وقتی admin نیست relaunch می‌کند؛ True یعنی «relaunch شد، پروسه باید خارج شود». `runner` اجازه می‌دهد تست‌ها فراخوانی را بدون دست‌زدن به Win32 کپچر کنند.
+- **`app.py`** — **entrypointِ نازکِ سطح‌بالا** که PyInstaller freeze می‌کند: ابتدا `ensure_admin(argv)` (اگر relaunch شد، `return 0`)، سپس `ui.app_qt.main(theme=...)`. فلگِ سبکِ `--theme {light,dark}` پشتیبانی می‌شود و فلگ‌های ناشناخته نادیده گرفته می‌شوند تا relaunch خراب نشود.
+- **`SNISpoofer.spec`** — اسپکِ PyInstaller: `--onefile` معادل، **بدون کنسول** (`console=False`)، مپِ کلِ `bin/` به `bin/` (هماهنگ با `core/binary_utils.get_bin_dir()` و `_MEIPASS/bin`)، جمع‌آوریِ WinDivert از pydivert با `collect_data_files` + `collect_dynamic_libs`، آیکون، hidden-importها و excludeهای حجمی (tkinter/numpy/PIL/QtWebEngine...).
+- **`scripts/build_exe.py`** — هلپرِ buildِ یک‌مرحله‌ای با **preflight** (باید ویندوز باشد، PyInstaller نصب باشد، `bin/` کامل باشد)، ساختِ آیکون در صورت نبودن، پاک‌سازیِ `build/`+`dist/`، اجرای PyInstaller و گزارشِ `dist/SNISpoofer.exe`. روی Linux import-safe است (فقط روی ویندوز واقعاً build می‌کند).
+- **`scripts/make_icon.py` + `assets/app.ico`** — تولیدِ آیکونِ چندسایزه (16…256) با Pillow؛ سپرِ تیره با گلیفِ «S» نئونیِ سایان-تیل (#27e0c8) و رینگِ بنفش (#9b7bff) هماهنگ با theme.
+- **`requirements-build.txt`** — وابستگی‌های build جدا (`pyinstaller`, `pillow`) تا requirements اصلیِ runtime تمیز بماند.
+- تست‌ها: `tests/test_admin.py` (۱۳ تست، با ۲ مورد skip روی غیرِویندوز)، `tests/test_app_entry.py` (۵ تست، با Qt تزریق‌شده‌ی فِیک)، `tests/test_build_exe.py` (۶ تست: preflight/spec-parse/ico-header). مجموعاً **۱۹۴ تست سبز + ۷ skip**.
+
 ## 📌 یادداشت‌های فنی
-- WinDivert نیاز به admin دارد (`_ensure_admin` موجود حفظ شود).
+- WinDivert نیاز به admin دارد — اکنون توسط `core/admin.ensure_admin` در `app.py` با `ShellExecuteW(..,"runas",..)` خودکار elevate می‌شود.
 - روی sandbox فقط import/syntax تست می‌شود؛ نمایش گرافیکی و WinDivert روی ویندوز کاربر است.
 - `ClientHelloMaker` (۵۱۷ بایت) مرجع همه‌ی استراتژی‌های مبتنی بر fake است — دست‌نخورده می‌ماند.
 - tkinter (`gui.py`, `gui_old2.py`) بعد از تثبیت UI جدید آرشیو/حذف می‌شود.

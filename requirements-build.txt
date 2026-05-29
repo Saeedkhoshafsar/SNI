@@ -1,0 +1,6 @@
+# Build-time dependencies for packaging the Windows exe (step 13).
+# Install alongside requirements.txt ON WINDOWS:
+#   pip install -r requirements.txt -r requirements-build.txt
+#   python scripts/build_exe.py
+pyinstaller>=6.0
+pillow>=10.0        # icon generation (scripts/make_icon.py)
