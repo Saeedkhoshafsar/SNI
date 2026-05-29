@@ -72,3 +72,34 @@ class TestIconAsset(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestReleaseWorkflow(unittest.TestCase):
+    """Guard the CI workflow against regressing to the old tkinter entrypoint.
+
+    The canonical workflow lives at ``ci/release.yml`` (a regular file the bot
+    is allowed to push). The user copies it into ``.github/workflows/`` — see
+    BUILD.md — because GitHub Apps can't push workflow files directly.
+    """
+
+    def _wf(self):
+        path = os.path.join(ROOT, "ci", "release.yml")
+        with open(path, "r", encoding="utf-8") as fp:
+            return fp.read()
+
+    def test_workflow_uses_spec_not_old_gui(self):
+        wf = self._wf()
+        self.assertIn("SNISpoofer.spec", wf)
+        # must NOT build the archived tkinter GUI
+        self.assertNotIn("gui.py", wf)
+        self.assertNotIn("gui_old2", wf)
+
+    def test_workflow_uploads_artifact(self):
+        wf = self._wf()
+        self.assertIn("upload-artifact", wf)
+
+    def test_old_gui_is_archived(self):
+        # old GUIs live under legacy/, not at project root
+        self.assertFalse(os.path.isfile(os.path.join(ROOT, "gui.py")))
+        self.assertFalse(os.path.isfile(os.path.join(ROOT, "gui_old2.py")))
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, "legacy", "gui.py")))

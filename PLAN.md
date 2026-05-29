@@ -215,8 +215,19 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **`requirements-build.txt`** — وابستگی‌های build جدا (`pyinstaller`, `pillow`) تا requirements اصلیِ runtime تمیز بماند.
 - تست‌ها: `tests/test_admin.py` (۱۳ تست، با ۲ مورد skip روی غیرِویندوز)، `tests/test_app_entry.py` (۵ تست، با Qt تزریق‌شده‌ی فِیک)، `tests/test_build_exe.py` (۶ تست: preflight/spec-parse/ico-header). مجموعاً **۱۹۴ تست سبز + ۷ skip**.
 
+## ✅ نظافتِ پس از roadmap (2026-05-29) — CI و آرشیو
+بعد از کاملِ شدن استپ‌های ۱…۱۳، کارهای پایانی:
+- **آرشیوِ tkinter قدیمی** — `gui.py` و `gui_old2.py` با `git mv` به `legacy/` منتقل شدند (تاریخچه حفظ شد) و `legacy/README.md` توضیحِ بازنشستگی را دارد. هیچ کدِ فعالی به آن‌ها وابسته نیست.
+- **workflowِ جدید در `ci/release.yml` آماده شد (کاربر یک‌بار به `.github/workflows/` می‌بَرَد — محدودیتِ push رباتِ گیت‌هاب)** — build خودکارِ exe روی **ویندوزِ GitHub Actions**:
+  - روی هر push به `main` / هر PR / اجرای دستی → exe ساخته و به‌عنوان **Artifact** آپلود می‌شود (دانلود از تب Actions، **بدون نیاز به tag**).
+  - روی push یک tag مثل `v1.0.0` → علاوه بر artifact، یک **GitHub Release** با فایل zip ساخته می‌شود.
+  - از `SNISpoofer.spec` + `app.py` جدید استفاده می‌کند (نه `gui.py` قدیمی)؛ باینری‌ها از repo می‌آیند و در صورت غیاب با `scripts/download_bins.py` دانلود می‌شوند (fail-soft).
+- **تست‌های نگهبان** در `tests/test_build_exe.py` اضافه شد (workflow باید spec را build کند نه gui.py؛ artifact آپلود شود؛ gui.py در `legacy/` باشد). مجموعاً **۱۹۷ تست سبز + ۷ skip**.
+- **`BUILD.md`** — راهنمای کاملِ فارسیِ ساختِ exe (هم از GitHub Actions بدون نصبِ چیزی، هم دستی روی ویندوز) + عیب‌یابی؛ از README لینک شد.
+
 ## 📌 یادداشت‌های فنی
 - WinDivert نیاز به admin دارد — اکنون توسط `core/admin.ensure_admin` در `app.py` با `ShellExecuteW(..,"runas",..)` خودکار elevate می‌شود.
 - روی sandbox فقط import/syntax تست می‌شود؛ نمایش گرافیکی و WinDivert روی ویندوز کاربر است.
 - `ClientHelloMaker` (۵۱۷ بایت) مرجع همه‌ی استراتژی‌های مبتنی بر fake است — دست‌نخورده می‌ماند.
-- tkinter (`gui.py`, `gui_old2.py`) بعد از تثبیت UI جدید آرشیو/حذف می‌شود.
+- tkinter (`gui.py`, `gui_old2.py`) آرشیو شد → `legacy/`.
+- **ساختِ exe**: نیازی به ثبتِ هیچ secret دستی در GitHub نیست؛ `GITHUB_TOKEN` به‌صورت خودکار توسط Actions تزریق می‌شود. فقط push کن یا tag بزن.
