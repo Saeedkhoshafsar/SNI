@@ -38,7 +38,7 @@
 - [x] استپ ۵ — اتصال UI به هسته (پروفایل‌ها/start/stop/callbackها) + مدیریت config  ✅ 2026-05-29
 - [x] استپ ۶ — StrategyEngine: استخراج interface تکنیک + ثبت تکنیک‌های موجود (wrong_seq)  ✅ 2026-05-29
 - [x] استپ ۷ — افزودن تکنیک‌ها: wrong_checksum (فعال‌سازی)، fake_ttl، multi-fake، split/disorder  ✅ 2026-05-29
-- [ ] استپ ۸ — لایه‌ی fragmentation: TCP split + TLS record fragmentation (مستقل از موقعیت)
+- [x] استپ ۸ — لایه‌ی fragmentation: TCP split + TLS record fragmentation (مستقل از موقعیت)  ✅ 2026-05-29
 - [ ] استپ ۹ — **غول آخر: Auto-Prober** — تست خودکار استراتژی‌ها، ranking، انتخاب/قفل خودکار
 - [ ] استپ ۱۰ — تاب‌آوری: تشخیص RST جعلی، throttle، چرخش CONNECT_IP/استراتژی، fallback chain
 - [ ] استپ ۱۱ — strategies.json از راه دور (mirror + امضا) برای آپدیت بدون انتشار اپ
@@ -137,6 +137,17 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **`strategies/__init__.py`** — هر چهار تکنیک جدید side-effect import شدند تا self-register شوند. حالا REGISTRY شامل ۵ استراتژی است.
 - **هم‌خوانی با UI:** `STRATEGIES` در `ui/window.py` (که از قبل هر ۵ کلید را لیست کرده بود) حالا کاملاً با پیاده‌سازی‌های واقعی پشتیبانی می‌شود — هیچ منوی «coming soon» باقی نمانده.
 - تست‌ها: `tests/test_strategies.py` گسترش یافت (۳۵ تست) — fakeها حالا `checksum`/`ttl`/`ipv6.hop_limit` دارند؛ تست متادیتا/score هر تکنیک، corrupt-checksum + ارسال recalc=False، TTL/hop_limit + override، تعداد ارسال multi_fake + override، دو کپی fake_disorder با seq متفاوت، و شبیه‌سازی ترتیب dispatch واقعی. مجموعاً **۷۲ تست سبز**.
+
+## ✅ استپ ۸ — جزئیات پیاده‌سازی (2026-05-29)
+- **`core/fragment.py`** — لایه‌ی fragmentation به‌صورت **داده‌ی خالص، بدون pydivert/OS** (کاملاً قابل تست روی sandbox و مسیر آینده‌ی چندپلتفرمی):
+  - پارسر هدر TLS record: `parse_record_header` (type/version/body_len)، `is_tls_handshake`.
+  - **یافتن SNI:** `find_sni_offset` ساختار کامل ClientHello را می‌پیماید (record → handshake → random → session_id → cipher_suites → compression → extensions → server_name) و آفست دقیق رشته‌ی hostname را برمی‌گرداند؛ روی buffer خراب/کوتاه به‌جای exception مقدار `None` می‌دهد. روی ClientHelloِ واقعیِ `ClientHelloMaker` آفست = ۱۲۷ (دقیقاً منطبق با ثابت داخلی template).
+  - **TCP segmentation:** `tcp_segment_at` (تقسیم در آفست دلخواه) + `tcp_segment_at_sni` (تقسیم داخل خود رشته‌ی SNI، با fallback روی نبود SNI) — کاملاً lossless.
+  - **TLS record fragmentation:** `split_tls_records` یک record را به چند record کوچک‌تر با هدر معتبر می‌شکند (content-type/version حفظ می‌شود)؛ `reassemble_tls_records` معکوس آن برای اثبات lossless بودنِ *بدنه‌ی* handshake. توجه: stream نهایی به‌خاطر هدرهای اضافه‌ی record بزرگ‌تر می‌شود (byte-identical نیست) ولی به همان handshake بازچینی می‌شود.
+  - **ورودی سطح‌بالا:** `fragment_client_hello(data, tcp=, tls=, tls_chunk=)` — لایه‌ها را به ترتیب اعمال می‌کند (اول TLS-record بعد TCP)؛ با هر دو خاموش، خودِ `data` را به‌صورت یک chunk برمی‌گرداند تا caller همیشه بتواند روی نتیجه iterate و send کند. این نقطه‌ی اتصال آینده برای engine/auto-prober است.
+- **`core/config_store.py`** — کلیدهای `fragment_tcp`/`fragment_tls`/`fragment_tls_chunk` به `DEFAULT_CONFIG` اضافه شد تا تنظیمات persist شود و نقطه‌ی wiring صریح باشد (اعمال زنده در ProxyServer که pydivert لازم دارد، به‌طور طبیعی کنار Auto-Prober استپ ۹ سیم‌کشی می‌شود).
+- **باگ یافته‌شده و حل‌شده (همین استپ):** نسخه‌ی record-layer در ClientHelloِ tool‏ مقدار `0x0301` است نه `0x0303` (TLS 1.3 برای سازگاری). دو تست که `0x0303` را hard-code کرده بودند fail شدند؛ به استخراج version واقعیِ همان record اصلاح شدند. ضمناً فرض اشتباه «byte-identical بودن stream بعد از TLS-fragmentation» در دو تست اصلاح شد (stream رشد می‌کند، فقط بازچینیِ بدنه lossless است).
+- تست‌ها: `tests/test_fragment.py` (۲۲ تست، روی ClientHelloِ واقعی ۵۱۷ بایتی) — پارس هدر، یافتن SNI با طول‌های مختلف + ورودی غیر-TLS/کوتاه، segmentation و straddle شدن SNI، fragmentation رکورد و صحت هدر/اندازه‌ها، رد chunk_size نامعتبر، و ترکیب دو لایه. مجموعاً **۹۴ تست سبز**.
 
 ## 📌 یادداشت‌های فنی
 - WinDivert نیاز به admin دارد (`_ensure_admin` موجود حفظ شود).
