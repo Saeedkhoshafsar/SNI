@@ -41,6 +41,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "fragment_tcp": False,        # split the real ClientHello across TCP segments
     "fragment_tls": False,        # rewrite the ClientHello as smaller TLS records
     "fragment_tls_chunk": 64,     # bytes per TLS record when fragment_tls is on
+    # resilience layer (core.resilience) — survive active censorship
+    "resilience": True,           # detect forged RSTs / throttling and rotate
+    "rst_budget": 3,              # forged RSTs to ignore before rotating strategy
+    "throttle_ratio": 0.4,        # recent_rate < ratio*baseline ⇒ throttled
     "theme": "dark",
 }
 
