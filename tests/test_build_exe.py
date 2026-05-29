@@ -77,15 +77,19 @@ if __name__ == "__main__":
 class TestReleaseWorkflow(unittest.TestCase):
     """Guard the CI workflow against regressing to the old tkinter entrypoint.
 
-    The canonical workflow lives at ``ci/release.yml`` (a regular file the bot
-    is allowed to push). The user copies it into ``.github/workflows/`` — see
-    BUILD.md — because GitHub Apps can't push workflow files directly.
+    The active workflow lives at ``.github/workflows/release.yml`` (this is what
+    GitHub Actions runs and what produced the working exe). A copy at
+    ``ci/release.yml`` may exist as a fallback for environments where the bot
+    cannot push workflow files directly — see BUILD.md.
     """
 
     def _wf(self):
-        path = os.path.join(ROOT, "ci", "release.yml")
-        with open(path, "r", encoding="utf-8") as fp:
-            return fp.read()
+        for rel in ((".github", "workflows", "release.yml"), ("ci", "release.yml")):
+            path = os.path.join(ROOT, *rel)
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as fp:
+                    return fp.read()
+        raise FileNotFoundError("no release.yml found in .github/workflows or ci/")
 
     def test_workflow_uses_spec_not_old_gui(self):
         wf = self._wf()

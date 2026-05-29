@@ -32,6 +32,7 @@ class FakeProxy:
         self.on_log = None
         self.on_status_change = None
         self.on_connection_count_change = None
+        self.on_traffic = None
         self.started = False
         self.stopped = False
         FakeProxy.last_instance = self
@@ -185,6 +186,35 @@ class EngineControllerTest(unittest.TestCase):
         self.assertIn((3, 10), counts)
         ctrl.stop()
 
+    def test_strategy_callback_fires_and_active_strategy_consistent(self):
+        # SNI Only, no auto-prober → the configured method is what's in force,
+        # and it must be reported to the UI exactly once on start.
+        ctrl = EngineController(
+            {"connection_mode": "SNI Only", "bypass_method": "fake_ttl"})
+        seen = []
+        ctrl.on_strategy = lambda m: seen.append(m)
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        # the dashboard (via on_strategy) and engine.active_strategy must agree
+        self.assertEqual(seen, ["fake_ttl"])
+        self.assertEqual(ctrl.active_strategy, "fake_ttl")
+        ctrl.stop()
+        # cleared on stop so a stale strategy never lingers in the UI
+        self.assertIsNone(ctrl.active_strategy)
+
+    def test_traffic_callback_forwarded_and_reset_on_stop(self):
+        ctrl = EngineController({"connection_mode": "SNI Only"})
+        traffic = []
+        ctrl.on_traffic = lambda u, d, ub, db: traffic.append((u, d, ub, db))
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        # simulate the proxy reporting live throughput
+        FakeProxy.last_instance.on_traffic(1024, 4096, 512.0, 2048.0)
+        self.assertIn((1024, 4096, 512.0, 2048.0), traffic)
+        ctrl.stop()
+        # stop emits a zeroing event so the graph returns to baseline
+        self.assertEqual(traffic[-1], (0, 0, 0.0, 0.0))
+
     def test_double_start_is_noop(self):
         ctrl = EngineController({"connection_mode": "SNI Only"})
         ctrl.start()
@@ -220,10 +250,19 @@ class EngineControllerTest(unittest.TestCase):
                 "LISTEN_PORT": 40443, "CONNECT_IP": "9.9.9.9", "CONNECT_PORT": 443,
                 "auto_prober": True, "bypass_method": "wrong_seq",
             })
+            seen = []
+            ctrl.on_strategy = lambda m: seen.append(m)
             ctrl.start()
             self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
             # engine must have locked onto the only successful candidate
             self.assertEqual(FakeProxy.last_instance.bypass_method, "fake_ttl")
+            # consistency: the strategy reported to the UI, engine.active_strategy,
+            # and the diagnostics snapshot must all agree on the prober's winner
+            # (this is the bug the user hit: dashboard said wrong_seq while
+            #  diagnostics said the probed winner).
+            self.assertEqual(seen, ["fake_ttl"])
+            self.assertEqual(ctrl.active_strategy, "fake_ttl")
+            self.assertEqual(ctrl.diagnostics().active_strategy, "fake_ttl")
             ctrl.stop()
         finally:
             prober_mod.tcp_probe = saved

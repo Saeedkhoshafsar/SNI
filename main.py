@@ -41,7 +41,15 @@ def save_config(config, config_path=None):
 #  Bidirectional relay – no mutual cancellation, clean socket shutdown
 # ---------------------------------------------------------------------------
 
-async def _relay_pair(sock_a: socket.socket, sock_b: socket.socket):
+async def _relay_pair(sock_a: socket.socket, sock_b: socket.socket,
+                      on_up=None, on_down=None):
+    """Relay bytes both ways.
+
+    ``sock_a`` is the *client* (incoming) socket and ``sock_b`` the *upstream*
+    (outgoing) socket. So ``a → b`` is **upload** and ``b → a`` is **download**.
+    Optional ``on_up`` / ``on_down`` callbacks receive the chunk length so the
+    server can keep live upload/download byte counters.
+    """
     loop = asyncio.get_running_loop()
     shutdown_initiated = False
 
@@ -56,12 +64,17 @@ async def _relay_pair(sock_a: socket.socket, sock_b: socket.socket):
             except OSError:
                 pass
 
-    async def _forward(src, dst):
+    async def _forward(src, dst, meter):
         try:
             while True:
                 data = await loop.sock_recv(src, 65536)
                 if not data:
                     break
+                if meter is not None:
+                    try:
+                        meter(len(data))
+                    except Exception:
+                        pass
                 await loop.sock_sendall(dst, data)
         except (OSError, ConnectionError, asyncio.CancelledError):
             pass
@@ -69,8 +82,8 @@ async def _relay_pair(sock_a: socket.socket, sock_b: socket.socket):
             _shutdown_both()
 
     await asyncio.gather(
-        _forward(sock_a, sock_b),
-        _forward(sock_b, sock_a),
+        _forward(sock_a, sock_b, on_up),    # client → upstream  (upload)
+        _forward(sock_b, sock_a, on_down),  # upstream → client  (download)
         return_exceptions=True,
     )
 
@@ -101,10 +114,20 @@ class ProxyServer:
         self._active_connections = 0
         self._total_connections = 0
 
+        # live traffic accounting (cumulative bytes since start)
+        self._up_bytes = 0
+        self._down_bytes = 0
+        self._last_up = 0
+        self._last_down = 0
+
+        # optional resilience controller handed in by the engine
+        self.resilience = None
+
         # UI callbacks (thread-safe, fire-and-forget)
         self.on_log = None
         self.on_status_change = None
         self.on_connection_count_change = None
+        self.on_traffic = None   # (up_bytes, down_bytes, up_bps, down_bps)
 
     # ---------------------------------------------------------------- helpers
 
@@ -126,6 +149,32 @@ class ProxyServer:
                     self._active_connections, self._total_connections)
             except Exception:
                 pass
+
+    # -- traffic metering (called from the relay, thread-confined to the loop)
+    def _add_up(self, n: int):
+        self._up_bytes += n
+
+    def _add_down(self, n: int):
+        self._down_bytes += n
+
+    async def _traffic_ticker(self):
+        """Emit cumulative bytes + a 1-second rolling rate to the UI."""
+        loop = asyncio.get_running_loop()
+        last_t = loop.time()
+        while self._running:
+            await asyncio.sleep(1.0)
+            now = loop.time()
+            dt = max(1e-6, now - last_t)
+            up_bps = (self._up_bytes - self._last_up) / dt
+            down_bps = (self._down_bytes - self._last_down) / dt
+            self._last_up, self._last_down = self._up_bytes, self._down_bytes
+            last_t = now
+            if self.on_traffic:
+                try:
+                    self.on_traffic(self._up_bytes, self._down_bytes,
+                                    max(0.0, up_bps), max(0.0, down_bps))
+                except Exception:
+                    pass
 
     @staticmethod
     def _configure_sock(sock: socket.socket, gaming: bool = False):
@@ -200,8 +249,10 @@ class ProxyServer:
             # Optimize the incoming socket too before relay
             self._configure_sock(incoming_sock, self.gaming_mode)
 
-            # Bidirectional relay – clean shutdown, no recursion
-            await _relay_pair(incoming_sock, outgoing_sock)
+            # Bidirectional relay – clean shutdown, no recursion.
+            # incoming = client, outgoing = upstream → up/down metering.
+            await _relay_pair(incoming_sock, outgoing_sock,
+                              on_up=self._add_up, on_down=self._add_down)
 
         except asyncio.CancelledError:
             pass
@@ -232,6 +283,9 @@ class ProxyServer:
         if self.on_status_change:
             self.on_status_change(True)
 
+        # start the live traffic rate emitter alongside the accept loop
+        ticker = asyncio.create_task(self._traffic_ticker())
+
         tasks: set[asyncio.Task] = set()
         try:
             while self._running:
@@ -249,10 +303,15 @@ class ProxyServer:
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
         finally:
+            ticker.cancel()
             for t in tasks:
                 t.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.gather(ticker, return_exceptions=True)
+            except Exception:
+                pass
             try:
                 self._server_sock.close()
             except OSError:

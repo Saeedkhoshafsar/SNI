@@ -27,6 +27,8 @@ class EngineBridge(QObject):
     log = Signal(str)
     status = Signal(str)          # "idle" | "connecting" | "active" | "error"
     count = Signal(int, int)      # (active, total)
+    strategy = Signal(str)        # live bypass method in force
+    traffic = Signal(int, int, float, float)  # up_bytes, down_bytes, up_bps, down_bps
 
     def __init__(self, controller: EngineController | None = None, parent=None):
         super().__init__(parent)
@@ -36,6 +38,8 @@ class EngineBridge(QObject):
         self.controller.on_log = self.log.emit
         self.controller.on_status = self.status.emit
         self.controller.on_count = self.count.emit
+        self.controller.on_strategy = self.strategy.emit
+        self.controller.on_traffic = self.traffic.emit
 
     # -- pass-through API the UI can call directly ------------------------
 

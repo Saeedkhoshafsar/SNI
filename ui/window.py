@@ -790,6 +790,9 @@ class MainWindow(QWidget):
         self.engine.status.connect(self.page_dashboard.set_status)
         self.engine.status.connect(self._on_status)
         self.engine.count.connect(self.page_dashboard.on_count)
+        # live bypass method → dashboard stays in sync with Diagnostics
+        self.engine.strategy.connect(self.page_dashboard.set_active_strategy)
+        self.engine.strategy.connect(self._on_strategy_changed)
 
         # UI → engine
         self.page_dashboard.power_handler = self._on_power
@@ -830,6 +833,9 @@ class MainWindow(QWidget):
             Toast.show_message(self, "اتصال قطع شد", "warn")
         elif status == "error":
             Toast.show_message(self, "خطا در اتصال — لاگ را ببینید", "err")
+
+    def _on_strategy_changed(self, method: str):
+        self.page_log.append(f"[strategy] استراتژی فعال: {method}")
 
     def _on_profile_selected(self, profile):
         self.engine.set_profile(profile)

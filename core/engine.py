@@ -40,6 +40,8 @@ STATUS_ERROR = "error"
 LogCb = Callable[[str], None]
 StatusCb = Callable[[str], None]
 CountCb = Callable[[int, int], None]
+StrategyCb = Callable[[str], None]
+TrafficCb = Callable[[int, int, float, float], None]  # up_bytes, down_bytes, up_bps, down_bps
 
 
 class EngineController:
@@ -53,6 +55,11 @@ class EngineController:
         self.on_log: Optional[LogCb] = None
         self.on_status: Optional[StatusCb] = None
         self.on_count: Optional[CountCb] = None
+        self.on_strategy: Optional[StrategyCb] = None   # fires when the live bypass method is (re)chosen
+        self.on_traffic: Optional[TrafficCb] = None     # fires with cumulative bytes + live rate
+
+        # the bypass method currently in force (kept in sync with the UI)
+        self._active_strategy: Optional[str] = None
 
         # internals
         self._proxy = None            # main.ProxyServer
@@ -94,6 +101,38 @@ class EngineController:
                 self.on_count(active, total)
             except Exception:
                 pass
+
+    def _emit_strategy(self, method: str) -> None:
+        """Tell the UI which bypass method is now in force.
+
+        This is the single source of truth so the Dashboard and the
+        Diagnostics page never disagree about the "active strategy".
+        """
+        self._active_strategy = method
+        if self.on_strategy:
+            try:
+                self.on_strategy(method)
+            except Exception:
+                pass
+
+    def _emit_traffic(self, up: int, down: int, up_bps: float, down_bps: float) -> None:
+        if self.on_traffic:
+            try:
+                self.on_traffic(up, down, up_bps, down_bps)
+            except Exception:
+                pass
+
+    @property
+    def active_strategy(self) -> Optional[str]:
+        """The bypass method currently in force (post auto-probe / rotation)."""
+        # prefer a live resilience rotation, then the prober's lock, then ours
+        res = self._resilience
+        if res is not None and getattr(res, "current_strategy", None):
+            return res.current_strategy
+        prober = self._prober
+        if prober is not None and getattr(prober, "selected", None) is not None:
+            return prober.selected.strategy
+        return self._active_strategy
 
     @property
     def status(self) -> str:
@@ -309,6 +348,9 @@ class EngineController:
         }
         # choose the bypass method: auto-probe if enabled, else the configured one
         bypass_method = self._choose_bypass_method(connect_ip, connect_port)
+        # single source of truth — push the live method to the UI so the
+        # Dashboard "active strategy" matches what Diagnostics shows
+        self._emit_strategy(bypass_method)
 
         # build the resilience controller for this session (forged-RST / throttle
         # detection + strategy/IP rotation) so the runtime can consult it
@@ -323,6 +365,10 @@ class EngineController:
         self._proxy.on_log = self._log
         self._proxy.on_status_change = self._on_proxy_status
         self._proxy.on_connection_count_change = self._emit_count
+        # live throughput (upload/download) — the ProxyServer reports cumulative
+        # bytes + rate; the UI turns it into the dashboard's traffic graph
+        if hasattr(self._proxy, "on_traffic"):
+            self._proxy.on_traffic = self._emit_traffic
         self._proxy.start()
 
         # --- 3. optionally chain xray core in front of the spoofer ---
@@ -371,5 +417,7 @@ class EngineController:
                 self._log(f"خطا در توقف spoofer: {exc}")
         self._spoof_port = None
         self._resilience = None
+        self._active_strategy = None
         self._set_status(STATUS_IDLE)
         self._emit_count(0, 0)
+        self._emit_traffic(0, 0, 0.0, 0.0)
