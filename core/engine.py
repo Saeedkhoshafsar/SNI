@@ -132,13 +132,43 @@ class EngineController:
             self._set_status(STATUS_ERROR)
             self.stop()
 
+    def _load_remote_strategies(self):
+        """Fetch + verify a signed ``strategies.json`` if remote updates are on.
+
+        Returns the :class:`StrategiesUpdater` whose manifest was adopted, or
+        ``None`` (remote disabled, no mirrors, fetch/verify failed). Never
+        raises — a bad/absent manifest just leaves us on the local registry.
+        """
+        if not self.config.get("remote_strategies", False):
+            return None
+        mirrors = list(self.config.get("strategies_mirrors", []) or [])
+        if not mirrors:
+            self._log("strategies از راه دور روشن است اما mirror تنظیم نشده — رد شد")
+            return None
+        try:
+            from core.strategies_remote import (
+                StrategiesUpdater, trusted_public_key, urllib_fetcher)
+
+            updater = StrategiesUpdater(
+                public_key=trusted_public_key(), mirrors=mirrors,
+                fetcher=urllib_fetcher(), on_log=self._log)
+            if updater.update():
+                return updater
+            self._log("strategies.json معتبری از mirrorها دریافت نشد — رجیستری محلی")
+            return None
+        except Exception as exc:
+            self._log(f"بارگیری strategies از راه دور خطا داد ({exc}) — رجیستری محلی")
+            return None
+
     def _choose_bypass_method(self, host: str, port: int) -> str:
         """Pick the bypass method: auto-probe when enabled, else the config one.
 
         When ``auto_prober`` is on, build candidates from the implemented
         strategies (ordered by their static prior), probe them against the real
-        upstream and lock the best. Falls back to the configured method on any
-        failure / no host, so Start never blocks on the prober.
+        upstream and lock the best. A verified remote ``strategies.json`` (when
+        enabled) supplies the candidate set + score priors instead of the local
+        registry. Falls back to the configured method on any failure / no host,
+        so Start never blocks on the prober.
         """
         configured = str(self.config.get("bypass_method", "wrong_seq"))
         if not self.config.get("auto_prober", False):
@@ -150,16 +180,25 @@ class EngineController:
             from strategies import all_strategies
             from core.prober import AutoProber, build_candidates, tcp_probe
 
-            keys = [s.meta.key for s in all_strategies(implemented_only=True)]
-            scored = {s.meta.key: s.score()
-                      for s in all_strategies(implemented_only=True)}
-            candidates = AutoProber.candidate_order(
-                scored, build_candidates(
+            # prefer a verified remote manifest; else the local registry
+            updater = self._load_remote_strategies()
+            if updater is not None:
+                base = updater.to_candidates()
+                scored = updater.score_priors()
+            else:
+                base = None
+                scored = {}
+            if not base:
+                keys = [s.meta.key for s in all_strategies(implemented_only=True)]
+                scored = {s.meta.key: s.score()
+                          for s in all_strategies(implemented_only=True)}
+                base = build_candidates(
                     keys,
                     fragment_tcp=bool(self.config.get("fragment_tcp", False)),
                     fragment_tls=bool(self.config.get("fragment_tls", False)),
                     tls_chunk=int(self.config.get("fragment_tls_chunk", 64)),
-                ))
+                )
+            candidates = AutoProber.candidate_order(scored, base)
             self._prober = AutoProber(
                 candidates, tcp_probe, on_log=self._log,
                 timeout=float(self.config.get("probe_timeout", 5.0)))

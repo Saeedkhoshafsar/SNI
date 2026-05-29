@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "updated": "2026-05-29",
+  "recipes": [
+    {
+      "strategy": "fake_ttl",
+      "fragment_tcp": true,
+      "fragment_tls": false,
+      "tls_chunk": 64,
+      "score": 0.75,
+      "title": "Fake low-TTL + TCP fragmentation",
+      "enabled": true
+    },
+    {
+      "strategy": "wrong_seq",
+      "fragment_tcp": false,
+      "fragment_tls": false,
+      "tls_chunk": 64,
+      "score": 0.6,
+      "title": "Wrong sequence (classic)",
+      "enabled": true
+    },
+    {
+      "strategy": "multi_fake",
+      "score": 0.65,
+      "title": "Repeated fake injection",
+      "enabled": true
+    },
+    {
+      "strategy": "fake_disorder",
+      "score": 0.6,
+      "title": "Out-of-order fakes",
+      "enabled": false
+    }
+  ]
+}

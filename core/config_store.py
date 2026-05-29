@@ -45,6 +45,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "resilience": True,           # detect forged RSTs / throttling and rotate
     "rst_budget": 3,              # forged RSTs to ignore before rotating strategy
     "throttle_ratio": 0.4,        # recent_rate < ratio*baseline ⇒ throttled
+    # remote signed strategies.json (core.strategies_remote) — anti-dictation
+    "remote_strategies": False,   # fetch + verify a signed manifest on Start
+    "strategies_mirrors": [],     # ordered mirror URLs serving strategies.json
     "theme": "dark",
 }
 
