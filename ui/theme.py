@@ -263,9 +263,42 @@ def build_qss(p: Palette) -> str:
         background: {p.surface};
     }}
     QListWidget#ProfileList::item:selected {{
-        background: {p.accent};
-        color: {p.on_accent};
+        background: transparent;   /* selection shown by the ProfileRow itself */
     }}
+
+    /* ---- Rich profile row (custom item widget) ---- */
+    QFrame#ProfileRow {{
+        background: {p.surface};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+    }}
+    QFrame#ProfileRow:hover {{ background: {p.surface_alt}; }}
+    QFrame#ProfileRow[active="1"] {{
+        background: {p.surface_alt};
+        border: 1px solid {p.accent};
+    }}
+    QLabel#RowGlyph {{ font-size: 17px; color: {p.accent}; }}
+    QLabel#RowName  {{ font-size: 14px; font-weight: 600; color: {p.text}; }}
+    QLabel#RowDetail {{
+        font-family: "Cascadia Code", "Consolas", monospace;
+        font-size: 11.5px; color: {p.text_muted};
+    }}
+    QLabel#ActivePill {{
+        background: {p.success}; color: {p.on_accent};
+        border-radius: 8px; padding: 1px 8px;
+        font-size: 11px; font-weight: 700;
+    }}
+    QLabel#RowBadge {{
+        background: {p.elevated}; color: {p.text_muted};
+        border: 1px solid {p.border}; border-radius: 7px;
+        padding: 1px 7px; font-size: 10.5px; font-weight: 600;
+        letter-spacing: 0.4px;
+    }}
+    QPushButton#RowEdit {{
+        background: transparent; border: 1px solid {p.border};
+        border-radius: 7px; color: {p.text_muted}; font-size: 13px;
+    }}
+    QPushButton#RowEdit:hover {{ background: {p.accent}; color: {p.on_accent}; border-color: {p.accent}; }}
 
     /* ---- Profile editor dialog ---- */
     QDialog#ProfileDialog {{

@@ -134,6 +134,94 @@ class NavItem(QPushButton):
 
 
 # ---------------------------------------------------------------------------
+#  Rich profile-list row (icon + name + server detail + badges + active mark)
+# ---------------------------------------------------------------------------
+
+# A glyph per protocol so each row is instantly recognisable.
+_PROTO_ICON = {
+    "vless": "\u2728",        # sparkles
+    "vmess": "\u25c8",        # diamond
+    "trojan": "\u2694",       # crossed swords
+    "shadowsocks": "\U0001f512",  # lock
+}
+
+
+class ProfileRow(QFrame):
+    """One server entry rendered as a card-like row.
+
+    Shows: protocol glyph, display name, a muted server-detail line
+    (``proto · host:port``), transport/security badges, and — when this is the
+    currently selected profile — a green **● فعال** pill so the user always
+    knows which server is in force (feedback #3). An ``edit`` signal lets the
+    page open the editor straight from the row.
+    """
+
+    edit = Signal()
+
+    def __init__(self, profile, *, active: bool = False,
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("ProfileRow")
+        self.setProperty("active", "1" if active else "0")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 9, 10, 9)
+        lay.setSpacing(11)
+
+        # protocol glyph
+        glyph = QLabel(_PROTO_ICON.get(profile.protocol, "\u25c9"))
+        glyph.setObjectName("RowGlyph")
+        glyph.setFixedWidth(26)
+        glyph.setAlignment(Qt.AlignCenter)
+        lay.addWidget(glyph)
+
+        # name + detail column
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        name = QLabel(profile.display_name)
+        name.setObjectName("RowName")
+        top.addWidget(name)
+        if active:
+            pill = QLabel("\u25cf فعال")
+            pill.setObjectName("ActivePill")
+            top.addWidget(pill)
+        top.addStretch(1)
+        col.addLayout(top)
+
+        detail = QLabel(f"{profile.protocol} · {profile.address}:{profile.port}")
+        detail.setObjectName("RowDetail")
+        col.addWidget(detail)
+        lay.addLayout(col, 1)
+
+        # transport / security badges
+        for txt in self._badges(profile):
+            b = QLabel(txt)
+            b.setObjectName("RowBadge")
+            lay.addWidget(b)
+
+        # inline edit button
+        self.btn_edit = QPushButton("\u270e")
+        self.btn_edit.setObjectName("RowEdit")
+        self.btn_edit.setCursor(Qt.PointingHandCursor)
+        self.btn_edit.setFixedSize(28, 28)
+        self.btn_edit.setToolTip("ویرایش این پروفایل")
+        self.btn_edit.clicked.connect(self.edit.emit)
+        lay.addWidget(self.btn_edit)
+
+    @staticmethod
+    def _badges(profile) -> list[str]:
+        out = []
+        tr = (profile.transport or "tcp").lower()
+        if tr and tr != "tcp":
+            out.append(tr.upper())
+        sec = (profile.security or "none").lower()
+        if sec in ("tls", "reality", "xtls"):
+            out.append(sec.upper())
+        return out
+
+
+# ---------------------------------------------------------------------------
 #  Power button — large Start/Stop control with smooth colour transitions
 # ---------------------------------------------------------------------------
 

@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from ui import win_effects
 from ui.theme import get_palette, build_qss
-from ui.widgets import Card, NavItem, PowerButton, TitleBar, Toast
+from ui.widgets import Card, NavItem, PowerButton, ProfileRow, TitleBar, Toast
 from ui.animations import CountUp, PulseDot, stagger_in
 
 from core.config_store import ConfigStore
@@ -371,11 +371,21 @@ class ProfilesPage(QWidget):
     def refresh(self) -> None:
         self.list.blockSignals(True)
         self.list.clear()
-        for p in self._store.profiles:
-            badge = p.protocol.upper()
-            QListWidgetItem(f"[{badge}]  {p.display_name}", self.list)
-        if 0 <= self._store.selected_index < self.list.count():
-            self.list.setCurrentRow(self._store.selected_index)
+        sel = self._store.selected_index
+        for i, p in enumerate(self._store.profiles):
+            item = QListWidgetItem(self.list)
+            row = ProfileRow(p, active=(i == sel))
+            row.edit.connect(lambda _=False, idx=i: self._edit_index(idx))
+            item.setSizeHint(row.sizeHint())
+            self.list.addItem(item)
+            self.list.setItemWidget(item, row)
+        if 0 <= sel < self.list.count():
+            self.list.setCurrentRow(sel)
+        # empty-state hint
+        if self.list.count() == 0:
+            ph = QListWidgetItem("هنوز پروفایلی اضافه نشده — یک لینک بچسبانید")
+            ph.setFlags(Qt.NoItemFlags)
+            self.list.addItem(ph)
         self.list.blockSignals(False)
 
     # -- actions -----------------------------------------------------------
@@ -412,6 +422,12 @@ class ProfilesPage(QWidget):
         row = self.list.currentRow()
         if not (0 <= row < len(self._store.profiles)):
             self._toast("ابتدا یک پروفایل را انتخاب کنید", "warn")
+            return
+        self._edit_index(row)
+
+    def _edit_index(self, row: int):
+        """Open the editor on a specific profile row and save edits."""
+        if not (0 <= row < len(self._store.profiles)):
             return
         current = self._store.profiles[row]
         dlg = ProfileDialog(current, self.window(), title="ویرایش پروفایل")
