@@ -1,8 +1,11 @@
 """Unit tests for :class:`core.config_store.ConfigStore`."""
 import json
 import os
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.config_store import ConfigStore, DEFAULT_CONFIG
 from core.profile import Profile

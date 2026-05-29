@@ -5,9 +5,12 @@ needs the bundled ``xray.exe``; neither runs in CI/sandbox. We therefore stub
 both with fakes and assert the *orchestration* logic: mode selection, the
 auto-chained spoof port, callback fan-out and clean start/stop transitions.
 """
+import os
 import sys
 import time
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import core.engine as engine_mod
 from core.engine import (
