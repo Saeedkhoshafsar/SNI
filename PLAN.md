@@ -484,3 +484,21 @@ xray کامل (socks 10808) → مستقیم به lucky-union-...workers.dev:443
 ```
 
 - تست‌ها: `tests/test_xray_config.py` (تشخیص spoof، override از extra، xray به اسپوفر لوکال با SNI واقعی) + `tests/test_engine.py` (Tunnel با کانفیگ spoof → xray↔اسپوفر زنجیر، اسپوفر→104.19.229.21 با FAKE_SNI=www.hcaptcha.com؛ + احترام به CONNECT_IP/FAKE_SNI صریح). مجموعاً **۳۳۱ تست سبز + ۲ skip**.
+
+## ✅ تصحیح بازخورد پنجم — حالت «SNI Only» مانع اجرای xray می‌شد (2026-05-30)
+**گزارش کاربر:** «با V2RayTun اوکیم ولی کانفیگ داخلی SNI Spoofer نه — همین کانفیگ را در هر دو تست کردم.» (همان `vless://...@127.0.0.1:40443?...sni=lucky-union-...workers.dev&type=xhttp&path=/vless-xhttp`).
+
+### تشخیص ریشه‌ای (از روی فایل‌های آپلودیِ کاربر)
+فایل‌های `config.json`، `profiles.json`، `xray_config.json` کاربر بررسی شد:
+- `xray_config.json` که خودِ نرم‌افزار تولید کرده **کاملاً درست** بود: outbound vless → `127.0.0.1:40443`، `tlsSettings.serverName=lucky-union-...workers.dev`، xhttp host/path درست. پس کد `5f4ac91` کانفیگ صحیح می‌سازد.
+- اما `config.json` کاربر `connection_mode: "SNI Only"` داشت. در منطق قدیمیِ `uses_core` (`profile is not None and mode != "SNI Only"`)، حالت SNI Only یعنی `uses_core=False` → **xray-core اصلاً اجرا نمی‌شد** → فقط فورواردر خام (`main.ProxyServer`) بالا می‌آمد که هیچ پروتکل VLESS‌ای نمی‌فهمد → اتصال شکست می‌خورد.
+- خروجی تشخیصی: `mode='SNI Only' uses_core=False chains_spoofer=False`.
+
+### رفع (`core/engine.py`)
+- `uses_core` تغییر کرد به `return self.profile is not None`. منطق درست: **هر وقت یک پروفایل انتخاب شده، xray باید اجرا شود** — صرف‌نظر از حالت. برچسب «SNI Only» فقط یعنی «بدون لایهٔ بیرونی Warp/Psiphon»، نه «بدون xray». تنها حالتی که بدون core اجرا می‌شود = SNI Only **بدون** هیچ پروفایل (کاربردِ فورواردر خام مستقل).
+- نتیجه: SNI Only + کانفیگ spoof → `uses_core=True` و `chains_spoofer=True` → xray ↔ اسپوفر زنجیر می‌شود و کانفیگ وصل می‌شود. ✓
+
+### تست‌ها
+- `tests/test_engine.py::test_uses_core_logic` و `test_sni_only_no_profile_starts_proxy_no_xray` بازنویسی شد (پروفایل همیشه core می‌خواهد؛ SNI Only بدون پروفایل = فقط فورواردر).
+- `tests/test_mode_fix_ui.py`: تست‌های قدیمیِ «SNI Only هیچ‌وقت core/spoofer ندارد» با سمانتیک جدید جایگزین شد (SNI Only با پروفایل → core+spoofer؛ بدون پروفایل → هیچ‌کدام).
+- مجموعاً **۳۳۲ تست سبز + ۲ skip**.

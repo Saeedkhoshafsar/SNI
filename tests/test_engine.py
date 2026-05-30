@@ -131,25 +131,30 @@ class EngineControllerTest(unittest.TestCase):
                        uuid="11111111-1111-1111-1111-111111111111")
 
     def test_uses_core_logic(self):
+        # No profile + SNI Only → raw forwarder, no core.
         ctrl = EngineController({"connection_mode": "SNI Only"})
         self.assertFalse(ctrl.uses_core)
+        # A selected profile ALWAYS needs xray, even in SNI Only (a VLESS
+        # profile can't run on a raw forwarder).
         ctrl.set_profile(self._profile())
-        self.assertFalse(ctrl.uses_core)  # mode still SNI Only
+        self.assertTrue(ctrl.uses_core)
         ctrl.update_config({"connection_mode": "SNI + Warp"})
         self.assertTrue(ctrl.uses_core)
 
-    def test_sni_only_starts_proxy_no_xray(self):
+    def test_sni_only_no_profile_starts_proxy_no_xray(self):
+        # The standalone raw-forwarder case: SNI Only with NO profile selected.
         ctrl = EngineController({
             "connection_mode": "SNI Only",
             "LISTEN_PORT": 40443, "CONNECT_IP": "1.2.3.4", "CONNECT_PORT": 443,
         })
+        ctrl.set_profile(None)
         logs = []
         ctrl.on_log = logs.append
         ctrl.start()
         self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
         self.assertIsNotNone(FakeProxy.last_instance)
         self.assertTrue(FakeProxy.last_instance.started)
-        self.assertIsNone(FakeXray.last_instance)  # no core in SNI Only
+        self.assertIsNone(FakeXray.last_instance)  # no core without a profile
         self.assertEqual(FakeProxy.last_instance.config["CONNECT_IP"], "1.2.3.4")
         ctrl.stop()
         self.assertEqual(ctrl.status, STATUS_IDLE)

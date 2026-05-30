@@ -156,12 +156,17 @@ class EngineController:
     def uses_core(self) -> bool:
         """True when an xray core is chained under the spoofer.
 
-        Any mode other than the raw ``"SNI Only"`` forwarder needs xray-core to
-        carry the VLESS/VMess/Trojan profile. ``"SNI Only"`` is the only mode
-        that runs without a core (and therefore without a profile).
+        A selected profile **always** needs xray-core — it carries the
+        VLESS/VMess/Trojan protocol that a raw SNI forwarder cannot speak. This
+        is especially true for *spoof configs* (``127.0.0.1:40443`` links):
+        their whole point is xray → our spoofer → Cloudflare, so the core must
+        run even when the user left the mode on ``"SNI Only"`` (that label only
+        means "no Warp/Psiphon outer layer", not "no xray").
+
+        ``"SNI Only"`` runs *without* a core only when **no profile** is
+        selected — the standalone raw-forwarder use case.
         """
-        mode = str(self.config.get("connection_mode", "Tunnel"))
-        return self.profile is not None and mode != "SNI Only"
+        return self.profile is not None
 
     @property
     def wants_core_but_no_profile(self) -> bool:

@@ -37,9 +37,19 @@ class EngineModeTest(unittest.TestCase):
         e.set_profile(profile)
         return e
 
-    def test_sni_only_never_uses_core(self):
-        e = self._engine("SNI Only", object())
+    def test_sni_only_without_profile_no_core(self):
+        # No profile selected → SNI Only runs the standalone raw forwarder
+        # (the only case that legitimately needs no xray core).
+        e = self._engine("SNI Only", None)
         self.assertFalse(e.uses_core)
+        self.assertFalse(e.wants_core_but_no_profile)
+
+    def test_sni_only_with_profile_still_uses_core(self):
+        # A selected profile ALWAYS needs xray (it speaks VLESS/VMess/Trojan,
+        # which a raw forwarder can't). "SNI Only" only means "no Warp/Psiphon
+        # outer layer", not "no xray" — so the core must run regardless.
+        e = self._engine("SNI Only", object())
+        self.assertTrue(e.uses_core)
         self.assertFalse(e.wants_core_but_no_profile)
 
     def test_tunnel_with_profile_uses_core(self):
@@ -52,8 +62,10 @@ class EngineModeTest(unittest.TestCase):
         self.assertFalse(e.uses_core)
         self.assertTrue(e.wants_core_but_no_profile)
 
-    def test_plain_tunnel_does_not_chain_spoofer(self):
-        # plain Tunnel = direct xray (V2RayTun-like), no spoofer mangling
+    def test_plain_tunnel_ordinary_profile_does_not_chain_spoofer(self):
+        # plain Tunnel + an ORDINARY (non-spoof) profile = direct xray
+        # (V2RayTun-like), no spoofer mangling. object() has no is_spoof_config
+        # attribute, so it's treated as a routable server.
         e = self._engine("Tunnel", object())
         self.assertTrue(e.uses_core)
         self.assertFalse(e.chains_spoofer)
@@ -64,9 +76,12 @@ class EngineModeTest(unittest.TestCase):
         self.assertTrue(e.uses_core)
         self.assertTrue(e.chains_spoofer)
 
-    def test_sni_only_never_chains_spoofer(self):
+    def test_sni_only_ordinary_profile_chains_spoofer(self):
+        # SNI Only + a profile = the user wants DPI evasion on the outer hop,
+        # so the spoofer is chained under xray.
         e = self._engine("SNI Only", object())
-        self.assertFalse(e.chains_spoofer)
+        self.assertTrue(e.uses_core)
+        self.assertTrue(e.chains_spoofer)
 
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 not available")

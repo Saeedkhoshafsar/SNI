@@ -75,7 +75,7 @@ DEFAULT_SNIS = [
 
 MODES = [
     "Tunnel",          # default: VLESS/xray chained under the spoofer (needs a profile)
-    "SNI Only",        # raw forwarder, no xray — for plain HTTPS DPI bypass
+    "SNI Only",        # spoofer; if a profile is selected, xray runs chained under it
     "SNI + Warp",
     "SNI + Psiphon",
     "SNI + Warp-in-Warp",
@@ -85,7 +85,7 @@ MODES = [
 # human-readable, Persian hint shown under the mode selector
 MODE_HINTS = {
     "Tunnel": "اتصال کامل از طریق کانفیگ انتخاب‌شده (VLESS/VMess/Trojan) با هسته‌ی xray + اسپوف SNI. برای استفاده از کانفیگ‌ها این حالت را انتخاب کنید.",
-    "SNI Only": "فقط فورواردر اسپوف SNI بدون xray — برای دور زدن DPI روی ترافیک HTTPS عادی. کانفیگ VLESS در این حالت استفاده نمی‌شود.",
+    "SNI Only": "اسپوف SNI بدون لایه‌ی بیرونی Warp/Psiphon. اگر کانفیگی انتخاب شده باشد، xray هم اجرا و زیر اسپوفر زنجیر می‌شود (کانفیگ VLESS کار می‌کند). فقط وقتی هیچ کانفیگی انتخاب نشده باشد، صرفاً فورواردر خام برای دور زدن DPI روی HTTPS عادی اجرا می‌شود.",
     "SNI + Warp": "کانفیگ + لایه‌ی Cloudflare Warp (نیازمند باینری warp).",
     "SNI + Psiphon": "کانفیگ + لایه‌ی Psiphon (نیازمند باینری psiphon).",
     "SNI + Warp-in-Warp": "کانفیگ + دو لایه‌ی Warp تو در تو.",
