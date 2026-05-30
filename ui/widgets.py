@@ -230,10 +230,10 @@ class ProfileRow(QFrame):
             top.addWidget(pill, 0, Qt.AlignVCenter)
         col.addLayout(top)
 
-        # show the *routable* endpoint (real CDN host for webtun configs), not a
-        # loopback placeholder, so the detail line is meaningful to the user
-        _addr = getattr(profile, "upstream_address", None) or profile.address
-        _port = getattr(profile, "upstream_port", None) or profile.port
+        # show the *routable* endpoint (real CDN host for placeholder configs),
+        # not the loopback stand-in, so the detail line is meaningful
+        _addr = getattr(profile, "dial_address", None) or profile.address
+        _port = getattr(profile, "dial_port", None) or profile.port
         detail = QLabel(f"{profile.protocol} · {_addr}:{_port}")
         detail.setObjectName("RowDetail")
         col.addWidget(detail)

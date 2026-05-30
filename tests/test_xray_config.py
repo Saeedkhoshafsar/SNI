@@ -225,14 +225,15 @@ def test_manager_direct_wiring():
 
 
 # ---------------------------------------------------------------------------
-#  webtun / CDN-placeholder configs
+#  CDN-placeholder configs
 #  ``vless://...@127.0.0.1:40443?...host=foo.workers.dev`` — the host slot is a
-#  local helper port; the real endpoint is the CDN domain in the SNI/Host.
-#  xray still dials the local helper (our spoofer occupies it); the *spoofer's*
-#  upstream resolves to the CDN host on 443. This is the V2RayTun pattern.
+#  loopback stand-in left over from an OLD client that lacked a full xray core
+#  (it tunnelled through a local 40443 portal / V2RayTun to reach the CDN). We
+#  ship a full xray core, so xray dials the real CDN endpoint (SNI/Host) on 443
+#  DIRECTLY — no local portal, no spoofer.
 # ---------------------------------------------------------------------------
 
-def _webtun_profile():
+def _cdn_placeholder_profile():
     return parse_link(
         "vless://84524180-c2d5-4bc1-83bb-c36f22d69a3b@127.0.0.1:40443"
         "?encryption=none&security=tls&type=xhttp&mode=auto"
@@ -241,42 +242,42 @@ def _webtun_profile():
         "&path=%2Fvless-xhttp&fp=chrome#vls-cf-xhttp")
 
 
-def test_profile_detects_webtun():
-    p = _webtun_profile()
-    assert p.is_webtun is True
-    assert p.upstream_address == "lucky-union-b89c.hamijafayi.workers.dev"
-    assert p.upstream_port == 443
+def test_profile_detects_cdn_placeholder():
+    p = _cdn_placeholder_profile()
+    assert p.is_cdn_placeholder is True
+    assert p.dial_address == "lucky-union-b89c.hamijafayi.workers.dev"
+    assert p.dial_port == 443
 
 
-def test_normal_profile_is_not_webtun():
+def test_normal_profile_is_not_placeholder():
     p = _vless_ws_tls()
-    assert p.is_webtun is False
-    assert p.upstream_address == "real.example.com"
-    assert p.upstream_port == 443
+    assert p.is_cdn_placeholder is False
+    assert p.dial_address == "real.example.com"
+    assert p.dial_port == 443
 
 
-def test_webtun_xray_still_dials_local_helper():
-    # xray's outbound keeps pointing at the placeholder loopback; our spoofer
-    # listens there and forwards to the CDN, so xray's config is unchanged.
+def test_cdn_placeholder_xray_dials_cdn_directly():
+    # Direct Tunnel (spoof_port=None): xray's outbound must point at the real
+    # CDN host:443, NOT the loopback placeholder. socks inbound = 10808.
     from core.xray_manager import XrayManager
-    mgr = XrayManager(_webtun_profile(), spoof_port=40443,
+    mgr = XrayManager(_cdn_placeholder_profile(), spoof_port=None,
                       socks_port=10808, http_port=10809)
     path = mgr.generate_config()
     with open(path, encoding="utf-8") as fp:
         cfg = json.load(fp)
     v = cfg["outbounds"][0]["settings"]["vnext"][0]
-    assert v["address"] == "127.0.0.1" and v["port"] == 40443
-    # inbound socks port must match the app/V2RayTun mixed port (10808)
+    assert v["address"] == "lucky-union-b89c.hamijafayi.workers.dev"
+    assert v["port"] == 443
     assert cfg["inbounds"][0]["port"] == 10808
-    # SNI / Host still carry the real CDN domain
     ss = cfg["outbounds"][0]["streamSettings"]
     assert ss["tlsSettings"]["serverName"] == \
         "lucky-union-b89c.hamijafayi.workers.dev"
+    assert ss["xhttpSettings"]["path"] == "/vless-xhttp"
 
 
-def test_webtun_manager_real_server_resolves_to_cdn():
+def test_cdn_placeholder_manager_real_server_resolves_to_cdn():
     from core.xray_manager import XrayManager
-    mgr = XrayManager(_webtun_profile(), spoof_port=40443)
+    mgr = XrayManager(_cdn_placeholder_profile(), spoof_port=None)
     host, port = mgr.real_server
     assert host == "lucky-union-b89c.hamijafayi.workers.dev"
     assert port == 443

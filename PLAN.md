@@ -437,3 +437,24 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - `ui/widgets.py`: بازنویسی `ProfileRow.__init__` — `setMinimumHeight(56)`، تراز عمودی (`AlignVCenter`) همهٔ فرزندان، نام با `stretch=1` + `setMinimumWidth(0)` تا پیل/بَج‌ها هرگز نام را نبُرند. خطِ جزئیات حالا **مقصد routable واقعی** (دامنهٔ CDN برای webtun) را نشان می‌دهد نه placeholder لوکال.
 
 - تست‌ها: `tests/test_xray_config.py` (+۵: تشخیص webtun، عدم تأثیر روی کانفیگ عادی، xray همچنان helper لوکال را صدا می‌زند با socks=10808، `real_server` به CDN رزولوو می‌شود) + `tests/test_engine.py` (+۱: Tunnel با کانفیگ webtun اسپوفر را روی پورت placeholder زنجیر می‌کند و به CDN فوروارد می‌کند). مجموعاً **۳۳۰ تست سبز + ۲ skip**. صفحهٔ پروفایل با کانفیگ webtunِ فعال در ۱۰۲۴×۶۸۰ رندر و تأیید بصری شد (پیل «● فعال» بدون بریدگی، خطِ جزئیات = دامنهٔ workers.dev واقعی).
+
+## ✅ تصحیح بازخورد سوم — معماری درست: xray کامل مستقیم به CDN (بدون پورت لوکال 40443) (2026-05-30)
+**چرا تصحیح:** تشخیص قبلی (اسپوفر روی 40443 + فوروارد) **اشتباه بود** و باعث شد هیچ‌چیز کار نکند (حتی پینگ V2RayTun هم به‌خاطر تداخل پورت قطع شد). کاربر معماری واقعی را توضیح داد:
+> «این نرم‌افزار چون قابلیت کامل xray نداشت، از V2RayTun کمک می‌گرفت: یک پورت 40443 باز می‌کرد که پورتالی به نت بین‌الملل بود. وقتی ما xray کامل داخل نرم‌افزار داریم دیگه نیازی به پورت‌های لوکال نداریم؛ اینا فقط برای ارتباط داخلی بین V2RayTun و SNI-spoofer بود.»
+
+### تشخیص درست
+- کانفیگ‌هایی مثل `vless://...@127.0.0.1:40443?type=xhttp&security=tls&sni=...workers.dev` در واقع یک کانفیگ **استاندارد VLESS+XHTTP+TLS به Cloudflare** هستند. آدرس `127.0.0.1:40443` فقط placeholder کلاینت قدیمی (بدون xray کامل) بود که از پورتال محلی V2RayTun استفاده می‌کرد.
+- **چون ما xray کامل داریم**، xray باید **مستقیماً** به `workers.dev:443` وصل شود. **هیچ پورت 40443، هیچ اسپوفر، هیچ V2RayTun لازم نیست.** (commit اشتباه `5ccc179` اسپوفر raw را زیر xray می‌گذاشت که handshake خود xray را خراب می‌کرد.)
+
+### رفع (`core/profile.py`, `core/engine.py`, `core/xray_manager.py`)
+- `core/profile.py`: تغییر نام `is_webtun`→`is_cdn_placeholder`، و `upstream_address/port`→`dial_address/dial_port`. این پراپرتی‌ها حالا «مقصد routable واقعی برای dial **مستقیم** xray» هستند: برای کانفیگ placeholder، آدرس CDN از `sni`/`host` روی پورت ۴۴۳ (یا ۸۰ بدون TLS)؛ برای کانفیگ عادی همان `address`/`port`.
+- `core/engine.py`: `chains_spoofer` برگشت به حالت قبلی — فقط ترکیب‌های صریح SNI (Warp/Psiphon/…) اسپوفر را زنجیر می‌کنند. حالت **Tunnel** (شاملِ کانفیگ‌های placeholder) از مسیر مستقیم `_start_core_only` می‌رود. در مسیر زنجیرهٔ SNI+X هم `dial_address/dial_port` استفاده می‌شود (نه placeholder لوکال).
+- `core/xray_manager.py`: در `generate_config`، حالت مستقیم (`spoof_port=None`) حالا `dest_address=dial_address، dest_port=dial_port` می‌فرستد تا outbound به CDN واقعی اشاره کند نه `127.0.0.1`. `real_server` نیز `dial_*` را برمی‌گرداند.
+
+### جریان نهایی درست
+```
+xray کامل (socks 10808) → مستقیم به lucky-union-...workers.dev:443 → اینترنت ✓
+```
+(دقیقاً مثل اجرای همان کانفیگ در یک کلاینت xray معمولی؛ هیچ هلپر/پورت لوکالی در میان نیست.)
+
+- تست‌ها: `tests/test_xray_config.py` (۴ تست بازنویسی‌شده: تشخیص placeholder، عدم تأثیر بر کانفیگ عادی، xray مستقیم به CDN با socks=10808، `real_server`→CDN) + `tests/test_engine.py` (Tunnel با کانفیگ placeholder → xray مستقیم، **بدون** اسپوفر). مجموعاً **۳۳۰ تست سبز + ۲ skip**. صفحهٔ پروفایل در ۱۰۲۴×۶۸۰ با کانفیگ placeholderِ فعال رندر و تأیید شد (پیل «● فعال» بدون بریدگی، خطِ جزئیات = `workers.dev:443`).

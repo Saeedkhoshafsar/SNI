@@ -194,9 +194,10 @@ class EngineControllerTest(unittest.TestCase):
         self.assertTrue(xray.stopped)
         self.assertEqual(ctrl.status, STATUS_IDLE)
 
-    def _webtun_profile(self):
-        # webtun/CDN config: host slot is a loopback helper placeholder, the
-        # real endpoint is the Cloudflare domain in the SNI/Host header.
+    def _cdn_placeholder_profile(self):
+        # CDN-placeholder config: the host slot is a loopback stand-in left
+        # over from an old client that lacked a full xray core; the real
+        # endpoint is the Cloudflare domain in the SNI/Host header.
         return Profile(
             protocol="vless", address="127.0.0.1", port=40443,
             uuid="84524180-c2d5-4bc1-83bb-c36f22d69a3b",
@@ -205,32 +206,28 @@ class EngineControllerTest(unittest.TestCase):
             host="lucky-union-b89c.hamijafayi.workers.dev",
             path="/vless-xhttp", mode="auto", fingerprint="chrome")
 
-    def test_webtun_tunnel_chains_spoofer_on_placeholder_port(self):
-        # webtun configs (127.0.0.1:40443) are *designed* to talk to a local
-        # helper; our spoofer must occupy that exact port even in Tunnel mode,
-        # forwarding to the real CDN — without it xray hits an empty loopback
-        # port and gets "actively refused" (the user's bug; V2RayTun worked
-        # because it runs its own helper there).
+    def test_cdn_placeholder_tunnel_runs_xray_directly_to_cdn(self):
+        # We ship a full xray core, so the old local 40443 portal is NOT
+        # needed: in Tunnel mode xray connects straight to the real CDN
+        # endpoint (no spoofer, no loopback hop). This is what makes the config
+        # actually connect (the bug was xray dialing an empty 127.0.0.1:40443).
         ctrl = EngineController({"connection_mode": "Tunnel"})
-        prof = self._webtun_profile()
+        prof = self._cdn_placeholder_profile()
         ctrl.set_profile(prof)
-        self.assertTrue(prof.is_webtun)
-        self.assertTrue(ctrl.chains_spoofer)
+        self.assertTrue(prof.is_cdn_placeholder)
+        self.assertFalse(ctrl.chains_spoofer)   # NO spoofer chaining
         ctrl.start()
         self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
 
-        proxy = FakeProxy.last_instance
         xray = FakeXray.last_instance
-        self.assertIsNotNone(proxy)
         self.assertIsNotNone(xray)
-        # the spoofer listens on the EXACT placeholder port the link hard-codes
-        self.assertEqual(proxy.config["LISTEN_PORT"], 40443)
-        self.assertEqual(xray.spoof_port, 40443)
-        # ...and forwards to the real CDN host (resolved or hostname), port 443
-        self.assertEqual(proxy.config["CONNECT_PORT"], 443)
-        self.assertNotEqual(proxy.config["CONNECT_IP"], "127.0.0.1")
+        self.assertIsNone(xray.spoof_port)            # direct, no chaining
+        self.assertIsNone(FakeProxy.last_instance)    # no spoofer at all
+        # the profile resolves to the real CDN endpoint for the direct dial
+        self.assertEqual(prof.dial_address,
+                         "lucky-union-b89c.hamijafayi.workers.dev")
+        self.assertEqual(prof.dial_port, 443)
         ctrl.stop()
-        self.assertTrue(proxy.stopped)
         self.assertTrue(xray.stopped)
 
     def test_count_callback_forwarded(self):

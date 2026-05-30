@@ -24,9 +24,9 @@ SECURITIES = ("none", "tls", "reality", "xtls")
 def _is_local_addr(addr: str) -> bool:
     """True when *addr* is a loopback / unspecified placeholder, not routable.
 
-    Covers the values that show up in "webtun"/CDN-helper share links where the
-    host slot is a stand-in for a local helper port: ``127.0.0.1``,
-    ``localhost``, ``0.0.0.0``, ``::1`` and the unspecified ``::``.
+    Covers the values that show up in CDN-placeholder share links where the
+    host slot is a loopback stand-in: ``127.0.0.1``, ``localhost``,
+    ``0.0.0.0``, ``::1`` and the unspecified ``::``.
     """
     a = (addr or "").strip().strip("[]").lower()
     if not a:
@@ -95,17 +95,21 @@ class Profile:
         return self.security in ("tls", "reality", "xtls")
 
     @property
-    def is_webtun(self) -> bool:
-        """True for "webtun"/CDN configs whose host slot is a local placeholder.
+    def is_cdn_placeholder(self) -> bool:
+        """True for configs whose host slot is a loopback placeholder.
 
-        These share links (e.g. ``vless://...@127.0.0.1:40443?...host=foo.workers.dev``)
-        are *designed* to talk to a local helper on the placeholder port; that
-        helper forwards the connection to the real CDN endpoint carried in the
-        SNI / Host header (Cloudflare ``workers.dev`` / ``pages.dev``). This is
-        exactly the V2RayTun internal-helper pattern. Our app fills the helper
-        role with its own SNI-spoofer running on the placeholder port, so we
-        must (a) recognise these configs and (b) know the real upstream the
-        spoofer should dial.
+        Some share links (e.g.
+        ``vless://...@127.0.0.1:40443?...host=foo.workers.dev``) were authored
+        for an *old* client that lacked a full xray core: it opened a local
+        portal on the placeholder port (``40443``) and tunnelled through a
+        helper (V2RayTun) to reach the real CDN endpoint carried in the
+        SNI / Host header (Cloudflare ``workers.dev`` / ``pages.dev``).
+
+        Our app ships a **full xray core**, so the local portal/helper is no
+        longer needed at all: xray can dial the real CDN endpoint directly. We
+        only need to (a) recognise these placeholder configs and (b) rewrite
+        the dial target to the real CDN host:port (see ``dial_address`` /
+        ``dial_port``). No local 40443 port, no spoofer chaining.
         """
         if not _is_local_addr(self.address):
             return False
@@ -115,14 +119,15 @@ class Profile:
         return False
 
     @property
-    def upstream_address(self) -> str:
-        """The real, routable host the *spoofer* must forward to.
+    def dial_address(self) -> str:
+        """The real, routable host xray should connect to **directly**.
 
-        For ordinary configs this is just ``address``. For webtun/CDN configs
-        the literal address is a loopback placeholder, so we resolve the real
-        endpoint from the SNI / Host header instead (the CDN domain).
+        For ordinary configs this is just ``address``. For CDN-placeholder
+        configs the literal address is a loopback stand-in, so we resolve the
+        real endpoint from the SNI / Host header (the CDN domain) — xray dials
+        it directly, exactly like any normal VLESS-over-CDN config.
         """
-        if self.is_webtun:
+        if self.is_cdn_placeholder:
             for cand in (self.sni, self.host):
                 cand = (cand or "").strip()
                 if cand and not _is_local_addr(cand):
@@ -130,15 +135,15 @@ class Profile:
         return (self.address or "").strip()
 
     @property
-    def upstream_port(self) -> int:
-        """The real port the *spoofer* must forward to.
+    def dial_port(self) -> int:
+        """The real port xray should connect to **directly**.
 
-        For webtun configs the placeholder port (e.g. ``40443``) is the local
-        helper port, not reachable on the CDN. Cloudflare-style WS/XHTTP+TLS
-        endpoints are served on the standard HTTPS port, so we forward to
-        ``443`` (or ``80`` for a plaintext fallback).
+        For CDN-placeholder configs the placeholder port (e.g. ``40443``) was
+        the old local-portal port, not reachable on the CDN. Cloudflare-style
+        WS/XHTTP+TLS endpoints are served on the standard HTTPS port, so we
+        dial ``443`` (or ``80`` for a plaintext fallback).
         """
-        if self.is_webtun:
+        if self.is_cdn_placeholder:
             return 443 if self.is_tls else 80
         return self.port
 

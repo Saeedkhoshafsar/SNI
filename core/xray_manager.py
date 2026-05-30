@@ -97,12 +97,12 @@ class XrayManager:
 
     @property
     def real_server(self) -> tuple[str, int]:
-        """The real upstream the spoofer must forward to.
+        """The real, routable upstream xray (or the spoofer) connects to.
 
-        For webtun/CDN configs this resolves the loopback placeholder to the
+        For CDN-placeholder configs this resolves the loopback stand-in to the
         real CDN endpoint carried in the SNI/Host header.
         """
-        return self.profile.upstream_address, self.profile.upstream_port
+        return self.profile.dial_address, self.profile.dial_port
 
     # ----------------------------------------------------------------
 
@@ -113,7 +113,11 @@ class XrayManager:
             dest_address: str | None = "127.0.0.1"
             dest_port: int | None = self.spoof_port
         else:
-            dest_address = dest_port = None  # connect directly
+            # connect directly to the REAL routable endpoint — for ordinary
+            # configs that's the profile address, for CDN-placeholder configs
+            # it's the resolved CDN host:443 (never the loopback 127.0.0.1).
+            dest_address = self.profile.dial_address
+            dest_port = self.profile.dial_port
 
         config = build_config(
             self.profile,
