@@ -243,31 +243,91 @@ class ProxyServer:
                           f"{self.connect_port} ناموفق: {exc}", "error")
                 return
 
-            self._log(f"[conn {cid}] TCP وصل شد (مبدأ {self.interface_ipv4}:"
-                      f"{src_port}) — منتظر تأیید ClientHello جعلی…")
-
-            # Random micro-jitter to defeat timing-based DPI fingerprinting
-            await asyncio.sleep(random.uniform(0.001, 0.008))
-
+            # Does the chosen strategy expect the server to ACK the injected
+            # fake? Classic out-of-window techniques (wrong_seq / multi_fake /
+            # fake_disorder) do — the server replies with a duplicate-ACK that
+            # we wait for as positive confirmation. "Fire-and-forget"
+            # techniques (fake_ttl / wrong_checksum) are deliberately built so
+            # the server NEVER receives the fake (it TTL-dies in transit or is
+            # dropped as corrupt) → no ACK ever returns. Blocking on that ACK
+            # is exactly why those two strategies "timed out and failed". For
+            # them we instead give the injector a brief window to emit the
+            # fake, then proceed straight to the relay.
+            expects_ack = True
             try:
-                await asyncio.wait_for(fake_conn.t2a_event.wait(), 5)
-                if fake_conn.t2a_msg == "unexpected_close":
-                    raise ValueError("unexpected close")
-                if fake_conn.t2a_msg != "fake_data_ack_recv":
-                    self._log(f"[conn {cid}] خطای تزریق‌کننده: "
-                              f"{fake_conn.t2a_msg}", "error")
-                    return
-            except (asyncio.TimeoutError, ValueError) as exc:
-                self._log(f"[conn {cid}] دست‌دادن جعلی شکست/تایم‌اوت "
-                          f"({type(exc).__name__}: {fake_conn.t2a_msg or exc}) "
-                          f"— آیا WinDivert/درایور نصب و با دسترسی Admin اجرا "
-                          f"شده؟", "error")
-                return
-            finally:
-                fake_conn.monitor = False
-                self._fake_connections.pop(fake_conn.id, None)
+                from strategies import get_strategy
+                expects_ack = bool(getattr(
+                    get_strategy(self.bypass_method), "expects_ack", True))
+            except Exception:
+                expects_ack = True
 
-            self._log(f"[conn {cid}] ✓ ClientHello جعلی تأیید شد — شروع رله")
+            if expects_ack:
+                self._log(f"[conn {cid}] TCP وصل شد (مبدأ {self.interface_ipv4}:"
+                          f"{src_port}) — منتظر تأیید ClientHello جعلی…")
+
+                # Random micro-jitter to defeat timing-based DPI fingerprinting
+                await asyncio.sleep(random.uniform(0.001, 0.008))
+
+                try:
+                    await asyncio.wait_for(fake_conn.t2a_event.wait(), 5)
+                    if fake_conn.t2a_msg == "unexpected_close":
+                        raise ValueError("unexpected close")
+                    if fake_conn.t2a_msg != "fake_data_ack_recv":
+                        self._log(f"[conn {cid}] خطای تزریق‌کننده: "
+                                  f"{fake_conn.t2a_msg}", "error")
+                        return
+                except (asyncio.TimeoutError, ValueError) as exc:
+                    self._log(f"[conn {cid}] دست‌دادن جعلی شکست/تایم‌اوت "
+                              f"({type(exc).__name__}: {fake_conn.t2a_msg or exc}) "
+                              f"— آیا WinDivert/درایور نصب و با دسترسی Admin اجرا "
+                              f"شده؟", "error")
+                    return
+                finally:
+                    fake_conn.monitor = False
+                    self._fake_connections.pop(fake_conn.id, None)
+
+                self._log(f"[conn {cid}] ✓ ClientHello جعلی تأیید شد — شروع رله")
+            else:
+                # Fire-and-forget: no server ACK will arrive. Poll briefly for
+                # the injector to mark the fake as sent (it fires from the
+                # WinDivert thread the moment the client's post-handshake ACK
+                # is captured), then stop monitoring so the *real* ClientHello
+                # flows out untouched and start relaying. We also bail out
+                # early if the injector reported a hard error (unexpected
+                # close) or never got a chance to send within the window.
+                self._log(f"[conn {cid}] TCP وصل شد (مبدأ {self.interface_ipv4}:"
+                          f"{src_port}) — استراتژی fire-and-forget "
+                          f"({self.bypass_method}) — تزریق بدون انتظار ACK…")
+                try:
+                    # Wait for the injector to confirm the fake is on the wire.
+                    # It fires ``t2a_event`` with ``fake_sent_no_ack`` the
+                    # instant it injects (no server round-trip involved), so
+                    # this resolves in milliseconds rather than waiting out the
+                    # full timeout. The timeout only triggers when WinDivert
+                    # isn't actually intercepting (missing driver / not Admin).
+                    await asyncio.wait_for(fake_conn.t2a_event.wait(), 5)
+                    if fake_conn.t2a_msg == "unexpected_close":
+                        raise ValueError("unexpected close")
+                    if fake_conn.t2a_msg != "fake_sent_no_ack" \
+                            and not fake_conn.fake_sent:
+                        self._log(f"[conn {cid}] خطای تزریق‌کننده: "
+                                  f"{fake_conn.t2a_msg}", "error")
+                        return
+                    # Give the injected fake a brief head-start over the real
+                    # ClientHello so the DPI sees the decoy first.
+                    await asyncio.sleep(random.uniform(0.004, 0.012))
+                except (asyncio.TimeoutError, ValueError) as exc:
+                    self._log(f"[conn {cid}] بسته‌ی جعلی تزریق نشد "
+                              f"({type(exc).__name__}: {fake_conn.t2a_msg or exc})"
+                              f" — آیا WinDivert/درایور نصب و با دسترسی Admin "
+                              f"اجرا شده؟", "error")
+                    return
+                finally:
+                    fake_conn.monitor = False
+                    self._fake_connections.pop(fake_conn.id, None)
+
+                self._log(f"[conn {cid}] ✓ ClientHello جعلی تزریق شد "
+                          f"(بدون انتظار ACK) — شروع رله")
 
             # Optimize the incoming socket too before relay
             self._configure_sock(incoming_sock, self.gaming_mode)

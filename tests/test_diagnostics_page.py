@@ -88,6 +88,35 @@ class DiagnosticsPageTest(unittest.TestCase):
         page = self._page(snap)
         self.assertIn("غیرفعال", page.lbl_rst.text())
 
+    def test_live_throughput_shown_without_baseline(self):
+        # Active connection, no baseline yet (resilience off) but live rate
+        # is flowing → the card must surface "سرعت فعلی" with a formatted
+        # speed instead of looking dead (the #4 "does nothing" complaint).
+        snap = DiagnosticsSnapshot(
+            status="active", resilience_on=False,
+            recent_bps=2000.0, baseline_bps=0.0,
+        )
+        page = self._page(snap)
+        self.assertTrue(hasattr(page, "lbl_tp_help"))
+        self.assertTrue(page.lbl_tp_help.text())            # explanation present
+        self.assertIn("سرعت فعلی", page.lbl_tp_live.text())
+        # 2000 bps ⇒ a non-placeholder formatted figure
+        self.assertNotIn("—", page.lbl_tp_live.text())
+        self.assertNotIn("در انتظار", page.lbl_tp_live.text())
+        # bar can't show a throttle ratio without a baseline yet
+        self.assertEqual(page.bar_tp.value(), 0)
+        self.assertIn("خط پایه", page.lbl_tp.text())
+
+    def test_live_throughput_waiting_when_no_traffic(self):
+        snap = DiagnosticsSnapshot(status="active", recent_bps=0.0)
+        page = self._page(snap)
+        self.assertIn("در انتظار", page.lbl_tp_live.text())
+
+    def test_live_throughput_dash_when_disconnected(self):
+        snap = DiagnosticsSnapshot(status="idle", recent_bps=0.0)
+        page = self._page(snap)
+        self.assertIn("متصل نیست", page.lbl_tp_live.text())
+
     def test_polling_toggles(self):
         page = self._page(DiagnosticsSnapshot())
         self.assertFalse(page._timer.isActive())

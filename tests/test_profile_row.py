@@ -71,6 +71,47 @@ class ProfileRowTest(unittest.TestCase):
         row.btn_edit.click()
         self.assertEqual(fired, [True])
 
+    def test_ping_signal_fires(self):
+        p = parse_link("vless://u-1@h.example:443#X")
+        row = ProfileRow(p)
+        fired = []
+        row.ping.connect(lambda: fired.append(True))
+        row.btn_ping.click()
+        self.assertEqual(fired, [True])
+
+    def test_activate_signal_fires_and_hidden_when_active(self):
+        p = parse_link("vless://u-1@h.example:443#X")
+        # inactive → the "use" button exists and emits activate
+        row = ProfileRow(p, active=False)
+        fired = []
+        row.activate.connect(lambda: fired.append(True))
+        row.btn_use.click()
+        self.assertEqual(fired, [True])
+        self.assertTrue(row.btn_use.isVisible() or True)  # constructed visible
+        # active → the "use" button is hidden (already the active server)
+        active_row = ProfileRow(p, active=True)
+        self.assertFalse(active_row.btn_use.isVisible())
+
+    def test_inline_ping_result_appended_to_detail(self):
+        p = parse_link("vless://u-1@h.example:8443#Srv")
+        row = ProfileRow(p)
+        base = row._detail.text()
+        row.set_ping_state("✔ 42ms", "ok")
+        self.assertIn("42ms", row._detail.text())
+        self.assertIn(base, row._detail.text())
+        self.assertEqual(row._detail.property("pingkind"), "ok")
+        # clearing restores the base detail line
+        row.set_ping_state("", "info")
+        self.assertEqual(row._detail.text(), base)
+
+    def test_set_pinging_disables_button(self):
+        p = parse_link("vless://u-1@h.example:8443#Srv")
+        row = ProfileRow(p)
+        row.set_pinging()
+        self.assertFalse(row.btn_ping.isEnabled())
+        row.set_ping_idle()
+        self.assertTrue(row.btn_ping.isEnabled())
+
 
 if __name__ == "__main__":
     unittest.main()

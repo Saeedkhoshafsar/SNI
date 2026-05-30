@@ -70,6 +70,10 @@ class EngineController:
         self._spoof_port: Optional[int] = None
         self._status = STATUS_IDLE
         self._lock = threading.RLock()
+        # latest live throughput (bytes/sec) reported by the spoofer; surfaced
+        # in diagnostics even when the resilience baseline isn't built yet (#4)
+        self._live_up_bps = 0.0
+        self._live_down_bps = 0.0
 
         # Injectable factory so the OS-proxy lifecycle is testable without
         # touching the real Windows registry. Tests swap this for a fake;
@@ -122,6 +126,11 @@ class EngineController:
                 pass
 
     def _emit_traffic(self, up: int, down: int, up_bps: float, down_bps: float) -> None:
+        # remember the latest live rate so diagnostics can show real-time
+        # throughput even when the resilience layer (which owns the baseline)
+        # is turned off (feedback #4 — the throughput card "did nothing").
+        self._live_up_bps = float(up_bps)
+        self._live_down_bps = float(down_bps)
         if self.on_traffic:
             try:
                 self.on_traffic(up, down, up_bps, down_bps)

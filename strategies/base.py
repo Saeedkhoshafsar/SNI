@@ -47,6 +47,23 @@ class BypassStrategy:
     meta: StrategyMeta = StrategyMeta(
         key="base", title="Base", description="(abstract)", implemented=False)
 
+    # -- handshake contract -----------------------------------------------
+    # Whether the *server* is expected to acknowledge the injected fake
+    # segment.  ``True`` (the default) describes the classic out-of-window
+    # techniques (wrong_seq / multi_fake / fake_disorder): the server still
+    # receives the bogus segment, treats it as old/duplicate data and replies
+    # with a *duplicate ACK*.  The spoofer waits for that ACK
+    # (``fake_data_ack_recv``) as positive confirmation before relaying the
+    # real ClientHello.
+    #
+    # ``False`` describes "fire-and-forget" techniques (fake_ttl /
+    # wrong_checksum) whose whole purpose is that the genuine server **never**
+    # receives the fake — it dies in transit (low TTL) or is dropped as
+    # corrupt (bad checksum).  No ACK will ever come back, so the spoofer must
+    # NOT block waiting for one; it sends the fake, gives the injector a brief
+    # moment to emit it, then proceeds straight to the relay.
+    expects_ack: bool = True
+
     # -- shared building block --------------------------------------------
     @staticmethod
     def apply_fake_payload(packet: Any, connection: Any) -> None:

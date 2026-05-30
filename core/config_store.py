@@ -28,13 +28,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "connection_mode": "Tunnel",
     "LISTEN_HOST": "127.0.0.1",
     "LISTEN_PORT": 40443,
-    "CONNECT_IP": "188.114.98.0",
+    "CONNECT_IP": "104.19.229.21",
     "CONNECT_PORT": 443,
-    "FAKE_SNI": "www.speedtest.net",
+    "FAKE_SNI": "www.hcaptcha.com",
     "socks_port": 10808,
     "http_port": 10809,
     "allow_lan": False,           # bind socks/http on 0.0.0.0 so LAN devices (phone) can use it
-    "system_proxy": False,        # set the Windows OS-wide proxy → local HTTP port on start
+    "system_proxy": True,         # set the Windows OS-wide proxy → local HTTP port on start (ON by default)
     "self_test": True,            # after Start, probe xray→spoofer→CDN via the local HTTP port
     "bypass_method": "wrong_seq",
     "gaming_mode": False,
