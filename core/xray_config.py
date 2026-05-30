@@ -79,34 +79,41 @@ def _stream_settings(p: Profile, *, gaming: bool = False) -> dict[str, Any]:
         }
     elif net == "xhttp":
         # XHTTP (a.k.a. splithttp) — the modern CDN-friendly HTTP transport.
+        #
+        # Keep this MINIMAL and identical to what V2RayTun / v2rayN emit for the
+        # same share link: just host + path + mode. The user's link works in
+        # V2RayTun, and V2RayTun does **not** inject scMaxConcurrentPosts /
+        # scMaxEachPostBytes / scMinPostsIntervalMs — it lets xray pick its own
+        # (now sensible) defaults. Hard-coding those previously *changed* the
+        # upload-stream behaviour versus the known-good client, which can stall
+        # or break a Cloudflare-Worker XHTTP tunnel that expects xray's defaults.
+        #
+        # We therefore only emit each sc* knob when the share link explicitly
+        # carries it (so power users can still tune it), and otherwise stay out
+        # of xray's way — matching V2RayTun byte-for-byte for the common case.
         xhttp: dict[str, Any] = {
             "host": p.host or p.sni or p.address,
             "path": p.path or "/",
             "mode": p.mode or "auto",
         }
-        # Cloudflare-Worker XHTTP needs explicit upload-stream sizing or it
-        # drip-feeds (a few KB/min) because xray's defaults don't chunk the
-        # POST uploads in a way the Worker accepts. These match the values
-        # Hiddify/HaPP/v2rayN emit for the same link and fix the stall.
-        # Honour any values carried in the share link's `extra`, else default.
         ex = p.extra if isinstance(p.extra, dict) else {}
 
-        def _num(*keys, default):
+        def _opt_num(target_key, *keys):
             for k in keys:
                 v = ex.get(k)
                 if v not in (None, "", 0):
                     try:
-                        return int(v)
+                        xhttp[target_key] = int(v)
+                        return
                     except (TypeError, ValueError):
                         pass
-            return default
 
-        xhttp["scMaxConcurrentPosts"] = _num(
-            "scMaxConcurrentPosts", "scmaxconcurrentposts", default=10)
-        xhttp["scMaxEachPostBytes"] = _num(
-            "scMaxEachPostBytes", "scmaxeachpostbytes", default=1000000)
-        xhttp["scMinPostsIntervalMs"] = _num(
-            "scMinPostsIntervalMs", "scminpostsintervalms", default=30)
+        _opt_num("scMaxConcurrentPosts",
+                 "scMaxConcurrentPosts", "scmaxconcurrentposts")
+        _opt_num("scMaxEachPostBytes",
+                 "scMaxEachPostBytes", "scmaxeachpostbytes")
+        _opt_num("scMinPostsIntervalMs",
+                 "scMinPostsIntervalMs", "scminpostsintervalms")
         stream["xhttpSettings"] = xhttp
     elif net == "httpupgrade":
         stream["httpupgradeSettings"] = {

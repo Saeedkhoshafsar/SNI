@@ -565,7 +565,20 @@ class EngineController:
         # bytes + rate; the UI turns it into the dashboard's traffic graph
         if hasattr(self._proxy, "on_traffic"):
             self._proxy.on_traffic = self._emit_traffic
-        self._proxy.start()
+        # start() now blocks until the spoofer is actually listening (or fails);
+        # if it couldn't come up we must NOT launch xray against a dead port —
+        # that's the classic "connects in V2RayTun but not standalone" trap
+        # (xray dials 127.0.0.1:40443 before the spoofer has bound it).
+        started = self._proxy.start()
+        if started is False:
+            err = (getattr(self._proxy, "_start_error", None)
+                   or "راه‌اندازی spoofer ناموفق بود")
+            self._log(f"✗ {err}")
+            # tear down any partially-started pieces first (stop() resets the
+            # status to IDLE), *then* set ERROR so it isn't clobbered.
+            self.stop()
+            self._set_status(STATUS_ERROR)
+            return
 
         # --- 3. chain xray core in front of the spoofer ---
         # Reached for spoof configs (127.0.0.1:40443 links) and the explicit

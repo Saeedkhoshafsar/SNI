@@ -159,6 +159,19 @@ class XrayManager:
                 si.wShowWindow = subprocess.SW_HIDE
                 kwargs["startupinfo"] = si
                 kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+            # Tell xray where to find geoip.dat / geosite.dat. Our config uses a
+            # ``geoip:private`` routing rule, so when the first private-range
+            # packet is routed xray loads geoip.dat — if it can't find it the
+            # connection silently fails. xray searches XRAY_LOCATION_ASSET, then
+            # its CWD. We point both at bin/ so the bundled .dat files are found
+            # regardless of where the .exe (or PyInstaller temp dir) lives.
+            bin_dir = get_bin_dir()
+            env = dict(os.environ)
+            env.setdefault("XRAY_LOCATION_ASSET", bin_dir)
+            kwargs["env"] = env
+            kwargs["cwd"] = bin_dir
+
             self._process = subprocess.Popen(
                 [self.xray_exe, "run", "-config", self.config_path],
                 stdout=subprocess.PIPE,
@@ -166,6 +179,21 @@ class XrayManager:
                 **kwargs,
             )
             threading.Thread(target=self._pump_output, daemon=True).start()
+
+            # xray exits within milliseconds on a bad config / missing asset.
+            # Detect that fast crash and surface it, instead of reporting
+            # "Xray started" for a process that's already dead (which made the
+            # tunnel look up while every request silently failed).
+            import time as _time
+            _time.sleep(0.4)
+            if self._process.poll() is not None:
+                code = self._process.returncode
+                self._log(
+                    f"ERROR: xray بلافاصله بسته شد (کد خروج {code}). "
+                    f"لاگ‌های [xray] بالا را برای علت بررسی کنید "
+                    f"(کانفیگ نامعتبر یا فایل geoip/geosite غایب).")
+                self._process = None
+                return
             chain = (f"  (chain → spoofer 127.0.0.1:{self.spoof_port}"
                      f" → {self.profile.address}:{self.profile.port})"
                      if self.spoof_port else

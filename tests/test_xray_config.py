@@ -54,12 +54,15 @@ def test_vless_xhttp_outbound():
     assert xh["host"] == "worker.example.dev"
     assert xh["path"] == "/vless-xhttp"
     assert xh["mode"] == "auto"
-    # Cloudflare-Worker upload sizing — without these the stream drip-feeds a
-    # few KB/min (regression for the "works in HaPP/Hiddify but not in-app,
-    # data trickles" report). Defaults match what Hiddify/HaPP emit.
-    assert xh["scMaxConcurrentPosts"] == 10
-    assert xh["scMaxEachPostBytes"] == 1000000
-    assert xh["scMinPostsIntervalMs"] == 30
+    # We must emit the SAME minimal xhttpSettings that V2RayTun / v2rayN emit
+    # for this link (host + path + mode only). The link works in V2RayTun, and
+    # V2RayTun does NOT inject sc* upload-sizing knobs — it lets xray use its
+    # own defaults. Hard-coding sc* previously diverged from the known-good
+    # client and could stall/break the Worker tunnel, so when the link omits
+    # them we must omit them too.
+    assert "scMaxConcurrentPosts" not in xh
+    assert "scMaxEachPostBytes" not in xh
+    assert "scMinPostsIntervalMs" not in xh
     # no stale tcp settings leaked in
     assert "tcpSettings" not in ss and "wsSettings" not in ss
 
