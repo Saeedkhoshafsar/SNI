@@ -432,6 +432,16 @@ class SettingsPage(QWidget):
         form.addWidget(self.lan_hint)
         self.chk_lan.toggled.connect(self._update_lan_hint)
 
+        # --- system proxy vs. tunnel (feedback 7) ---
+        self.chk_system_proxy = QCheckBox(
+            "پروکسی سیستم — همه‌ی برنامه‌های ویندوز خودکار از تونل رد شوند")
+        form.addWidget(self.chk_system_proxy)
+        self.proxy_hint = QLabel("")
+        self.proxy_hint.setObjectName("Muted")
+        self.proxy_hint.setWordWrap(True)
+        form.addWidget(self.proxy_hint)
+        self.chk_system_proxy.toggled.connect(self._update_proxy_hint)
+
         save_row = QHBoxLayout()
         save_row.addStretch(1)
         self.btn_save = QPushButton("ذخیره")
@@ -455,6 +465,8 @@ class SettingsPage(QWidget):
         self.connect_ip.setText(str(cfg.get("CONNECT_IP", "")))
         self.chk_lan.setChecked(bool(cfg.get("allow_lan", False)))
         self._update_lan_hint(self.chk_lan.isChecked())
+        self.chk_system_proxy.setChecked(bool(cfg.get("system_proxy", False)))
+        self._update_proxy_hint(self.chk_system_proxy.isChecked())
 
     def collect(self) -> dict:
         """Read the widgets back into a config dict fragment."""
@@ -465,6 +477,7 @@ class SettingsPage(QWidget):
             "socks_port": self.spin_socks.value(),
             "CONNECT_IP": self.connect_ip.text().strip(),
             "allow_lan": self.chk_lan.isChecked(),
+            "system_proxy": self.chk_system_proxy.isChecked(),
         }
 
     def _update_lan_hint(self, on: bool) -> None:
@@ -482,6 +495,18 @@ class SettingsPage(QWidget):
         self.lan_hint.setText(
             f"روشن — در گوشی، پروکسی SOCKS5 را روی {ip}:{port} تنظیم کنید "
             f"(هر دو دستگاه باید روی یک شبکه/Wi-Fi باشند)")
+
+    def _update_proxy_hint(self, on: bool) -> None:
+        """Explain the tunnel-vs-system-proxy choice (feedback 7)."""
+        if on:
+            self.proxy_hint.setText(
+                "حالت «پروکسی سیستم»: هنگام اتصال، پروکسی ویندوز روی پورت HTTP "
+                "محلی تنظیم می‌شود و با قطع اتصال خودکار برمی‌گردد. فقط در "
+                "حالت‌های دارای xray (نه SNI Only) و روی ویندوز کار می‌کند.")
+        else:
+            self.proxy_hint.setText(
+                "حالت «تونل»: فقط برنامه‌هایی که دستی روی پروکسی محلی تنظیم "
+                "شده‌اند رد می‌شوند؛ تنظیمات ویندوز دست‌نخورده می‌ماند.")
 
     def _field_label(self, t: str) -> QLabel:
         lbl = QLabel(t)

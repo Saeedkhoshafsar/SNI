@@ -66,9 +66,15 @@ class EngineController:
         self._xray = None             # core.xray_manager.XrayManager
         self._prober = None           # core.prober.AutoProber (when enabled)
         self._resilience = None       # core.resilience.ResilienceController
+        self._system_proxy = None     # core.system_proxy.SystemProxy (when on)
         self._spoof_port: Optional[int] = None
         self._status = STATUS_IDLE
         self._lock = threading.RLock()
+
+        # Injectable factory so the OS-proxy lifecycle is testable without
+        # touching the real Windows registry. Tests swap this for a fake;
+        # production leaves it None → the real SystemProxy is built lazily.
+        self._system_proxy_factory: Optional[Callable[[], Any]] = None
 
     # ------------------------------------------------------------------ wiring
 
@@ -445,8 +451,42 @@ class EngineController:
             else:
                 self._xray.start()
 
+        # --- 4. optionally point the OS system proxy at our local HTTP port ---
+        self._maybe_enable_system_proxy(use_core)
+
         self._set_status(STATUS_ACTIVE)
         self._log("✓ اتصال برقرار شد")
+
+    def _maybe_enable_system_proxy(self, use_core: bool) -> None:
+        """Set the Windows system proxy → local HTTP port, if requested.
+
+        System-proxy mode only makes sense when xray-core is in the chain (it
+        exposes a real local HTTP/SOCKS proxy). In SNI-Only mode the spoofer is
+        a transparent forwarder, so there is nothing to point the OS proxy at.
+        """
+        self._system_proxy = None
+        if not self.config.get("system_proxy", False):
+            return
+        if not use_core:
+            self._log("پروکسی سیستم فقط در حالت‌های دارای xray کاربرد دارد "
+                      "(در SNI Only نادیده گرفته شد)")
+            return
+        try:
+            from core.system_proxy import SystemProxy, is_windows
+            host = "127.0.0.1"
+            port = int(self.config.get("http_port", 10809))
+            if self._system_proxy_factory is not None:
+                sp = self._system_proxy_factory()
+            else:
+                if not is_windows():
+                    self._log("پروکسی سیستم فقط روی ویندوز اعمال می‌شود")
+                    return
+                sp = SystemProxy(on_log=self._log)
+            sp.enable(host, port)
+            self._system_proxy = sp
+        except Exception as exc:  # never block Start on proxy failure
+            self._log(f"تنظیم پروکسی سیستم ناموفق: {exc}")
+            self._system_proxy = None
 
     def _on_proxy_status(self, running: bool) -> None:
         # the proxy reports its own listen-loop coming up/down; only downgrade
@@ -461,7 +501,14 @@ class EngineController:
         """Stop xray then the spoofer; safe to call when already stopped."""
         with self._lock:
             xray, proxy = self._xray, self._proxy
-            self._xray = self._proxy = None
+            sysproxy = self._system_proxy
+            self._xray = self._proxy = self._system_proxy = None
+        # restore the OS proxy first so the browser stops pointing at a dead port
+        if sysproxy is not None:
+            try:
+                sysproxy.disable()
+            except Exception as exc:
+                self._log(f"خطا در خاموش‌کردن پروکسی سیستم: {exc}")
         if xray is not None:
             try:
                 xray.stop()

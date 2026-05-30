@@ -197,5 +197,33 @@ class LanSettingsTest(unittest.TestCase):
         self.assertIn(str(page.spin_socks.value()), hint)
 
 
+class SystemProxySettingsTest(unittest.TestCase):
+    """SettingsPage tunnel-vs-system-proxy toggle (feedback 7)."""
+
+    def _page(self):
+        from ui.window import SettingsPage
+        return SettingsPage()
+
+    def test_system_proxy_toggle_roundtrips_through_config(self):
+        page = self._page()
+        page.load_from({"system_proxy": True})
+        self.assertTrue(page.chk_system_proxy.isChecked())
+        self.assertTrue(page.collect()["system_proxy"])
+        page.chk_system_proxy.setChecked(False)
+        self.assertFalse(page.collect()["system_proxy"])
+
+    def test_system_proxy_off_by_default(self):
+        page = self._page()
+        page.load_from({})
+        self.assertFalse(page.chk_system_proxy.isChecked())
+        # default (tunnel) hint mentions the tunnel wording
+        self.assertIn("تونل", page.proxy_hint.text())
+
+    def test_system_proxy_hint_changes_when_on(self):
+        page = self._page()
+        page.chk_system_proxy.setChecked(True)   # toggled → hint updates
+        self.assertIn("پروکسی سیستم", page.proxy_hint.text())
+
+
 if __name__ == "__main__":
     unittest.main()

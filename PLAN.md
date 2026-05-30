@@ -84,7 +84,7 @@ Cloudflare Worker (`type=xhttp`, `mode=auto`). علت ریشه‌ای: `_stream_
 عدم اتصال. این یعنی ادعای «بی‌نیازی از v2rayN» عملاً برای ترنسپورت مدرن XHTTP نقض شده بود.
 
 - [x] استپ ۲۱ — **رفع باگ XHTTP** (بحرانی): افزودن `xhttp`/`splithttp`/`httpupgrade` به `TRANSPORTS`، فیلد `mode` به `Profile`، گرفتن `mode=` در پارسر (vless/trojan/vmess)، ساخت درست `xhttpSettings`/`httpupgradeSettings` در `_stream_settings` (با نرمال‌سازی `splithttp→xhttp`)، و نمایش/ویرایش `mode` در دیالوگ پروفایل (بازخورد ۱۱)  ✅ 2026-05-30
-- [ ] استپ ۲۲ — پروکسی سیستم ویندوز (set/unset رجیستری) + سوییچ در UI «تونل/پروکسی سیستم» (بازخورد ۷)
+- [x] استپ ۲۲ — پروکسی سیستم ویندوز (set/unset رجیستری) + سوییچ در UI «تونل/پروکسی سیستم» (بازخورد ۷)  ✅ 2026-05-30
 - [ ] استپ ۲۳ — لاگ حرفه‌ای: timestamp، سطح‌بندی info/ok/warn/err با رنگ، فیلتر، شمارنده (بازخورد ۱)
 - [ ] استپ ۲۴ — صفحه‌ی استراتژی کلیک‌پذیر + بازطراحی تم سه‌بعدی/مدرن (کارت‌های معلق/شیشه/سایه عمیق/هاور) + رفع drag پنجره (بازخورد ۴/۵/۶)
 
@@ -339,3 +339,15 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **`ui/profile_dialog.py`** — افزودن ردیف «حالت XHTTP» به بخش ترنسپورت؛ `xhttp/...` به‌صورت خودکار در کمبوی ترنسپورت ظاهر می‌شوند چون از `TRANSPORTS` پر می‌شود. (collect از `_source.to_dict()` شروع می‌کند، پس `mode` حتی بدون ویرایش حفظ می‌شود.)
 - **اعتبارسنجی با کانفیگ واقعی کاربر:** لینک VLESS+XHTTP+Cloudflare او درست پارس و به `network=xhttp` + `tlsSettings`(SNI+fp=chrome) + `xhttpSettings`(host/path/mode=auto) تبدیل شد — دقیقاً همان چیزی که v2rayN/Hiddify تولید می‌کند.
 - تست‌ها: `tests/test_share_link.py` (+۳: XHTTP/Cloudflare واقعی، mode در trojan، mode در vmess) + `tests/test_xray_config.py` (+۴: xhttpSettings درست بدون نشت tcp/ws، نرمال‌سازی splithttp، mode پیش‌فرض auto، httpupgrade) + `tests/test_profile_dialog.py` (+۱: prefill/round-trip mode). مجموعاً **۲۷۱ تست سبز + ۲ skip**.
+
+## ✅ استپ ۲۲ — پروکسی سیستم ویندوز + سوییچ «تونل/پروکسی سیستم» (2026-05-30)
+**چرا:** بازخورد ۷ — کاربر می‌خواهد یک حالت «پروکسی سیستم» داشته باشد که هنگام اتصال، پروکسی ویندوز را روی پورت HTTP محلی تنظیم کند (مثل v2rayN/Clash) تا همهٔ مرورگرها/برنامه‌ها خودکار رد شوند؛ و با قطع اتصال خودکار برگردد. در مقابلِ حالت «تونل» که فقط برنامه‌های دستی‌تنظیم‌شده رد می‌شوند و تنظیمات ویندوز دست‌نخورده می‌ماند.
+- **`core/system_proxy.py` (جدید)** — هلپر پروکسی سیستم. کلیدهای WinINET زیر `HKCU\...\Internet Settings` نوشته می‌شوند (`ProxyEnable`/`ProxyServer`/`ProxyOverride`) و سپس با `InternetSetOption` رفرش می‌شوند تا بی‌نیاز از logout اعمال شود.
+  - **منطق خالص و تست‌پذیر روی هر OS** (مدل‌گرفته از `core/admin.py`): `format_proxy_server(host,port)` (اعتبارسنجی پورت، host خالی→loopback)، `normalise_bypass()` (لیست bypass تمیزِ `;`-جداشده با fallback به `DEFAULT_BYPASS`)، `desired_state(enable,host,port,bypass)` (محاسبهٔ مقادیر رجیستری).
+  - `DEFAULT_BYPASS = "localhost;127.*;10.*;172.16.*;192.168.*;<local>"` تا ترافیک محلی/اینترانت از پروکسی رد نشود.
+  - کلاس `SystemProxy` با backendهای تزریق‌پذیر (`writer`/`refresher`/`reader`) — متدهای `enable/disable/is_enabled`. بخش‌های واقعی winreg/ctypes فقط روی ویندوز و با `# pragma: no cover` اجرا می‌شوند؛ تست‌ها هرگز رجیستری واقعی را لمس نمی‌کنند.
+- **`core/engine.py`** — `_maybe_enable_system_proxy(use_core)` در `_do_start` (پس از بالاآمدن xray): فقط اگر `config["system_proxy"]` روشن، `use_core` (xray در زنجیره)، و ویندوز باشد، پروکسی OS را به `127.0.0.1:<http_port>` می‌چرخاند. در `stop()` ابتدا `disable()` صدا زده می‌شود (قبل از تخریب xray/proxy) تا مرورگر به پورت مرده اشاره نکند. فاکتوریِ تزریق‌پذیر `_system_proxy_factory` افزوده شد تا چرخهٔ enable/disable بدون لمس رجیستری تست شود.
+- **`core/config_store.py`** — پیش‌فرض `"system_proxy": False`.
+- **`ui/window.py`** — در SettingsPage: چک‌باکس `chk_system_proxy` + برچسب راهنمای `proxy_hint` + `_update_proxy_hint` که تفاوت «تونل» و «پروکسی سیستم» را توضیح می‌دهد؛ بارگذاری/جمع‌آوری در `load_from`/`collect`.
+- **چرا فقط در حالت‌های دارای xray:** در «SNI Only» اسپوفر یک forwarder شفاف است و پروکسی HTTP واقعی‌ای وجود ندارد که OS را به آن اشاره دهیم؛ پس toggle در آن حالت نادیده گرفته شده و لاگ می‌شود.
+- تست‌ها: `tests/test_system_proxy.py` (+۱۰: منطق خالص + چرخهٔ enable/disable با `_FakeBackend` + swallow خطای reader) + `tests/test_engine.py` (+۳: enable روی start/disable روی stop، نادیده‌گرفتن در SNI Only، خاموش بودن پیش‌فرض) + `tests/test_ping_ui.py` (+۳: round-trip toggle، خاموش پیش‌فرض، تغییر hint). مجموعاً **۲۸۷ تست سبز + ۲ skip**.

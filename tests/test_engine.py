@@ -441,6 +441,78 @@ class EngineControllerTest(unittest.TestCase):
         self.assertEqual(FakeXray.last_instance.listen, "127.0.0.1")
         ctrl.stop()
 
+    def test_system_proxy_enabled_on_start_disabled_on_stop(self):
+        """When system_proxy is on (core mode), the OS proxy is flipped on at
+        start (pointed at the local HTTP port) and back off at stop."""
+        from core.system_proxy import SystemProxy
+        store = {"ProxyEnable": 0, "ProxyServer": "", "ProxyOverride": ""}
+        refreshes = {"n": 0}
+
+        def _writer(values):
+            store.update(values)
+
+        def _refresher():
+            refreshes["n"] += 1
+
+        def _make_sp():
+            return SystemProxy(writer=_writer, refresher=_refresher,
+                               reader=lambda: dict(store))
+
+        ctrl = EngineController({
+            "connection_mode": "SNI + Warp",  # use_core → eligible for system proxy
+            "LISTEN_PORT": 40443, "http_port": 10809,
+            "system_proxy": True,
+        })
+        ctrl._system_proxy_factory = _make_sp
+        ctrl.set_profile(self._profile())
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        # OS proxy turned ON pointing at the local HTTP port
+        self.assertEqual(store["ProxyEnable"], 1)
+        self.assertEqual(store["ProxyServer"], "127.0.0.1:10809")
+        self.assertIsNotNone(ctrl._system_proxy)
+        ctrl.stop()
+        # …and turned back OFF on stop
+        self.assertEqual(store["ProxyEnable"], 0)
+        self.assertIsNone(ctrl._system_proxy)
+
+    def test_system_proxy_skipped_in_sni_only_mode(self):
+        """System proxy needs a real local proxy (xray); SNI Only has none, so
+        the toggle is ignored and the OS proxy is never touched."""
+        from core.system_proxy import SystemProxy
+        store = {"ProxyEnable": 0, "ProxyServer": "", "ProxyOverride": ""}
+
+        def _make_sp():
+            return SystemProxy(writer=lambda v: store.update(v),
+                               refresher=lambda: None,
+                               reader=lambda: dict(store))
+
+        ctrl = EngineController({
+            "connection_mode": "SNI Only", "LISTEN_PORT": 40443,
+            "CONNECT_IP": "1.2.3.4", "CONNECT_PORT": 443,
+            "system_proxy": True,
+        })
+        ctrl._system_proxy_factory = _make_sp
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        self.assertIsNone(ctrl._system_proxy)
+        self.assertEqual(store["ProxyEnable"], 0)  # never touched
+        ctrl.stop()
+
+    def test_system_proxy_off_by_default(self):
+        """With the toggle off, even in core mode the OS proxy stays untouched."""
+        ctrl = EngineController({
+            "connection_mode": "SNI + Warp", "LISTEN_PORT": 40443,
+        })
+        sentinel = {"called": False}
+        ctrl._system_proxy_factory = lambda: sentinel.__setitem__("called", True)
+        ctrl.set_profile(self._profile())
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        self.assertIsNone(ctrl._system_proxy)
+        self.assertFalse(sentinel["called"])
+        ctrl.stop()
+
     def test_resilience_chain_includes_extra_ips(self):
         ctrl = EngineController({
             "connection_mode": "SNI Only",
