@@ -10,6 +10,8 @@ Run:  python tests/test_strategies.py
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strategies import (
@@ -118,8 +120,11 @@ def test_get_strategy_unknown_raises_keyerror():
 
 
 EXPECTED_KEYS = {
-    "wrong_seq", "wrong_checksum", "fake_ttl", "multi_fake", "fake_disorder",
+    "wrong_seq", "multi_fake", "fake_disorder",
 }
+
+# fake_ttl and wrong_checksum were removed (fire-and-forget, unverifiable).
+REMOVED_KEYS = {"fake_ttl", "wrong_checksum"}
 
 
 def test_all_strategies_contains_wrong_seq():
@@ -289,13 +294,14 @@ def test_out_of_window_strategies_expect_ack():
         assert get_strategy(key).expects_ack is True, key
 
 
-def test_fire_and_forget_strategies_do_not_expect_ack():
-    # fake_ttl (packet TTL-dies before the server) and wrong_checksum (server
-    # drops the corrupt segment) are designed so the server NEVER receives the
-    # fake → no ACK ever returns. They must declare expects_ack=False so the
-    # spoofer relays immediately instead of timing out after 5s.
-    for key in ("fake_ttl", "wrong_checksum"):
-        assert get_strategy(key).expects_ack is False, key
+def test_removed_strategies_are_unregistered():
+    # fake_ttl and wrong_checksum were fire-and-forget: by design the server
+    # never ACKs the fake, so the spoofer could never *confirm* the decoy
+    # reached the DPI box → unreliable. They were removed entirely.
+    for key in REMOVED_KEYS:
+        assert key not in REGISTRY, key
+        with pytest.raises(KeyError):
+            get_strategy(key)
 
 
 # ---------------------------------------------------------------------------
@@ -310,92 +316,6 @@ def test_apply_fake_payload_shared_prologue():
     assert pkt.tcp.payload == b"12345"
     assert pkt.ip.packet_len == 45
     assert pkt.ipv4.ident == 8
-
-
-# ---------------------------------------------------------------------------
-#  wrong_checksum
-# ---------------------------------------------------------------------------
-
-def test_wrong_checksum_metadata_and_score():
-    s = get_strategy("wrong_checksum")
-    assert s.meta.title == "Wrong Checksum"
-    assert s.score() == 0.6
-    assert "no-recalc" in s.meta.tags
-
-
-def test_wrong_checksum_corrupts_checksum_and_keeps_inwindow_seq():
-    s = get_strategy("wrong_checksum")
-    pkt = _FakePacket()
-    conn = _FakeConnection(syn_seq=2000, fake_data=b"hello")
-    s.mutate_fake_packet(pkt, conn)
-    assert pkt.tcp.payload == b"hello"
-    # the fake must carry a deliberately-wrong, NON-ZERO checksum. We avoid
-    # 0x0000 because in TCP (unlike UDP) zero is a legitimate checksum value and
-    # some NIC offload paths treat it specially, so it wasn't reliably dropped.
-    assert pkt.tcp.checksum == s.BAD_CHECKSUM
-    assert pkt.tcp.checksum != 0x0000
-    assert pkt.tcp.checksum != 0x1234          # differs from the valid starting value
-    assert pkt.tcp.seq_num == (2000 + 1) & 0xFFFFFFFF  # in-window
-
-
-def test_wrong_checksum_avoids_accidental_match():
-    # if the stale checksum already equals BAD_CHECKSUM, the strategy must
-    # perturb it so the emitted value is still definitely "wrong".
-    s = get_strategy("wrong_checksum")
-    pkt = _FakePacket()
-    pkt.tcp.checksum = s.BAD_CHECKSUM
-    conn = _FakeConnection(syn_seq=2000, fake_data=b"hello")
-    s.mutate_fake_packet(pkt, conn)
-    assert pkt.tcp.checksum != 0x0000
-    # perturbed away from the constant (XOR 0xFFFF) yet still non-zero
-    assert pkt.tcp.checksum == (s.BAD_CHECKSUM ^ 0xFFFF)
-
-
-def test_wrong_checksum_sends_without_recalc():
-    # CRITICAL: must send recalc=False so WinDivert keeps the bad checksum
-    s = get_strategy("wrong_checksum")
-    pkt = _FakePacket()
-    conn = _FakeConnection()
-    inj = _FakeInjector()
-    s.send_fake(inj, pkt, conn)
-    assert conn.fake_sent is True
-    assert inj.sent == [(pkt, False)]
-
-
-# ---------------------------------------------------------------------------
-#  fake_ttl
-# ---------------------------------------------------------------------------
-
-def test_fake_ttl_metadata_and_score():
-    s = get_strategy("fake_ttl")
-    assert s.meta.title == "Fake TTL"
-    assert s.score() == 0.55
-
-
-def test_fake_ttl_sets_low_ipv4_ttl():
-    s = get_strategy("fake_ttl")
-    pkt = _FakePacket()  # ipv4 packet, no ipv6
-    conn = _FakeConnection(syn_seq=500)
-    s.mutate_fake_packet(pkt, conn)
-    assert pkt.ip.ttl == s.DEFAULT_TTL
-    assert pkt.tcp.seq_num == (500 + 1) & 0xFFFFFFFF
-
-
-def test_fake_ttl_per_connection_override():
-    s = get_strategy("fake_ttl")
-    pkt = _FakePacket()
-    conn = _FakeConnection()
-    conn.fake_ttl = 9
-    s.mutate_fake_packet(pkt, conn)
-    assert pkt.ip.ttl == 9
-
-
-def test_fake_ttl_sets_ipv6_hop_limit():
-    s = get_strategy("fake_ttl")
-    pkt = _FakePacket(with_ipv4=False, with_ipv6=True)
-    conn = _FakeConnection()
-    s.mutate_fake_packet(pkt, conn)
-    assert pkt.ipv6.hop_limit == s.DEFAULT_TTL
 
 
 # ---------------------------------------------------------------------------

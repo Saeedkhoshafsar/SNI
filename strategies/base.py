@@ -56,12 +56,13 @@ class BypassStrategy:
     # (``fake_data_ack_recv``) as positive confirmation before relaying the
     # real ClientHello.
     #
-    # ``False`` describes "fire-and-forget" techniques (fake_ttl /
-    # wrong_checksum) whose whole purpose is that the genuine server **never**
-    # receives the fake — it dies in transit (low TTL) or is dropped as
-    # corrupt (bad checksum).  No ACK will ever come back, so the spoofer must
-    # NOT block waiting for one; it sends the fake, gives the injector a brief
-    # moment to emit it, then proceeds straight to the relay.
+    # ``False`` would describe a "fire-and-forget" technique whose fake the
+    # genuine server **never** receives (dies in transit / dropped as corrupt),
+    # so no ACK ever returns. The early ``fake_ttl`` / ``wrong_checksum``
+    # experiments were of this kind but have been removed: because no ACK comes
+    # back the spoofer could never *confirm* the decoy reached the DPI box,
+    # which made them unreliable. The flag is kept as an extension point for any
+    # future technique, and the spoofer still honours it.
     expects_ack: bool = True
 
     # -- shared building block --------------------------------------------

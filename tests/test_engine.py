@@ -149,7 +149,7 @@ class EngineControllerTest(unittest.TestCase):
         # profile can't run on a raw forwarder).
         ctrl.set_profile(self._profile())
         self.assertTrue(ctrl.uses_core)
-        ctrl.update_config({"connection_mode": "SNI + Warp"})
+        ctrl.update_config({"connection_mode": "SNI Only"})
         self.assertTrue(ctrl.uses_core)
 
     def test_sni_only_no_profile_starts_proxy_no_xray(self):
@@ -171,10 +171,13 @@ class EngineControllerTest(unittest.TestCase):
         self.assertEqual(ctrl.status, STATUS_IDLE)
 
     def test_core_mode_chains_spoofer_under_xray(self):
-        ctrl = EngineController({
-            "connection_mode": "SNI + Warp", "LISTEN_PORT": 40443,
-        })
-        ctrl.set_profile(self._profile())
+        # #6: only a SPOOF config (loopback share link) chains the spoofer. The
+        # spoofer dials the fixed CDN IP with the decoy SNI; xray's outbound is
+        # pointed at the local spoofer port.
+        prof = self._spoof_profile()
+        ctrl = EngineController({"connection_mode": "Tunnel"})
+        ctrl.set_profile(prof)
+        self.assertTrue(ctrl.chains_spoofer)
         ctrl.start()
         self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
 
@@ -182,15 +185,30 @@ class EngineControllerTest(unittest.TestCase):
         xray = FakeXray.last_instance
         self.assertIsNotNone(proxy)
         self.assertIsNotNone(xray)
-        # spoofer forwards to the REAL server...
-        self.assertEqual(proxy.config["CONNECT_IP"], "real.example.com")
-        self.assertEqual(proxy.config["CONNECT_PORT"], 8443)
-        # ...and xray's outbound is pointed at the local spoofer port
-        self.assertEqual(xray.spoof_port, 40443)
-        self.assertEqual(proxy.config["LISTEN_PORT"], 40443)
+        # spoofer forwards to the fixed CDN IP (decoy SNI rides on top)
+        self.assertEqual(proxy.config["CONNECT_IP"], prof.spoof_connect_ip)
+        self.assertEqual(proxy.config["CONNECT_PORT"], prof.spoof_connect_port)
+        # xray's outbound is pointed at the local spoofer port
+        self.assertEqual(xray.spoof_port, proxy.config["LISTEN_PORT"])
         ctrl.stop()
         self.assertTrue(proxy.stopped)
         self.assertTrue(xray.stopped)
+
+    def test_ordinary_config_never_chains_spoofer(self):
+        # #6: an ordinary (routable) config connects directly — no spoofer is
+        # ever started, regardless of the connection mode.
+        for mode in ("Tunnel", "SNI Only"):
+            with self.subTest(mode=mode):
+                FakeProxy.last_instance = None
+                ctrl = EngineController({"connection_mode": mode})
+                ctrl.set_profile(self._profile())
+                self.assertFalse(ctrl.chains_spoofer)
+                ctrl.start()
+                self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+                # core-only path: xray runs, no spoofer ProxyServer
+                self.assertIsNotNone(FakeXray.last_instance)
+                self.assertIsNone(FakeProxy.last_instance)
+                ctrl.stop()
 
     def test_spoofer_start_failure_aborts_and_no_xray(self):
         # If the spoofer can't come up (e.g. WinDivert missing / port busy),
@@ -206,10 +224,9 @@ class EngineControllerTest(unittest.TestCase):
         import main as fake_main
         fake_main.ProxyServer = FailingProxy
         try:
-            ctrl = EngineController({
-                "connection_mode": "SNI + Warp", "LISTEN_PORT": 40443,
-            })
-            ctrl.set_profile(self._profile())
+            # a spoof config is the case that actually starts the spoofer (#6)
+            ctrl = EngineController({"connection_mode": "Tunnel"})
+            ctrl.set_profile(self._spoof_profile())
             logs = []
             ctrl.on_log = logs.append
             ctrl.start()
@@ -316,14 +333,14 @@ class EngineControllerTest(unittest.TestCase):
         # SNI Only, no auto-prober → the configured method is what's in force,
         # and it must be reported to the UI exactly once on start.
         ctrl = EngineController(
-            {"connection_mode": "SNI Only", "bypass_method": "fake_ttl"})
+            {"connection_mode": "SNI Only", "bypass_method": "fake_disorder"})
         seen = []
         ctrl.on_strategy = lambda m: seen.append(m)
         ctrl.start()
         self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
         # the dashboard (via on_strategy) and engine.active_strategy must agree
-        self.assertEqual(seen, ["fake_ttl"])
-        self.assertEqual(ctrl.active_strategy, "fake_ttl")
+        self.assertEqual(seen, ["fake_disorder"])
+        self.assertEqual(ctrl.active_strategy, "fake_disorder")
         ctrl.stop()
         # cleared on stop so a stale strategy never lingers in the UI
         self.assertIsNone(ctrl.active_strategy)
@@ -362,9 +379,9 @@ class EngineControllerTest(unittest.TestCase):
         import core.prober as prober_mod
         from core.prober import ProbeResult, OK, RST
 
-        # fake probe: only "fake_ttl" succeeds, everything else RSTs
+        # fake probe: only "fake_disorder" succeeds, everything else RSTs
         def fake_probe(candidate, host, port, timeout):
-            if candidate.strategy == "fake_ttl":
+            if candidate.strategy == "fake_disorder":
                 return ProbeResult(candidate, OK, latency_ms=5.0)
             return ProbeResult(candidate, RST)
 
@@ -381,14 +398,14 @@ class EngineControllerTest(unittest.TestCase):
             ctrl.start()
             self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
             # engine must have locked onto the only successful candidate
-            self.assertEqual(FakeProxy.last_instance.bypass_method, "fake_ttl")
+            self.assertEqual(FakeProxy.last_instance.bypass_method, "fake_disorder")
             # consistency: the strategy reported to the UI, engine.active_strategy,
             # and the diagnostics snapshot must all agree on the prober's winner
             # (this is the bug the user hit: dashboard said wrong_seq while
             #  diagnostics said the probed winner).
-            self.assertEqual(seen, ["fake_ttl"])
-            self.assertEqual(ctrl.active_strategy, "fake_ttl")
-            self.assertEqual(ctrl.diagnostics().active_strategy, "fake_ttl")
+            self.assertEqual(seen, ["fake_disorder"])
+            self.assertEqual(ctrl.active_strategy, "fake_disorder")
+            self.assertEqual(ctrl.diagnostics().active_strategy, "fake_disorder")
             ctrl.stop()
         finally:
             prober_mod.tcp_probe = saved
@@ -423,7 +440,7 @@ class EngineControllerTest(unittest.TestCase):
         ctrl = EngineController({
             "connection_mode": "SNI Only",
             "LISTEN_PORT": 40443, "CONNECT_IP": "1.2.3.4", "CONNECT_PORT": 443,
-            "bypass_method": "fake_ttl",
+            "bypass_method": "fake_disorder",
             "resilience": True, "rst_budget": 2,
         })
         ctrl.start()
@@ -433,7 +450,7 @@ class EngineControllerTest(unittest.TestCase):
         # config knobs propagated
         self.assertEqual(res.rst_budget, 2)
         # the chosen method heads the strategy fallback chain
-        self.assertEqual(res.current_strategy, "fake_ttl")
+        self.assertEqual(res.current_strategy, "fake_disorder")
         # the upstream IP heads the IP chain
         self.assertEqual(res.current_ip, "1.2.3.4")
         # other implemented strategies follow as fallbacks
@@ -468,7 +485,7 @@ class EngineControllerTest(unittest.TestCase):
         url = "https://mirror/strategies.json"
         recipes = [
             {"strategy": "fake_disorder", "score": 0.6},
-            {"strategy": "fake_ttl", "score": 0.9},
+            {"strategy": "fake_disorder", "score": 0.9},
         ]
         raw, sig, pub = _signed_manifest(seed, 3, recipes)
         store = {url: raw, url + ".sig": sig}
@@ -479,9 +496,9 @@ class EngineControllerTest(unittest.TestCase):
         sr.TRUSTED_PUBLIC_KEY_HEX = pub.hex()
         sr.urllib_fetcher = lambda timeout=8.0: (lambda u: store[u])
 
-        # only fake_ttl (the manifest's top recipe) succeeds
+        # only fake_disorder (the manifest's top recipe) succeeds
         def fake_probe(candidate, host, port, timeout):
-            if candidate.strategy == "fake_ttl":
+            if candidate.strategy == "fake_disorder":
                 return ProbeResult(candidate, OK, latency_ms=3.0)
             return ProbeResult(candidate, RST)
         prober_mod.tcp_probe = fake_probe
@@ -494,7 +511,7 @@ class EngineControllerTest(unittest.TestCase):
             })
             ctrl.start()
             self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
-            self.assertEqual(FakeProxy.last_instance.bypass_method, "fake_ttl")
+            self.assertEqual(FakeProxy.last_instance.bypass_method, "fake_disorder")
             ctrl.stop()
         finally:
             sr.TRUSTED_PUBLIC_KEY_HEX = saved_pk
@@ -541,7 +558,7 @@ class EngineControllerTest(unittest.TestCase):
 
     def test_allow_lan_binds_xray_on_all_interfaces(self):
         ctrl = EngineController({
-            "connection_mode": "SNI + Warp",  # use_core → xray is built
+            "connection_mode": "Tunnel",  # use_core → xray is built
             "LISTEN_PORT": 40443, "CONNECT_IP": "1.1.1.1", "CONNECT_PORT": 443,
             "bypass_method": "wrong_seq", "allow_lan": True,
         })
@@ -555,7 +572,7 @@ class EngineControllerTest(unittest.TestCase):
 
     def test_local_only_binds_loopback(self):
         ctrl = EngineController({
-            "connection_mode": "SNI + Warp",
+            "connection_mode": "Tunnel",
             "LISTEN_PORT": 40443, "CONNECT_IP": "1.1.1.1", "CONNECT_PORT": 443,
             "bypass_method": "wrong_seq", "allow_lan": False,
         })
@@ -584,7 +601,7 @@ class EngineControllerTest(unittest.TestCase):
                                reader=lambda: dict(store))
 
         ctrl = EngineController({
-            "connection_mode": "SNI + Warp",  # use_core → eligible for system proxy
+            "connection_mode": "Tunnel",  # use_core → eligible for system proxy
             "LISTEN_PORT": 40443, "http_port": 10809,
             "system_proxy": True,
         })
@@ -627,7 +644,7 @@ class EngineControllerTest(unittest.TestCase):
     def test_system_proxy_off_by_default(self):
         """With the toggle off, even in core mode the OS proxy stays untouched."""
         ctrl = EngineController({
-            "connection_mode": "SNI + Warp", "LISTEN_PORT": 40443,
+            "connection_mode": "Tunnel", "LISTEN_PORT": 40443,
         })
         sentinel = {"called": False}
         ctrl._system_proxy_factory = lambda: sentinel.__setitem__("called", True)
@@ -701,7 +718,7 @@ class EnginePingTest(unittest.TestCase):
         from core.prober import ProbeResult, OK, RST
         saved = prober_mod.tcp_probe
         def fake(cand, host, port, timeout):
-            if cand.strategy == "fake_ttl":
+            if cand.strategy == "fake_disorder":
                 return ProbeResult(cand, OK, latency_ms=15.0)
             if cand.strategy == "wrong_seq":
                 return ProbeResult(cand, OK, latency_ms=90.0)
@@ -711,7 +728,7 @@ class EnginePingTest(unittest.TestCase):
             ctrl = EngineController({})
             report = ctrl.probe_strategies_for(self._profile("h"))
             self.assertTrue(report.any_connected)
-            self.assertEqual(report.best.strategy, "fake_ttl")
+            self.assertEqual(report.best.strategy, "fake_disorder")
         finally:
             prober_mod.tcp_probe = saved
 

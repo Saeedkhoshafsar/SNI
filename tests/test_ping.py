@@ -195,22 +195,22 @@ class TestStrategyPing(unittest.TestCase):
     def test_picks_best_connecting_strategy(self):
         probe = make_strategy_probe({
             "wrong_seq": (OK, 120.0),
-            "fake_ttl": (OK, 40.0),    # lowest latency among OK → best
+            "fake_disorder": (OK, 40.0),    # lowest latency among OK → best
             "multi_fake": (RST, 0.0),
         })
         report = probe_strategies(
             Target("s", "h", 443),
-            strategies=["wrong_seq", "fake_ttl", "multi_fake"],
+            strategies=["wrong_seq", "fake_disorder", "multi_fake"],
             probe_fn=probe, timeout=1.0)
         self.assertTrue(report.any_connected)
-        self.assertEqual(report.best.strategy, "fake_ttl")
+        self.assertEqual(report.best.strategy, "fake_disorder")
         self.assertEqual(len(report.results), 3)
 
     def test_no_strategy_connects(self):
         probe = make_strategy_probe({"wrong_seq": (RST, 0.0),
-                                     "fake_ttl": (TIMEOUT, 0.0)})
+                                     "fake_disorder": (TIMEOUT, 0.0)})
         report = probe_strategies(Target("s", "h", 443),
-                                 strategies=["wrong_seq", "fake_ttl"],
+                                 strategies=["wrong_seq", "fake_disorder"],
                                  probe_fn=probe)
         self.assertFalse(report.any_connected)
         self.assertIsNone(report.best)
@@ -240,7 +240,7 @@ class TestStrategyPing(unittest.TestCase):
     def test_default_strategy_keys_returns_implemented(self):
         keys = default_strategy_keys()
         # strategies package is importable in this repo; expect the 5 known keys
-        for expected in ("wrong_seq", "fake_ttl", "multi_fake"):
+        for expected in ("wrong_seq", "fake_disorder", "multi_fake"):
             self.assertIn(expected, keys)
 
 

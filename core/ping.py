@@ -194,11 +194,20 @@ class PingResult:
 
 @dataclass(frozen=True)
 class Target:
-    """A single host:port to ping, with a human label."""
+    """A single host:port to ping, with a human label.
+
+    ``server_name`` is the SNI / TLS server name to present in the ClientHello
+    when *validating* the handshake (TLS probe). For spoof configs this is the
+    real CDN SNI the spoofer fronts; for direct configs it's the host itself.
+    ``tls`` marks the target as TLS-bearing so the prober knows to validate a
+    real ServerHello instead of trusting a bare TCP connect (#1).
+    """
 
     label: str
     host: str
     port: int
+    server_name: str = ""
+    tls: bool = False
 
 
 def target_from_profile(profile) -> Target:
@@ -215,13 +224,25 @@ def target_from_profile(profile) -> Target:
         label = label()
     host = getattr(profile, "address", "") or ""
     port = int(getattr(profile, "port", 0) or 0)
+    is_tls = bool(getattr(profile, "is_tls", False))
+    # default SNI to validate: the explicit server name → host header → host.
+    server_name = (getattr(profile, "sni", "") or getattr(profile, "host", "")
+                   or host)
     if getattr(profile, "is_spoof_config", False):
-        real_host = (getattr(profile, "sni", "") or getattr(profile, "host", "")
-                     or host)
-        if real_host:
-            host = real_host
-            port = 443 if getattr(profile, "is_tls", False) else port
-    return Target(label=str(label), host=host, port=port)
+        # Spoof configs dial *our* loopback spoofer, which forwards to a fixed
+        # CDN IP while injecting a **decoy** SNI to beat DPI. The honest offline
+        # test of the bypass path is therefore: a TLS handshake to that same
+        # connect IP presenting the *decoy* SNI (exactly what the spoofer does).
+        # If the connect IP is blocked, that handshake resets → honest red.
+        connect_ip = getattr(profile, "spoof_connect_ip", "") or host
+        connect_port = getattr(profile, "spoof_connect_port", 0) or (
+            443 if is_tls else port)
+        fake_sni = getattr(profile, "spoof_fake_sni", "") or server_name
+        host = connect_ip
+        port = int(connect_port)
+        server_name = fake_sni
+    return Target(label=str(label), host=host, port=port,
+                  server_name=str(server_name or ""), tls=is_tls)
 
 
 # ---------------------------------------------------------------------------
@@ -399,9 +420,25 @@ def probe_strategies(
     """
     # Resolve the probe lazily so a monkeypatched core.prober.tcp_probe (tests /
     # alternate runtimes) is honoured rather than a default bound at import.
+    #
+    # #1: for a TLS target we DON'T trust a bare TCP connect — DPI lets the TCP
+    # handshake through and only resets the TLS ClientHello. So the default
+    # probe validates a real TLS handshake (presenting the target's SNI). A
+    # caller-supplied ``probe_fn`` (or a test's monkeypatched ``tcp_probe``)
+    # always wins so the deterministic test suite stays in control.
     if probe_fn is None:
         from . import prober as _prober_mod
-        probe_fn = _prober_mod.tcp_probe
+        sni = getattr(target, "server_name", "") or ""
+        if getattr(target, "tls", False):
+            def probe_fn(cand, host, port, timeout, _sni=sni):  # noqa: E306
+                return _prober_mod.tls_probe(
+                    cand, host, port, timeout, server_name=_sni)
+        else:
+            # Non-TLS target → a bare TCP connect is the honest test. Resolve
+            # the symbol lazily through the module so a monkeypatched
+            # ``core.prober.tcp_probe`` (tests) is still honoured.
+            def probe_fn(cand, host, port, timeout):  # noqa: E306
+                return _prober_mod.tcp_probe(cand, host, port, timeout)
     keys = list(strategies) if strategies else default_strategy_keys()
     report = StrategyPingReport(label=target.label, host=target.host,
                                 port=target.port)

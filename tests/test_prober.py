@@ -234,6 +234,109 @@ def test_candidate_order_uses_real_registry_scores():
     assert order[0].strategy == "wrong_seq"
 
 
+# ---------------------------------------------------------------------------
+#  tls_probe — #1 false-positive fix (validate a real handshake, not just TCP)
+# ---------------------------------------------------------------------------
+
+def test_tls_probe_rst_when_peer_closes_during_handshake():
+    """A peer that accepts the TCP connect but drops it before completing the
+    TLS handshake (exactly how DPI blocks a censored SNI) must NOT be reported
+    as OK — that was the green-ping-but-no-connect bug (#1)."""
+    import socket
+    import threading
+    from core.prober import tls_probe
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def _accept_then_reset():
+        try:
+            conn, _ = srv.accept()
+            # force a RST on close so the client's TLS handshake fails hard
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                            __import__("struct").pack("ii", 1, 0))
+            conn.close()
+        except OSError:
+            pass
+
+    threading.Thread(target=_accept_then_reset, daemon=True).start()
+    res = tls_probe(Candidate("wrong_seq"), "127.0.0.1", port, 2.0,
+                    server_name="blocked.example.com")
+    srv.close()
+    # TCP connected but TLS never completed → must be a failure, never OK
+    assert res.outcome != OK
+    assert res.outcome in (RST, TIMEOUT, ERROR)
+
+
+def test_tls_probe_ok_against_real_tls_server():
+    """A genuine TLS endpoint (self-signed is fine — we only validate that the
+    protocol got through, not the cert) must report OK."""
+    import ssl
+    import socket
+    import threading
+    import tempfile
+    import os as _os
+    from core.prober import tls_probe
+
+    # generate a throwaway self-signed cert; skip if cryptography isn't present
+    try:
+        from datetime import datetime, timedelta, timezone
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+    except Exception:
+        import pytest
+        pytest.skip("cryptography not available for self-signed TLS test")
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    cert = (x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.now(timezone.utc) - timedelta(days=1))
+            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
+            .sign(key, hashes.SHA256()))
+    d = tempfile.mkdtemp()
+    cpath, kpath = _os.path.join(d, "c.pem"), _os.path.join(d, "k.pem")
+    with open(cpath, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    with open(kpath, "wb") as f:
+        f.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()))
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cpath, kpath)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def _serve():
+        try:
+            conn, _ = srv.accept()
+            try:
+                tls = ctx.wrap_socket(conn, server_side=True)
+                tls.close()
+            except OSError:
+                conn.close()
+        except OSError:
+            pass
+
+    threading.Thread(target=_serve, daemon=True).start()
+    res = tls_probe(Candidate("wrong_seq"), "127.0.0.1", port, 3.0,
+                    server_name="localhost")
+    srv.close()
+    assert res.outcome == OK
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

@@ -292,6 +292,88 @@ def tcp_probe(candidate: Candidate, host: str, port: int,
             pass
 
 
+def tls_probe(candidate: Candidate, host: str, port: int, timeout: float, *,
+              server_name: str = "") -> ProbeResult:  # pragma: no cover - net
+    """Validating probe: TCP connect **and** drive a real TLS handshake.
+
+    Why this exists (#1 — green-ping-but-no-connect): a bare :func:`tcp_probe`
+    only proves the *transport* is reachable. Most DPI censorship of Cloudflare
+    front IPs lets the TCP three-way handshake complete and only resets / drops
+    the connection once it sees the TLS **ClientHello** (SNI). So a blocked IP
+    happily answered the old TCP probe → a misleading green "✔ 45ms" even though
+    no real session could ever be established.
+
+    Here we send a genuine ``ClientHello`` (via :mod:`ssl`) carrying *server_name*
+    as SNI and wait for the ``ServerHello``. Outcomes:
+
+    * **OK**      — the handshake produced a ServerHello (cert validation is
+      intentionally *disabled*: we only care that the peer spoke TLS back, not
+      that the cert is trusted, so self-signed / SNI-mismatch still counts as
+      "the protocol got through").
+    * **RST**     — peer reset the connection (classic DPI injection).
+    * **TIMEOUT** — no handshake response in time (silent drop / DPI blackhole).
+    * **ERROR**   — DNS / route / other transport failure.
+
+    A TLS *alert* during the handshake still means the peer answered in TLS, so
+    we treat ``ssl.SSLError`` that isn't a reset/timeout as OK (protocol passed
+    the DPI box). Falls back to a TCP-only verdict when *server_name* is empty.
+    """
+    import socket
+    import ssl
+
+    sni = (server_name or host or "").strip().strip("[]")
+    start = time.monotonic()
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(timeout)
+    try:
+        raw.connect((host, port))
+    except socket.timeout:
+        raw.close()
+        return ProbeResult(candidate, TIMEOUT, detail="connect timeout")
+    except ConnectionResetError:
+        raw.close()
+        return ProbeResult(candidate, RST, detail="connection reset")
+    except OSError as exc:
+        raw.close()
+        return ProbeResult(candidate, ERROR, detail=str(exc))
+
+    # transport up — now prove TLS actually gets through the DPI box.
+    if not sni:
+        latency = (time.monotonic() - start) * 1000.0
+        raw.close()
+        return ProbeResult(candidate, OK, latency_ms=latency,
+                           detail="tcp-only (no sni)")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        tls = ctx.wrap_socket(raw, server_hostname=sni)
+        latency = (time.monotonic() - start) * 1000.0
+        try:
+            tls.close()
+        except OSError:
+            pass
+        return ProbeResult(candidate, OK, latency_ms=latency, detail="tls ok")
+    except socket.timeout:
+        return ProbeResult(candidate, TIMEOUT, detail="tls handshake timeout")
+    except ConnectionResetError:
+        return ProbeResult(candidate, RST, detail="tls reset (DPI)")
+    except ssl.SSLError as exc:
+        # the peer answered *in TLS* (even an alert) → protocol passed the DPI
+        # box, which is what we're validating. Connection-level resets surface
+        # as OSError/ConnectionResetError above, not here.
+        latency = (time.monotonic() - start) * 1000.0
+        return ProbeResult(candidate, OK, latency_ms=latency,
+                           detail=f"tls alert: {exc.__class__.__name__}")
+    except OSError as exc:
+        return ProbeResult(candidate, ERROR, detail=str(exc))
+    finally:
+        try:
+            raw.close()
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 #  candidate enumeration helper
 # ---------------------------------------------------------------------------

@@ -76,29 +76,22 @@ DEFAULT_SNIS = [
     "www.bing.com",
 ]
 
+# #5: only the two modes that actually work are kept. The Warp / Psiphon /
+# Warp-in-Warp / Gaming experiments were removed — they were never wired to a
+# working backend and only confused the UI.
 MODES = [
     "Tunnel",          # default: VLESS/xray chained under the spoofer (needs a profile)
     "SNI Only",        # spoofer; if a profile is selected, xray runs chained under it
-    "SNI + Warp",
-    "SNI + Psiphon",
-    "SNI + Warp-in-Warp",
-    "Gaming Mode",
 ]
 
 # human-readable, Persian hint shown under the mode selector
 MODE_HINTS = {
     "Tunnel": "اتصال کامل از طریق کانفیگ انتخاب‌شده (VLESS/VMess/Trojan) با هسته‌ی xray + اسپوف SNI. برای استفاده از کانفیگ‌ها این حالت را انتخاب کنید.",
     "SNI Only": "اسپوف SNI بدون لایه‌ی بیرونی Warp/Psiphon. اگر کانفیگی انتخاب شده باشد، xray هم اجرا و زیر اسپوفر زنجیر می‌شود (کانفیگ VLESS کار می‌کند). فقط وقتی هیچ کانفیگی انتخاب نشده باشد، صرفاً فورواردر خام برای دور زدن DPI روی HTTPS عادی اجرا می‌شود.",
-    "SNI + Warp": "کانفیگ + لایه‌ی Cloudflare Warp (نیازمند باینری warp).",
-    "SNI + Psiphon": "کانفیگ + لایه‌ی Psiphon (نیازمند باینری psiphon).",
-    "SNI + Warp-in-Warp": "کانفیگ + دو لایه‌ی Warp تو در تو.",
-    "Gaming Mode": "بهینه‌سازی تأخیر پایین برای بازی (TCP no-delay/fast-open).",
 }
 
 STRATEGIES = [
     ("wrong_seq", "Wrong Sequence", "تزریق ClientHello جعلی با seq خارج از پنجره"),
-    ("wrong_checksum", "Wrong Checksum", "چک‌سام نامعتبر تا سرور دور بریزد"),
-    ("fake_ttl", "Fake TTL", "TTL کوتاه تا فقط به DPI برسد"),
     ("multi_fake", "Multi Fake", "چند بسته جعلی پشت‌سرهم"),
     ("fake_disorder", "Fake Disorder", "بی‌نظمی عمدی در ترتیب بسته‌ها"),
 ]
@@ -242,11 +235,13 @@ def fmt_rate(bps: float) -> str:
 
 # which connection modes are full tunnels vs. local proxy only
 def mode_kind(mode: str) -> str:
-    """Return 'tunnel' for warp/psiphon chained modes, else 'proxy'."""
-    m = (mode or "").lower()
-    if "warp" in m or "psiphon" in m or "gaming" in m:
-        return "tunnel"
-    return "proxy"
+    """Classify a connection mode for the dashboard badge.
+
+    Only two modes remain (#5): ``"Tunnel"`` is a full tunnel through the
+    selected config (→ ``"tunnel"``); everything else (``"SNI Only"`` / empty)
+    is the local SNI-spoof proxy (→ ``"proxy"``).
+    """
+    return "tunnel" if (mode or "").strip().lower() == "tunnel" else "proxy"
 
 
 def _stat_card(value: str, label: str, accent_color: str | None = None) -> Card:
@@ -538,7 +533,29 @@ class SettingsPage(QWidget):
         if i >= 0:
             self.mode.setCurrentIndex(i)
 
+    def set_mode_applicable(self, applicable: bool) -> None:
+        """Enable/disable the connection-mode selector (#6).
+
+        The Tunnel / SNI-Only modes only matter for **spoof** configs (loopback
+        share links that need our SNI spoofer). For an ordinary, routable config
+        the app connects directly like a normal client, so the selector is
+        disabled and an explanatory hint is shown instead — no spoofer is spun
+        up and no system resources are wasted.
+        """
+        self._mode_applicable = bool(applicable)
+        self.mode.setEnabled(applicable)
+        if applicable:
+            self._update_mode_hint(self.mode.currentText())
+        else:
+            self.mode_hint.setText(tr(
+                "این کانفیگ آدرس سرور معمولی (غیرلوکال) دارد و مثل یک کلاینت "
+                "معمولی مستقیماً وصل می‌شود؛ حالت تونل/SNI Only فقط برای "
+                "کانفیگ‌های اسپوف (با IP لوکال) کاربرد دارد."))
+
     def _update_mode_hint(self, mode: str) -> None:
+        # honour the "not applicable" state set by set_mode_applicable (#6)
+        if getattr(self, "_mode_applicable", True) is False:
+            return
         self.mode_hint.setText(tr(MODE_HINTS.get(mode, "")))
 
     def _update_lan_hint(self, on: bool) -> None:
@@ -1698,6 +1715,8 @@ class MainWindow(QWidget):
         self.page_dashboard.set_active_strategy(
             self.store.get("bypass_method", "wrong_seq"))
         sel = self.store.selected_profile
+        # #6: gate the mode selector on the initially-selected profile too
+        self._sync_mode_applicability(sel)
         if sel:
             self.page_log.append(
                 "[init] " + tr("پروفایل فعال: {name}").format(name=sel.display_name))
@@ -1772,6 +1791,9 @@ class MainWindow(QWidget):
         self.engine.set_profile(profile)
         # keep the persistent status bar in sync with the active server (#9)
         self.active_bar.set_profile(profile)
+        # #6: the connection-mode selector only applies to spoof (local-IP)
+        # configs; ordinary configs connect directly like a normal client.
+        self._sync_mode_applicability(profile)
 
         if profile:
             self.page_log.append(
@@ -1811,6 +1833,22 @@ class MainWindow(QWidget):
             try:
                 Toast.show_message(
                     self, tr("سرور جدید فعال شد — اتصال بازنشانی شد"), "ok")
+            except Exception:
+                pass
+
+    def _sync_mode_applicability(self, profile):
+        """Enable the mode selector only for spoof (local-IP) configs (#6).
+
+        Ordinary configs connect directly like a normal client, so the
+        Tunnel / SNI-Only selector is irrelevant for them and is greyed out with
+        an explanatory hint. Spoof configs keep the selector active because they
+        genuinely need the SNI spoofer.
+        """
+        is_spoof = bool(getattr(profile, "is_spoof_config", False)) if profile \
+            else True  # no profile selected → SNI-Only forwarder still relevant
+        if hasattr(self, "page_settings"):
+            try:
+                self.page_settings.set_mode_applicable(is_spoof)
             except Exception:
                 pass
 
@@ -1855,8 +1893,40 @@ class MainWindow(QWidget):
         name = next((n for k, n, _ in STRATEGIES if k == key), key)
         self.page_log.append(
             "[strategy] " + tr("انتخاب دستی: {name} ({key})").format(name=name, key=key))
-        Toast.show_message(
-            self, tr("استراتژی انتخاب شد: {name}").format(name=name), "ok")
+
+        # #4: reflect the new strategy on the dashboard immediately. The engine
+        # only emits its ``strategy`` signal on start / auto-probe, so a manual
+        # pick never reached the dashboard badge before — it kept showing the
+        # old strategy until the next connect.
+        try:
+            self.page_dashboard.set_active_strategy(key)
+        except Exception:
+            pass
+
+        # #3: if the engine is running, restart the active config so the new
+        # strategy actually takes effect now (same transparent stop→idle→start
+        # mechanism as the config-switch restart, #2). ``is_running`` is a
+        # *property* on both EngineBridge and the controller.
+        try:
+            was_running = bool(self.engine.is_running)
+        except Exception:
+            was_running = False
+        if was_running:
+            self.page_log.append(
+                "[strategy] " + tr("راه‌اندازی مجدد خودکار برای اعمال استراتژی جدید…"))
+            try:
+                self.engine.stop()
+            except Exception:
+                pass
+            self._restart_attempts = 0
+            self._restart_when_idle()
+            Toast.show_message(
+                self,
+                tr("استراتژی «{name}» اعمال شد — اتصال بازنشانی شد").format(name=name),
+                "ok")
+        else:
+            Toast.show_message(
+                self, tr("استراتژی انتخاب شد: {name}").format(name=name), "ok")
 
     def _save_settings(self):
         self.store.update(**self.page_settings.collect())
