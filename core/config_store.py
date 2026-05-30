@@ -35,6 +35,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "http_port": 10809,
     "allow_lan": False,           # bind socks/http on 0.0.0.0 so LAN devices (phone) can use it
     "system_proxy": False,        # set the Windows OS-wide proxy → local HTTP port on start
+    "self_test": True,            # after Start, probe xray→spoofer→CDN via the local HTTP port
     "bypass_method": "wrong_seq",
     "gaming_mode": False,
     "auto_prober": False,

@@ -93,6 +93,11 @@ def _install_fakes():
     # deterministic port so we can assert the chain
     xm.find_free_port = lambda preferred=None: preferred or 40443
 
+    # neutralise the post-start connectivity self-test so the test suite never
+    # spins up a real network probe thread (no xray/spoofer exist under fakes).
+    saved_selftest = EngineController._self_test_chain
+    EngineController._self_test_chain = lambda self: None
+
     def restore():
         if saved_main is not None:
             sys.modules["main"] = saved_main
@@ -100,6 +105,7 @@ def _install_fakes():
             sys.modules.pop("main", None)
         xm.XrayManager = saved_xray
         xm.find_free_port = saved_find
+        EngineController._self_test_chain = saved_selftest
 
     return restore
 

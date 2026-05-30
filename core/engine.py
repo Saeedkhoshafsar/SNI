@@ -598,6 +598,31 @@ class EngineController:
         self._set_status(STATUS_ACTIVE)
         self._log("✓ اتصال برقرار شد")
 
+        # Tell the user *how* to actually route traffic through the tunnel.
+        # This is the single biggest source of "works with V2RayTun but not
+        # standalone" confusion: our app exposes a local SOCKS/HTTP proxy but,
+        # unlike V2RayTun, does not capture OS traffic unless system-proxy is on.
+        if chain_spoofer:
+            socks_port = int(self.config.get("socks_port", 10808))
+            http_port = int(self.config.get("http_port", 10809))
+            if not self.config.get("system_proxy", False):
+                self._log(
+                    f"ℹ برای استفاده، یا گزینهٔ «پروکسی سیستم» را روشن کنید، "
+                    f"یا مرورگر/برنامه را روی پروکسی SOCKS5 127.0.0.1:"
+                    f"{socks_port} (یا HTTP 127.0.0.1:{http_port}) تنظیم کنید. "
+                    f"بدون این کار، ترافیک سیستم وارد تونل نمی‌شود.")
+
+        # --- 5. self-test the internal chain (xray → spoofer → CDN) ---------
+        # The #1 confusion is "works with V2RayTun but not standalone": that's
+        # almost always because nothing is pointing the OS/browser at our local
+        # SOCKS/HTTP port, so xray never dials the spoofer. This active probe
+        # drives a real request *through our own HTTP proxy port* a few seconds
+        # after start, so the log unambiguously shows whether the full internal
+        # path works — independent of the user's browser/system-proxy settings.
+        if chain_spoofer and self.config.get("self_test", True):
+            threading.Thread(target=self._self_test_chain,
+                             daemon=True).start()
+
     def _maybe_enable_system_proxy(self, use_core: bool) -> None:
         """Set the Windows system proxy → local HTTP port, if requested.
 
@@ -628,6 +653,55 @@ class EngineController:
         except Exception as exc:  # never block Start on proxy failure
             self._log(f"تنظیم پروکسی سیستم ناموفق: {exc}")
             self._system_proxy = None
+
+    def _self_test_chain(self) -> None:
+        """Probe the full internal chain through our own local HTTP proxy.
+
+        Runs off-thread shortly after Start. Makes a real HTTPS request to a
+        lightweight 204 endpoint *via* ``127.0.0.1:<http_port>`` (xray's HTTP
+        inbound), so it exercises xray → spoofer → CDN exactly like the browser
+        would. The result is logged in plain language so the user can tell
+        whether the tunnel itself works, separately from whether their browser
+        is pointed at the proxy.
+        """
+        import time
+        import urllib.request
+
+        # give xray + the spoofer a moment to finish binding/handshaking
+        time.sleep(3.0)
+        if self._status != STATUS_ACTIVE:
+            return  # already stopped / errored — nothing to test
+
+        http_port = int(self.config.get("http_port", 10809))
+        proxy = f"http://127.0.0.1:{http_port}"
+        # 204 endpoints are tiny and return no body — ideal for a liveness probe
+        test_url = "https://www.gstatic.com/generate_204"
+        self._log(f"[self-test] آزمایش مسیر داخلی از طریق پروکسی "
+                  f"{proxy} → {test_url} …")
+        try:
+            handler = urllib.request.ProxyHandler(
+                {"http": proxy, "https": proxy})
+            opener = urllib.request.build_opener(handler)
+            req = urllib.request.Request(
+                test_url, headers={"User-Agent": "SNISpoofer-selftest"})
+            t0 = time.time()
+            with opener.open(req, timeout=12) as resp:
+                code = resp.getcode()
+            dt = int((time.time() - t0) * 1000)
+            if code in (200, 204):
+                self._log(
+                    f"[self-test] ✓ مسیر داخلی سالم است (HTTP {code}، {dt}ms). "
+                    f"تونل کار می‌کند — اگر مرورگرتان باز نمی‌کند یعنی پروکسی "
+                    f"سیستم/مرورگر روی 127.0.0.1:{http_port} (یا SOCKS "
+                    f"{self.config.get('socks_port', 10808)}) تنظیم نشده.")
+            else:
+                self._log(f"[self-test] ⚠ پاسخ غیرمنتظره HTTP {code} — مسیر "
+                          f"کامل برقرار نشد.", )
+        except Exception as exc:
+            self._log(
+                f"[self-test] ✗ مسیر داخلی شکست خورد: {type(exc).__name__}: "
+                f"{exc} — یعنی xray به اسپوفر یا اسپوفر به CDN وصل نمی‌شود. "
+                f"لاگ‌های [conn #...] و [xray] بالا را بررسی کنید.")
 
     def _on_proxy_status(self, running: bool) -> None:
         # the proxy reports its own listen-loop coming up/down; only downgrade
