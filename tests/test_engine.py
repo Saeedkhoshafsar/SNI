@@ -194,6 +194,45 @@ class EngineControllerTest(unittest.TestCase):
         self.assertTrue(xray.stopped)
         self.assertEqual(ctrl.status, STATUS_IDLE)
 
+    def _webtun_profile(self):
+        # webtun/CDN config: host slot is a loopback helper placeholder, the
+        # real endpoint is the Cloudflare domain in the SNI/Host header.
+        return Profile(
+            protocol="vless", address="127.0.0.1", port=40443,
+            uuid="84524180-c2d5-4bc1-83bb-c36f22d69a3b",
+            transport="xhttp", security="tls",
+            sni="lucky-union-b89c.hamijafayi.workers.dev",
+            host="lucky-union-b89c.hamijafayi.workers.dev",
+            path="/vless-xhttp", mode="auto", fingerprint="chrome")
+
+    def test_webtun_tunnel_chains_spoofer_on_placeholder_port(self):
+        # webtun configs (127.0.0.1:40443) are *designed* to talk to a local
+        # helper; our spoofer must occupy that exact port even in Tunnel mode,
+        # forwarding to the real CDN — without it xray hits an empty loopback
+        # port and gets "actively refused" (the user's bug; V2RayTun worked
+        # because it runs its own helper there).
+        ctrl = EngineController({"connection_mode": "Tunnel"})
+        prof = self._webtun_profile()
+        ctrl.set_profile(prof)
+        self.assertTrue(prof.is_webtun)
+        self.assertTrue(ctrl.chains_spoofer)
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+
+        proxy = FakeProxy.last_instance
+        xray = FakeXray.last_instance
+        self.assertIsNotNone(proxy)
+        self.assertIsNotNone(xray)
+        # the spoofer listens on the EXACT placeholder port the link hard-codes
+        self.assertEqual(proxy.config["LISTEN_PORT"], 40443)
+        self.assertEqual(xray.spoof_port, 40443)
+        # ...and forwards to the real CDN host (resolved or hostname), port 443
+        self.assertEqual(proxy.config["CONNECT_PORT"], 443)
+        self.assertNotEqual(proxy.config["CONNECT_IP"], "127.0.0.1")
+        ctrl.stop()
+        self.assertTrue(proxy.stopped)
+        self.assertTrue(xray.stopped)
+
     def test_count_callback_forwarded(self):
         ctrl = EngineController({"connection_mode": "SNI Only"})
         counts = []

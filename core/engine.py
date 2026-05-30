@@ -177,18 +177,31 @@ class EngineController:
     def chains_spoofer(self) -> bool:
         """True when the SNI-spoofer should sit *under* the xray core.
 
-        Plain ``"Tunnel"`` mode connects xray straight to the server — exactly
-        like V2RayTun — so the spoofer never re-mangles xray's own TLS/WS
-        handshake (which made the tunnel slow or broke it entirely; the
-        "config still doesn't connect / much slower" feedback). Only the
-        explicit SNI-bypass combos ("SNI + Warp", "SNI + Psiphon", …) chain the
-        spoofer in front, because those modes specifically want DPI evasion on
-        the outer connection.
+        Two cases require chaining the spoofer beneath xray:
+
+        1. **Explicit SNI-bypass combos** ("SNI + Warp", "SNI + Psiphon", …) —
+           the user asked for DPI evasion on the outer connection.
+
+        2. **Webtun / CDN configs** (host slot is ``127.0.0.1:<helper-port>``).
+           These links are *designed* to talk to a local helper on that port,
+           which forwards to the real CDN endpoint in the SNI/Host header — the
+           V2RayTun internal-helper pattern. xray can't reach a bare loopback
+           port unless our spoofer is the helper sitting there, so we MUST chain
+           the spoofer (on the exact placeholder port) even in plain "Tunnel"
+           mode. Without it, xray dials ``127.0.0.1:40443`` where nothing is
+           listening → ``connectex: actively refused`` (the "config doesn't
+           connect" bug the user hit while V2RayTun worked).
+
+        For an ordinary "Tunnel" config xray connects straight to the server,
+        exactly like V2RayTun, with no spoofer re-mangling its handshake.
         """
         if not self.uses_core:
             return False
         mode = str(self.config.get("connection_mode", "Tunnel"))
-        return mode not in ("Tunnel",)
+        if mode not in ("Tunnel",):
+            return True
+        # plain Tunnel: still chain the spoofer for webtun/CDN placeholder configs
+        return bool(getattr(self.profile, "is_webtun", False))
 
     def diagnostics(self):
         """Return a :class:`core.diagnostics.DiagnosticsSnapshot` of live state.
@@ -409,6 +422,28 @@ class EngineController:
             self._log(f"تاب‌آوری راه‌اندازی نشد ({exc}) — بدون آن ادامه می‌دهیم")
             self._resilience = None
 
+    @staticmethod
+    def _resolve_ipv4(host: str) -> Optional[str]:
+        """Resolve *host* to an IPv4 address, or None on failure.
+
+        The raw-socket SNI-spoofer crafts packets to a concrete IPv4, so a CDN
+        domain (e.g. ``foo.workers.dev``) must be resolved first. If *host* is
+        already an IPv4 literal it's returned unchanged.
+        """
+        import socket as _socket
+        host = (host or "").strip()
+        if not host:
+            return None
+        try:
+            infos = _socket.getaddrinfo(host, None, _socket.AF_INET)
+            for info in infos:
+                ip = info[4][0]
+                if ip:
+                    return ip
+        except OSError:
+            return None
+        return None
+
     def _start_core_only(self) -> None:
         """Plain Tunnel: run xray-core alone, connecting straight to the server.
 
@@ -472,14 +507,29 @@ class EngineController:
         # --- 1. work out the spoofer's listen port + upstream target ---
         if use_core:
             assert self.profile is not None
-            from core.xray_manager import find_free_port
-            self._spoof_port = find_free_port(
-                int(self.config.get("LISTEN_PORT", 40443)))
-            connect_ip = self.profile.address
-            connect_port = self.profile.port
-            self._log(
-                f"حالت v2rayN: spoofer روی 127.0.0.1:{self._spoof_port} "
-                f"→ {connect_ip}:{connect_port}")
+            if self.profile.is_webtun:
+                # webtun/CDN config: the share link hard-codes the helper port
+                # (e.g. 127.0.0.1:40443), so the spoofer MUST listen on that
+                # exact port for xray's outbound to reach it. The real upstream
+                # is the CDN host carried in the SNI/Host header — and the raw-
+                # socket spoofer needs an IPv4 address, so resolve the domain.
+                self._spoof_port = int(self.profile.port)
+                cdn_host = self.profile.upstream_address
+                connect_port = self.profile.upstream_port
+                connect_ip = self._resolve_ipv4(cdn_host) or cdn_host
+                self._log(
+                    f"حالت webtun: spoofer روی 127.0.0.1:{self._spoof_port} "
+                    f"→ {cdn_host} ({connect_ip}):{connect_port} "
+                    f"(CDN واقعی از روی SNI/Host)")
+            else:
+                from core.xray_manager import find_free_port
+                self._spoof_port = find_free_port(
+                    int(self.config.get("LISTEN_PORT", 40443)))
+                connect_ip = self.profile.address
+                connect_port = self.profile.port
+                self._log(
+                    f"حالت v2rayN: spoofer روی 127.0.0.1:{self._spoof_port} "
+                    f"→ {connect_ip}:{connect_port}")
         else:
             self._spoof_port = int(self.config.get("LISTEN_PORT", 40443))
             connect_ip = str(self.config.get("CONNECT_IP", ""))
@@ -522,8 +572,11 @@ class EngineController:
         self._proxy.start()
 
         # --- 3. chain xray core in front of the spoofer (SNI-bypass combos) ---
-        # NB: plain "Tunnel" returned early via _start_core_only; only the
-        # explicit SNI+X modes reach here with chain_spoofer == True.
+        # NB: an *ordinary* plain "Tunnel" returned early via _start_core_only.
+        # We reach here with chain_spoofer == True for the explicit SNI+X modes
+        # AND for webtun/CDN configs (whose loopback helper port the spoofer
+        # must occupy even in Tunnel mode). xray dials 127.0.0.1:<spoof_port>,
+        # which is exactly the address the webtun share link hard-codes.
         if chain_spoofer:
             assert self.profile is not None
             from core.xray_manager import XrayManager

@@ -21,6 +21,23 @@ TRANSPORTS = ("tcp", "ws", "grpc", "http", "h2", "quic", "kcp",
 SECURITIES = ("none", "tls", "reality", "xtls")
 
 
+def _is_local_addr(addr: str) -> bool:
+    """True when *addr* is a loopback / unspecified placeholder, not routable.
+
+    Covers the values that show up in "webtun"/CDN-helper share links where the
+    host slot is a stand-in for a local helper port: ``127.0.0.1``,
+    ``localhost``, ``0.0.0.0``, ``::1`` and the unspecified ``::``.
+    """
+    a = (addr or "").strip().strip("[]").lower()
+    if not a:
+        return True
+    if a in ("localhost", "0.0.0.0", "::", "::1"):
+        return True
+    if a.startswith("127."):
+        return True
+    return False
+
+
 @dataclass
 class Profile:
     """A single, transport-agnostic outbound definition."""
@@ -76,6 +93,54 @@ class Profile:
     @property
     def is_tls(self) -> bool:
         return self.security in ("tls", "reality", "xtls")
+
+    @property
+    def is_webtun(self) -> bool:
+        """True for "webtun"/CDN configs whose host slot is a local placeholder.
+
+        These share links (e.g. ``vless://...@127.0.0.1:40443?...host=foo.workers.dev``)
+        are *designed* to talk to a local helper on the placeholder port; that
+        helper forwards the connection to the real CDN endpoint carried in the
+        SNI / Host header (Cloudflare ``workers.dev`` / ``pages.dev``). This is
+        exactly the V2RayTun internal-helper pattern. Our app fills the helper
+        role with its own SNI-spoofer running on the placeholder port, so we
+        must (a) recognise these configs and (b) know the real upstream the
+        spoofer should dial.
+        """
+        if not _is_local_addr(self.address):
+            return False
+        for cand in (self.sni, self.host):
+            if (cand or "").strip() and not _is_local_addr(cand):
+                return True
+        return False
+
+    @property
+    def upstream_address(self) -> str:
+        """The real, routable host the *spoofer* must forward to.
+
+        For ordinary configs this is just ``address``. For webtun/CDN configs
+        the literal address is a loopback placeholder, so we resolve the real
+        endpoint from the SNI / Host header instead (the CDN domain).
+        """
+        if self.is_webtun:
+            for cand in (self.sni, self.host):
+                cand = (cand or "").strip()
+                if cand and not _is_local_addr(cand):
+                    return cand
+        return (self.address or "").strip()
+
+    @property
+    def upstream_port(self) -> int:
+        """The real port the *spoofer* must forward to.
+
+        For webtun configs the placeholder port (e.g. ``40443``) is the local
+        helper port, not reachable on the CDN. Cloudflare-style WS/XHTTP+TLS
+        endpoints are served on the standard HTTPS port, so we forward to
+        ``443`` (or ``80`` for a plaintext fallback).
+        """
+        if self.is_webtun:
+            return 443 if self.is_tls else 80
+        return self.port
 
     @property
     def display_name(self) -> str:

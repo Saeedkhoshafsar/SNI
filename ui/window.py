@@ -644,6 +644,15 @@ class ProfilesPage(QWidget):
         lb.addWidget(self._field_label("سرورهای ذخیره‌شده"))
         self.list = QListWidget()
         self.list.setObjectName("ProfileList")
+        # give the list real breathing room so several servers are visible and
+        # rows never get vertically squeezed (the "cramped / clipped" feedback)
+        self.list.setMinimumHeight(200)
+        self.list.setSpacing(6)
+        from PySide6.QtWidgets import QAbstractItemView
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list.setUniformItemSizes(False)
         lb.addWidget(self.list)
 
         del_row = QHBoxLayout()
@@ -731,7 +740,11 @@ class ProfilesPage(QWidget):
             item = QListWidgetItem(self.list)
             row = ProfileRow(p, active=(i == sel))
             row.edit.connect(lambda _=False, idx=i: self._edit_index(idx))
-            item.setSizeHint(row.sizeHint())
+            # use a guaranteed minimum row height so the active "● فعال" pill +
+            # badges never get clipped (sizeHint can under-report before layout)
+            hint = row.sizeHint()
+            hint.setHeight(max(hint.height(), 62))
+            item.setSizeHint(hint)
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
         if 0 <= sel < self.list.count():

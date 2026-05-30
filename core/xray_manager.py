@@ -97,8 +97,12 @@ class XrayManager:
 
     @property
     def real_server(self) -> tuple[str, int]:
-        """The real upstream the spoofer must forward to."""
-        return self.profile.address, self.profile.port
+        """The real upstream the spoofer must forward to.
+
+        For webtun/CDN configs this resolves the loopback placeholder to the
+        real CDN endpoint carried in the SNI/Host header.
+        """
+        return self.profile.upstream_address, self.profile.upstream_port
 
     # ----------------------------------------------------------------
 

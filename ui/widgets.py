@@ -197,42 +197,53 @@ class ProfileRow(QFrame):
         super().__init__(parent)
         self.setObjectName("ProfileRow")
         self.setProperty("active", "1" if active else "0")
+        # a guaranteed height so the name + active pill + badges always fit on
+        # two lines without clipping (the "active label clips the fields" bug)
+        self.setMinimumHeight(56)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 9, 10, 9)
-        lay.setSpacing(11)
+        lay.setContentsMargins(12, 8, 10, 8)
+        lay.setSpacing(10)
 
-        # protocol glyph
+        # protocol glyph (vertically centred so it lines up with the two-row text)
         glyph = QLabel(_PROTO_ICON.get(profile.protocol, "\u25c9"))
         glyph.setObjectName("RowGlyph")
-        glyph.setFixedWidth(26)
+        glyph.setFixedWidth(24)
         glyph.setAlignment(Qt.AlignCenter)
-        lay.addWidget(glyph)
+        lay.addWidget(glyph, 0, Qt.AlignVCenter)
 
-        # name + detail column
+        # name + detail column (gets the stretch so it owns the free width)
         col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(2)
         top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(8)
         name = QLabel(profile.display_name)
         name.setObjectName("RowName")
-        top.addWidget(name)
+        # let the name shrink gracefully so the pill/badges never push it out
+        # of the row and clip it (RTL elide is unreliable)
+        name.setMinimumWidth(0)
+        top.addWidget(name, 1)
         if active:
             pill = QLabel("\u25cf فعال")
             pill.setObjectName("ActivePill")
-            top.addWidget(pill)
-        top.addStretch(1)
+            top.addWidget(pill, 0, Qt.AlignVCenter)
         col.addLayout(top)
 
-        detail = QLabel(f"{profile.protocol} · {profile.address}:{profile.port}")
+        # show the *routable* endpoint (real CDN host for webtun configs), not a
+        # loopback placeholder, so the detail line is meaningful to the user
+        _addr = getattr(profile, "upstream_address", None) or profile.address
+        _port = getattr(profile, "upstream_port", None) or profile.port
+        detail = QLabel(f"{profile.protocol} · {_addr}:{_port}")
         detail.setObjectName("RowDetail")
         col.addWidget(detail)
         lay.addLayout(col, 1)
 
-        # transport / security badges
+        # transport / security badges (vertically centred)
         for txt in self._badges(profile):
             b = QLabel(txt)
             b.setObjectName("RowBadge")
-            lay.addWidget(b)
+            lay.addWidget(b, 0, Qt.AlignVCenter)
 
         # inline edit button
         self.btn_edit = QPushButton("\u270e")
@@ -241,7 +252,7 @@ class ProfileRow(QFrame):
         self.btn_edit.setFixedSize(28, 28)
         self.btn_edit.setToolTip("ویرایش این پروفایل")
         self.btn_edit.clicked.connect(self.edit.emit)
-        lay.addWidget(self.btn_edit)
+        lay.addWidget(self.btn_edit, 0, Qt.AlignVCenter)
 
     @staticmethod
     def _badges(profile) -> list[str]:
