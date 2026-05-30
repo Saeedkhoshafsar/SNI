@@ -329,8 +329,26 @@ def test_wrong_checksum_corrupts_checksum_and_keeps_inwindow_seq():
     conn = _FakeConnection(syn_seq=2000, fake_data=b"hello")
     s.mutate_fake_packet(pkt, conn)
     assert pkt.tcp.payload == b"hello"
-    assert pkt.tcp.checksum == 0x0000          # deliberately wrong
+    # the fake must carry a deliberately-wrong, NON-ZERO checksum. We avoid
+    # 0x0000 because in TCP (unlike UDP) zero is a legitimate checksum value and
+    # some NIC offload paths treat it specially, so it wasn't reliably dropped.
+    assert pkt.tcp.checksum == s.BAD_CHECKSUM
+    assert pkt.tcp.checksum != 0x0000
+    assert pkt.tcp.checksum != 0x1234          # differs from the valid starting value
     assert pkt.tcp.seq_num == (2000 + 1) & 0xFFFFFFFF  # in-window
+
+
+def test_wrong_checksum_avoids_accidental_match():
+    # if the stale checksum already equals BAD_CHECKSUM, the strategy must
+    # perturb it so the emitted value is still definitely "wrong".
+    s = get_strategy("wrong_checksum")
+    pkt = _FakePacket()
+    pkt.tcp.checksum = s.BAD_CHECKSUM
+    conn = _FakeConnection(syn_seq=2000, fake_data=b"hello")
+    s.mutate_fake_packet(pkt, conn)
+    assert pkt.tcp.checksum != 0x0000
+    # perturbed away from the constant (XOR 0xFFFF) yet still non-zero
+    assert pkt.tcp.checksum == (s.BAD_CHECKSUM ^ 0xFFFF)
 
 
 def test_wrong_checksum_sends_without_recalc():

@@ -246,6 +246,7 @@ _EN: dict[str, str] = {
     "در حال پینگ…": "Pinging…",
     "بدون پاسخ": "No response",
     "✖ بدون پاسخ": "✖ No response",
+    "✖ مسدود (هیچ استراتژی وصل نشد)": "✖ Blocked (no strategy connected)",
     "سروری انتخاب نشده": "No server selected",
     "سروری انتخاب نشده — حالت SNI Only": "No server selected — SNI Only mode",
     "سرور": "Server",

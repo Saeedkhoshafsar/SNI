@@ -231,12 +231,15 @@ def build_qss(p: Palette) -> str:
     }}
 
     /* ---- Window control buttons (title bar) ---- */
-    QPushButton#WinBtn {{
+    /* #3: WinClose must share WinBtn's transparent base style — without it the
+       close button fell back to Qt's default opaque white button. */
+    QPushButton#WinBtn, QPushButton#WinClose {{
         background: transparent; border: none; border-radius: 6px;
         color: {p.text_muted}; font-size: 15px; padding: 4px 10px;
     }}
     QPushButton#WinBtn:hover {{ background: {p.surface_alt}; color: {p.text}; }}
     QPushButton#WinClose:hover {{ background: {p.danger}; color: #fff; }}
+    QPushButton#WinBtn:pressed, QPushButton#WinClose:pressed {{ background: {p.border}; }}
 
     /* ---- Persistent active-config status bar (visible on every tab, #9) ---- */
     QFrame#ActiveBar {{
@@ -414,10 +417,14 @@ def build_qss(p: Palette) -> str:
         font-family: "Cascadia Code", "Consolas", monospace;
         font-size: 11.5px; color: {p.text_muted};
     }}
-    /* inline ping-result tinting on the detail line (#3) */
-    QLabel#RowDetail[pingkind="busy"] {{ color: {p.warning}; }}
-    QLabel#RowDetail[pingkind="ok"]   {{ color: {p.success}; }}
-    QLabel#RowDetail[pingkind="err"]  {{ color: {p.danger}; }}
+    /* dedicated, never-clipped inline ping-result label (#1) */
+    QLabel#RowPingResult {{
+        font-family: "Cascadia Code", "Consolas", monospace;
+        font-size: 11.5px; font-weight: 600; color: {p.text_muted};
+    }}
+    QLabel#RowPingResult[pingkind="busy"] {{ color: {p.warning}; }}
+    QLabel#RowPingResult[pingkind="ok"]   {{ color: {p.success}; }}
+    QLabel#RowPingResult[pingkind="err"]  {{ color: {p.danger}; }}
     QLabel#ActivePill {{
         background: {p.success}; color: {p.on_accent};
         border-radius: 8px; padding: 1px 8px;

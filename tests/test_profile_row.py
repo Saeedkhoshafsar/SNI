@@ -99,17 +99,24 @@ class ProfileRowTest(unittest.TestCase):
         active_row = ProfileRow(p, active=True)
         self.assertFalse(active_row.btn_use.isVisible())
 
-    def test_inline_ping_result_appended_to_detail(self):
+    def test_inline_ping_result_in_dedicated_label(self):
+        # #1: the ping result now lives in its OWN label so a long host can
+        # never push the latency value out of the visible box. The address line
+        # (_detail) is left untouched (it only elides on resize).
         p = parse_link("vless://u-1@h.example:8443#Srv")
         row = ProfileRow(p)
-        base = row._detail.text()
         row.set_ping_state("✔ 42ms", "ok")
-        self.assertIn("42ms", row._detail.text())
-        self.assertIn(base, row._detail.text())
-        self.assertEqual(row._detail.property("pingkind"), "ok")
-        # clearing restores the base detail line
+        self.assertIn("42ms", row._ping_label.text())
+        # not explicitly hidden (isVisible() is False on an unshown parent, so
+        # assert the hidden flag instead)
+        self.assertFalse(row._ping_label.isHidden())
+        self.assertEqual(row._ping_label.property("pingkind"), "ok")
+        # the address line carries the full endpoint
+        self.assertIn("h.example:8443", row._detail_full)
+        # clearing hides the dedicated ping label again
         row.set_ping_state("", "info")
-        self.assertEqual(row._detail.text(), base)
+        self.assertEqual(row._ping_label.text(), "")
+        self.assertTrue(row._ping_label.isHidden())
 
     def test_set_pinging_disables_button(self):
         p = parse_link("vless://u-1@h.example:8443#Srv")

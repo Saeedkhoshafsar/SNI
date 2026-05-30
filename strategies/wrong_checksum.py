@@ -32,15 +32,28 @@ class WrongChecksumStrategy(BypassStrategy):
     # fake → fire-and-forget. The spoofer must not block waiting for an ACK.
     expects_ack = False
 
-    # an obviously-wrong constant; any non-correct value works because the
-    # server drops it and the DPI ignores L4 checksums.
-    BAD_CHECKSUM = 0x0000
+    # an obviously-wrong constant. NOTE: we deliberately avoid 0x0000 — in TCP
+    # a zero checksum is *not* a guaranteed-invalid value the way it is in UDP,
+    # and some offload paths treat 0x0000 specially. A fixed non-zero constant
+    # that we then nudge away from any accidental "correct" value guarantees the
+    # server's NIC drops the segment as corrupt while the DPI (which ignores L4
+    # checksums) still records the decoy SNI.
+    BAD_CHECKSUM = 0xDEAD
 
     def mutate_fake_packet(self, packet: Any, connection: Any) -> None:
         self.apply_fake_payload(packet, connection)
         # keep a plausible in-window seq so only the checksum is "wrong"
         packet.tcp.seq_num = (connection.syn_seq + 1) & 0xFFFFFFFF
-        packet.tcp.checksum = self.BAD_CHECKSUM
+        bad = self.BAD_CHECKSUM
+        # if the stale checksum already equals our bad constant, perturb it so
+        # the value is still definitely different from whatever the correct one
+        # would be (defence against the rare coincidental match).
+        try:
+            if int(getattr(packet.tcp, "checksum", 0)) == bad:
+                bad = (bad ^ 0xFFFF) or 0x0001
+        except Exception:
+            pass
+        packet.tcp.checksum = bad
 
     def send_fake(self, injector: Any, packet: Any, connection: Any) -> None:
         # CRITICAL: recalc=False so WinDivert does NOT repair the checksum.

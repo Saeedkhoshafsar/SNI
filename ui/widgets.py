@@ -323,14 +323,29 @@ class ProfileRow(QFrame):
         else:
             _addr = profile.address
             _port = profile.port
-        detail = QLabel(f"{profile.protocol} · {_addr}:{_port}")
+        # the address line ELIDES on overflow so a long ``*.workers.dev`` host
+        # never pushes the inline ping result out of the visible box (#1). The
+        # ping result gets its OWN label beside it so it is always visible
+        # regardless of host length.
+        detail_row = QHBoxLayout()
+        detail_row.setContentsMargins(0, 0, 0, 0)
+        detail_row.setSpacing(8)
+        detail = QLabel()
         detail.setObjectName("RowDetail")
-        # the detail line doubles as the inline ping-result slot: a small
-        # bullet + latency is appended right next to the address so the user
-        # never has to dig into a separate panel (feedback #3).
+        detail.setMinimumWidth(0)
         self._detail = detail
-        self._detail_base = detail.text()
-        col.addWidget(detail)
+        self._detail_base = f"{profile.protocol} · {_addr}:{_port}"
+        self._detail_full = self._detail_base
+        detail.setText(self._detail_base)
+        detail.setToolTip(self._detail_base)
+        detail_row.addWidget(detail, 1)
+        # dedicated, never-clipped inline ping-result slot (#1/#3)
+        self._ping_label = QLabel("")
+        self._ping_label.setObjectName("RowPingResult")
+        self._ping_label.setMinimumWidth(0)
+        self._ping_label.setVisible(False)
+        detail_row.addWidget(self._ping_label, 0, Qt.AlignVCenter)
+        col.addLayout(detail_row)
         lay.addLayout(col, 1)
 
         # transport / security badges (vertically centred)
@@ -371,19 +386,40 @@ class ProfileRow(QFrame):
 
     # -- inline ping result -------------------------------------------------
     def set_ping_state(self, text: str, kind: str = "info") -> None:
-        """Show an inline ping status/result appended to the detail line.
+        """Show the inline ping status/result in its OWN label (#1).
 
-        ``kind`` ∈ {"info","busy","ok","err"} — used for colour via the
-        ``pingkind`` dynamic property so the stylesheet can tint the text.
+        Previously the result was appended to the address line, so a long host
+        pushed the latency value off-screen. It now lives in a dedicated
+        ``_ping_label`` that is never clipped. ``kind`` ∈
+        {"info","busy","ok","err"} tints the text via the ``pingkind`` property.
         """
-        self._detail.setProperty("pingkind", kind)
-        if text:
-            self._detail.setText(f"{self._detail_base}   ·   {text}")
-        else:
-            self._detail.setText(self._detail_base)
+        lbl = getattr(self, "_ping_label", None)
+        if lbl is None:                       # pragma: no cover - defensive
+            return
+        lbl.setProperty("pingkind", kind)
+        lbl.setText(text or "")
+        lbl.setVisible(bool(text))
+        lbl.setToolTip(text or "")
         # re-polish so the dynamic-property style refreshes
-        self._detail.style().unpolish(self._detail)
-        self._detail.style().polish(self._detail)
+        lbl.style().unpolish(lbl)
+        lbl.style().polish(lbl)
+
+    def resizeEvent(self, event):
+        """Elide the address line so long hosts never overflow the box (#1)."""
+        super().resizeEvent(event)
+        self._elide_detail()
+
+    def _elide_detail(self) -> None:
+        d = getattr(self, "_detail", None)
+        full = getattr(self, "_detail_full", None)
+        if d is None or full is None:
+            return
+        from PySide6.QtGui import QFontMetrics
+        fm = QFontMetrics(d.font())
+        avail = max(40, d.width() - 2)
+        elided = fm.elidedText(full, Qt.ElideMiddle, avail)
+        if elided != d.text():
+            d.setText(elided)
 
     def set_pinging(self) -> None:
         self.btn_ping.setEnabled(False)

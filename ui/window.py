@@ -1048,6 +1048,12 @@ class InlinePingWorker(QThread):
         self._profile = profile
 
     def run(self):  # pragma: no cover - exercised via Qt smoke, not unit
+        # #4: a raw TCP connect to a real (censored) server's IP can succeed at
+        # the transport layer even when DPI blocks the protocol — so a plain
+        # ping showed a misleading "✔ 45ms" for servers that don't actually
+        # work. We therefore also PROBE THE BYPASS: if no strategy completes a
+        # handshake the row honestly reports it as blocked instead of a
+        # false-positive latency.
         try:
             res = self._engine.ping_profile(self._profile)
         except Exception as exc:
@@ -1059,7 +1065,23 @@ class InlinePingWorker(QThread):
         if not res.reachable:
             self.result.emit(tr("✖ بدون پاسخ"), "err")
             return
-        parts = [f"{res.best_ms:.0f}ms"]
+
+        # the TCP endpoint answered — but does the bypass actually connect?
+        best_ms = res.best_ms
+        try:
+            report = self._engine.probe_strategies_for(self._profile)
+        except Exception:
+            report = None
+        if report is not None and report.results:
+            if not report.any_connected:
+                # transport reachable but DPI blocks every strategy ⇒ unusable
+                self.result.emit(tr("✖ مسدود (هیچ استراتژی وصل نشد)"), "err")
+                return
+            b = report.best
+            if b is not None and b.latency_ms:
+                best_ms = b.latency_ms
+
+        parts = [f"{best_ms:.0f}ms"]
         if res.jitter_ms is not None:
             parts.append(f"jitter {res.jitter_ms:.0f}")
         if res.loss > 0:
@@ -1734,30 +1756,22 @@ class MainWindow(QWidget):
         # #2: if the engine is already running when the user activates a
         # different server, transparently restart it on the new profile so the
         # switch takes effect immediately — no manual stop/start needed.
-        was_running = False
+        # NOTE: ``is_running`` is a *property* on both EngineBridge and the
+        # controller — calling it like a method raised TypeError (swallowed by
+        # the except), so the auto-restart never fired and the engine stayed
+        # stuck on the previous config (feedback #2).
         try:
-            was_running = self.engine.is_running()
+            was_running = bool(self.engine.is_running)
         except Exception:
             was_running = False
 
+        # --- 1) apply the new profile + any mode change FIRST ---------------
+        # so the (re)start below already sees the new server *and* the right
+        # connection mode. Doing the mode switch after start() was part of why
+        # the engine stayed stuck on the previous config.
         self.engine.set_profile(profile)
         # keep the persistent status bar in sync with the active server (#9)
         self.active_bar.set_profile(profile)
-
-        if was_running:
-            self.page_log.append(
-                "[profile] " + tr("راه‌اندازی مجدد خودکار برای اعمال سرور جدید…"))
-            try:
-                self.engine.stop()
-            except Exception:
-                pass
-            # small delay so sockets/proxy settings unwind before re-start
-            QTimer.singleShot(450, self.engine.start)
-            try:
-                Toast.show_message(
-                    self, tr("سرور جدید فعال شد — اتصال بازنشانی شد"), "ok")
-            except Exception:
-                pass
 
         if profile:
             self.page_log.append(
@@ -1778,6 +1792,48 @@ class MainWindow(QWidget):
                 Toast.show_message(
                     self, tr("حالت به «Tunnel» تغییر کرد (برای استفاده از کانفیگ)"),
                     "ok")
+
+        # --- 2) now restart the live engine if it was running --------------
+        if was_running:
+            self.page_log.append(
+                "[profile] " + tr("راه‌اندازی مجدد خودکار برای اعمال سرور جدید…"))
+            try:
+                self.engine.stop()
+            except Exception:
+                pass
+            # Poll until the engine has fully torn down (xray killed, the
+            # 127.0.0.1:40443 spoofer port released) before starting again. A
+            # blind fixed delay sometimes re-bound before the old spoofer let go
+            # of the port, so xray dialed a half-dead spoofer ⇒ the new config
+            # never came up and the user had to stop/start manually (#2).
+            self._restart_attempts = 0
+            self._restart_when_idle()
+            try:
+                Toast.show_message(
+                    self, tr("سرور جدید فعال شد — اتصال بازنشانی شد"), "ok")
+            except Exception:
+                pass
+
+    def _restart_when_idle(self):
+        """Start the engine once it has fully stopped (feedback #2).
+
+        Polls engine status every 150 ms (≈6 s cap). Starting only after the
+        previous session reached idle guarantees the spoofer port + xray
+        subprocess are released, so the new profile actually connects instead of
+        the engine appearing "active" while stuck on the old config.
+        """
+        try:
+            running = bool(self.engine.is_running)
+        except Exception:
+            running = False
+        self._restart_attempts = getattr(self, "_restart_attempts", 0) + 1
+        if not running or self._restart_attempts > 40:
+            try:
+                self.engine.start()
+            except Exception:
+                pass
+            return
+        QTimer.singleShot(150, self._restart_when_idle)
 
     def _on_auto_prober_changed(self, enabled: bool):
         # the StrategyPage already persisted the flag; push it to the live engine

@@ -247,6 +247,121 @@ class ProxyStartupTest(unittest.TestCase):
         finally:
             srv.stop()
 
+    # -- #5 dead-relay detection -------------------------------------------
+
+    def test_dead_relay_streak_warns_once(self):
+        """A streak of upload-only (download==0) relays warns exactly once."""
+        srv = self.main.ProxyServer(self._cfg(_free_port()))
+        warnings = []
+        srv.on_log = lambda m: None
+        # capture only error/warning-level logs
+        orig_log = srv._log
+        def _cap(msg, level="info"):
+            if level.lower() in ("error", "warn", "warning"):
+                warnings.append(msg)
+        srv._log = _cap
+        srv.bypass_method = "fake_ttl"
+
+        # below the threshold ⇒ no warning yet
+        for _ in range(srv.DEAD_RELAY_STREAK - 1):
+            srv._note_relay_result(up_n=1000, down_n=0)
+        self.assertEqual(warnings, [])
+
+        # crossing the threshold ⇒ exactly one warning
+        srv._note_relay_result(up_n=1000, down_n=0)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("fake_ttl", warnings[0])
+
+        # further dead relays do not spam additional warnings
+        srv._note_relay_result(up_n=1000, down_n=0)
+        self.assertEqual(len(warnings), 1)
+
+    def test_successful_download_resets_dead_streak(self):
+        srv = self.main.ProxyServer(self._cfg(_free_port()))
+        warnings = []
+        srv._log = lambda msg, level="info": (
+            warnings.append(msg) if level.lower().startswith(("err", "warn"))
+            else None)
+        srv.bypass_method = "wrong_checksum"
+
+        for _ in range(srv.DEAD_RELAY_STREAK - 1):
+            srv._note_relay_result(up_n=500, down_n=0)
+        # a real download arrives ⇒ streak resets, no warning ever fires
+        srv._note_relay_result(up_n=500, down_n=4096)
+        for _ in range(srv.DEAD_RELAY_STREAK - 1):
+            srv._note_relay_result(up_n=500, down_n=0)
+        self.assertEqual(warnings, [])
+
+    def test_idle_close_is_not_a_dead_relay(self):
+        # neither uploaded nor downloaded ⇒ not counted as a failed relay
+        srv = self.main.ProxyServer(self._cfg(_free_port()))
+        for _ in range(srv.DEAD_RELAY_STREAK + 3):
+            srv._note_relay_result(up_n=0, down_n=0)
+        self.assertEqual(srv._down_zero_streak, 0)
+
+    # -- #5 per-connection log verbosity gate ------------------------------
+
+    def test_conn_log_suppressed_by_default(self):
+        # the happy-path per-connection chatter is hidden unless verbose is on,
+        # so a failing fire-and-forget strategy can't flood the log (#5).
+        srv = self.main.ProxyServer(self._cfg(_free_port()))
+        seen = []
+        srv._log = lambda msg, level="info": seen.append((msg, level))
+        srv._log_conn("[conn #1] relay started")
+        self.assertEqual(seen, [])               # info chatter swallowed
+
+    def test_conn_log_emitted_when_verbose(self):
+        cfg = self._cfg(_free_port())
+        cfg["verbose_conn_log"] = True
+        srv = self.main.ProxyServer(cfg)
+        seen = []
+        srv._log = lambda msg, level="info": seen.append((msg, level))
+        srv._log_conn("[conn #1] relay started")
+        self.assertEqual(len(seen), 1)
+
+    def test_conn_log_errors_always_pass_through(self):
+        # errors must surface even with the verbosity gate off
+        srv = self.main.ProxyServer(self._cfg(_free_port()))
+        seen = []
+        srv._log = lambda msg, level="info": seen.append((msg, level))
+        srv._log_conn("[conn #1] injector failed", "error")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][1], "error")
+
+    # -- #5 concurrency gate -----------------------------------------------
+
+    def test_conn_gate_bounds_simultaneous_handlers(self):
+        """The semaphore caps how many handlers run at once (#5)."""
+        import asyncio
+
+        srv = self.main.ProxyServer(self._cfg(_free_port()))
+        srv._log = lambda *a, **k: None
+
+        async def _drive():
+            srv._conn_gate = asyncio.Semaphore(2)
+            peak = {"n": 0, "cur": 0}
+            release = asyncio.Event()
+
+            async def _fake_handle():
+                gate = srv._conn_gate
+                await gate.acquire()
+                peak["cur"] += 1
+                peak["n"] = max(peak["n"], peak["cur"])
+                try:
+                    await release.wait()
+                finally:
+                    peak["cur"] -= 1
+                    gate.release()
+
+            tasks = [asyncio.create_task(_fake_handle()) for _ in range(8)]
+            await asyncio.sleep(0.05)            # let them pile up on the gate
+            self.assertLessEqual(peak["n"], 2)   # never more than 2 at once
+            release.set()
+            await asyncio.gather(*tasks)
+            return peak["n"]
+
+        self.assertLessEqual(asyncio.run(_drive()), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
