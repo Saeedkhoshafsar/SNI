@@ -38,6 +38,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "self_test": True,            # after Start, probe xray→spoofer→CDN via the local HTTP port
     "bypass_method": "wrong_seq",
     "gaming_mode": False,
+    "verbose_conn_log": False,    # log every per-connection lifecycle line (#5: off = readable log)
     "auto_prober": False,
     "probe_timeout": 5.0,         # per-candidate probe timeout (seconds)
     # ping / latency measurement (core.ping) — done *before* connecting

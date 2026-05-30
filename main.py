@@ -120,6 +120,18 @@ class ProxyServer:
         self._last_up = 0
         self._last_down = 0
 
+        # #5 dead-relay detection: a connection that finishes having uploaded
+        # bytes but received *zero* download means the spoof didn't actually
+        # work (the real handshake to the CDN never got a reply). We count a
+        # streak of such connections and warn once, instead of letting xray
+        # silently storm hundreds of failing retries (the "fake_ttl floods the
+        # log with 100+ active connections and nothing downloads" symptom).
+        self._down_zero_streak = 0
+        self._dead_relay_warned = False
+        # gentle concurrency guard so a failing fire-and-forget strategy can't
+        # open an unbounded number of simultaneous dead connections.
+        self._conn_gate = None  # asyncio.Semaphore, created on the loop
+
         # optional resilience controller handed in by the engine
         self.resilience = None
 
@@ -146,6 +158,22 @@ class ProxyServer:
             except Exception:
                 pass
 
+    def _log_conn(self, msg: str, level: str = "info"):
+        """Per-connection lifecycle log — suppressed unless verbose (#5).
+
+        A failing fire-and-forget strategy opens hundreds of short-lived
+        connections; emitting three INFO lines for each one floods the log so
+        fast it becomes unreadable (the user's "logs scroll way too fast"
+        complaint). We always surface warnings/errors, but the happy-path
+        "TCP connected / fake injected / relay ended" chatter is gated behind a
+        ``verbose_conn_log`` config flag (off by default).
+        """
+        if level.lower() in ("warning", "error", "warn", "err"):
+            self._log(msg, level)
+            return
+        if self.config.get("verbose_conn_log", False):
+            self._log(msg, level)
+
     def _update_conn_count(self, delta: int):
         self._active_connections += delta
         if delta > 0:
@@ -163,6 +191,36 @@ class ProxyServer:
 
     def _add_down(self, n: int):
         self._down_bytes += n
+
+    # how many consecutive upload-only (download==0) relays before we warn
+    DEAD_RELAY_STREAK = 6
+
+    def _note_relay_result(self, up_n: int, down_n: int) -> None:
+        """Track dead relays (uploaded but never downloaded) and warn once (#5).
+
+        A handful of such connections is normal (probes, aborted requests). A
+        long *streak* of upload-only relays means the chosen bypass strategy is
+        not actually getting a reply from the CDN on this network — exactly the
+        ``fake_ttl`` / ``wrong_checksum`` "fast, 100+ connections, nothing
+        downloads" symptom. We surface a single, clear, actionable warning
+        rather than flooding the log or silently failing.
+        """
+        if down_n > 0:
+            self._down_zero_streak = 0
+            self._dead_relay_warned = False
+            return
+        if up_n <= 0:
+            return  # neither up nor down — not a "dead relay", just an idle close
+        self._down_zero_streak += 1
+        if (self._down_zero_streak >= self.DEAD_RELAY_STREAK
+                and not self._dead_relay_warned):
+            self._dead_relay_warned = True
+            self._log(
+                f"هشدار: {self._down_zero_streak} اتصال پشت‌سرهم فقط آپلود "
+                f"داشتند و هیچ دانلودی برنگشت — استراتژی «{self.bypass_method}» "
+                f"احتمالاً روی این شبکه کار نمی‌کند (دست‌دادن واقعی با CDN "
+                f"کامل نمی‌شود). یک استراتژی دیگر مثل wrong_seq را امتحان کنید "
+                f"یا پراب خودکار را روشن کنید.", "error")
 
     async def _traffic_ticker(self):
         """Emit cumulative bytes + a 1-second rolling rate to the UI."""
@@ -205,6 +263,15 @@ class ProxyServer:
     # ---------------------------------------------------------------- handler
 
     async def _handle(self, incoming_sock: socket.socket, addr):
+        # #5: bound the number of simultaneously in-flight connections. A
+        # misbehaving fire-and-forget strategy (e.g. fake_ttl that never gets a
+        # download back) otherwise lets xray storm hundreds of parallel dead
+        # sockets — the "100+ active connections, super-fast log, nothing
+        # downloads" symptom. The gate caps that blast radius; real multiplexed
+        # traffic never needs more than a few dozen concurrent sockets.
+        gate = self._conn_gate
+        if gate is not None:
+            await gate.acquire()
         self._update_conn_count(1)
         outgoing_sock = None
         # per-connection diagnostics: a short tag so the user's log clearly
@@ -213,8 +280,8 @@ class ProxyServer:
         cid = f"#{self._total_connections}"
         try:
             loop = asyncio.get_running_loop()
-            self._log(f"[conn {cid}] از xray رسید ({addr[0]}:{addr[1]}) → "
-                      f"اتصال به {self.connect_ip}:{self.connect_port}")
+            self._log_conn(f"[conn {cid}] از xray رسید ({addr[0]}:{addr[1]}) → "
+                           f"اتصال به {self.connect_ip}:{self.connect_port}")
 
             fake_data = ClientHelloMaker.get_client_hello_with(
                 os.urandom(32), os.urandom(32), self.fake_sni, os.urandom(32))
@@ -262,8 +329,8 @@ class ProxyServer:
                 expects_ack = True
 
             if expects_ack:
-                self._log(f"[conn {cid}] TCP وصل شد (مبدأ {self.interface_ipv4}:"
-                          f"{src_port}) — منتظر تأیید ClientHello جعلی…")
+                self._log_conn(f"[conn {cid}] TCP وصل شد (مبدأ {self.interface_ipv4}:"
+                               f"{src_port}) — منتظر تأیید ClientHello جعلی…")
 
                 # Random micro-jitter to defeat timing-based DPI fingerprinting
                 await asyncio.sleep(random.uniform(0.001, 0.008))
@@ -286,7 +353,7 @@ class ProxyServer:
                     fake_conn.monitor = False
                     self._fake_connections.pop(fake_conn.id, None)
 
-                self._log(f"[conn {cid}] ✓ ClientHello جعلی تأیید شد — شروع رله")
+                self._log_conn(f"[conn {cid}] ✓ ClientHello جعلی تأیید شد — شروع رله")
             else:
                 # Fire-and-forget: no server ACK will arrive. Poll briefly for
                 # the injector to mark the fake as sent (it fires from the
@@ -295,9 +362,9 @@ class ProxyServer:
                 # flows out untouched and start relaying. We also bail out
                 # early if the injector reported a hard error (unexpected
                 # close) or never got a chance to send within the window.
-                self._log(f"[conn {cid}] TCP وصل شد (مبدأ {self.interface_ipv4}:"
-                          f"{src_port}) — استراتژی fire-and-forget "
-                          f"({self.bypass_method}) — تزریق بدون انتظار ACK…")
+                self._log_conn(f"[conn {cid}] TCP وصل شد (مبدأ {self.interface_ipv4}:"
+                               f"{src_port}) — استراتژی fire-and-forget "
+                               f"({self.bypass_method}) — تزریق بدون انتظار ACK…")
                 try:
                     # Wait for the injector to confirm the fake is on the wire.
                     # It fires ``t2a_event`` with ``fake_sent_no_ack`` the
@@ -326,8 +393,8 @@ class ProxyServer:
                     fake_conn.monitor = False
                     self._fake_connections.pop(fake_conn.id, None)
 
-                self._log(f"[conn {cid}] ✓ ClientHello جعلی تزریق شد "
-                          f"(بدون انتظار ACK) — شروع رله")
+                self._log_conn(f"[conn {cid}] ✓ ClientHello جعلی تزریق شد "
+                               f"(بدون انتظار ACK) — شروع رله")
 
             # Optimize the incoming socket too before relay
             self._configure_sock(incoming_sock, self.gaming_mode)
@@ -337,8 +404,9 @@ class ProxyServer:
             up0, down0 = self._up_bytes, self._down_bytes
             await _relay_pair(incoming_sock, outgoing_sock,
                               on_up=self._add_up, on_down=self._add_down)
-            self._log(f"[conn {cid}] رله پایان یافت "
-                      f"(↑{self._up_bytes - up0}B ↓{self._down_bytes - down0}B)")
+            up_n, down_n = self._up_bytes - up0, self._down_bytes - down0
+            self._log_conn(f"[conn {cid}] رله پایان یافت (↑{up_n}B ↓{down_n}B)")
+            self._note_relay_result(up_n, down_n)
 
         except asyncio.CancelledError:
             pass
@@ -352,6 +420,11 @@ class ProxyServer:
                         s.close()
                     except OSError:
                         pass
+            if gate is not None:
+                try:
+                    gate.release()
+                except Exception:
+                    pass
 
     # ---------------------------------------------------------------- server
 
@@ -377,6 +450,11 @@ class ProxyServer:
             return
 
         loop = asyncio.get_running_loop()
+        # #5: cap simultaneous in-flight connections so a misbehaving
+        # fire-and-forget strategy can't open hundreds of dead sockets at once
+        # (the "100+ active connections" storm). 64 is plenty for real traffic
+        # — xray multiplexes — while bounding the blast radius of a bad strategy.
+        self._conn_gate = asyncio.Semaphore(64)
         self._log(f"Listening on {self.listen_host}:{self.listen_port}")
         self._running = True
         # the listen socket is now bound — release start() so xray can dial us
@@ -400,6 +478,9 @@ class ProxyServer:
                         break
                     raise
                 incoming_sock.setblocking(False)
+                # concurrency is bounded *inside* _handle via self._conn_gate
+                # (acquired there, released in its finally) so a failing
+                # fire-and-forget strategy can't storm hundreds of dead sockets.
                 task = asyncio.create_task(self._handle(incoming_sock, addr))
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
