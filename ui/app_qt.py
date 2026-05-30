@@ -28,8 +28,19 @@ def main(theme: str | None = None) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("SNI Spoofer")
     app.setApplicationDisplayName("SNI Spoofer")
-    # Persian-first product: right-to-left layout direction.
-    app.setLayoutDirection(Qt.RightToLeft)
+
+    # Language (#6): restore the persisted choice and set the matching layout
+    # direction (RTL for Persian, LTR for English) before the window is built.
+    try:
+        from core.config_store import ConfigStore
+        from ui import i18n
+        lang = str(ConfigStore().get("language", "fa"))
+        if lang not in ("fa", "en"):
+            lang = "fa"
+        i18n._lang = lang
+    except Exception:
+        lang = "fa"
+    app.setLayoutDirection(Qt.RightToLeft if lang == "fa" else Qt.LeftToRight)
 
     from ui.window import MainWindow
     win = MainWindow(theme=theme)

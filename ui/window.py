@@ -18,9 +18,10 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QProgressBar, QPushButton,
-    QScrollArea, QSpinBox, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit,
+    QProgressBar, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 
@@ -52,6 +53,7 @@ from ui.widgets import (
     PowerButton, ProfileRow, Sparkline, TitleBar, Toast,
 )
 from ui.animations import CountUp, PulseDot, WaveBackdrop, stagger_in
+from ui.i18n import tr
 
 from core.config_store import ConfigStore
 from core.engine import EngineController
@@ -138,17 +140,17 @@ class PingWorker(QThread):
             elif self._kind == "strategy":
                 self._do_strategy()
             else:
-                self.done.emit("نوع سنجش ناشناخته")
+                self.done.emit(tr("نوع سنجش ناشناخته"))
         except Exception as exc:
-            self.line.emit(f"خطا: {exc}")
-            self.done.emit("سنجش با خطا متوقف شد")
+            self.line.emit(tr("خطا: {exc}").format(exc=exc))
+            self.done.emit(tr("سنجش با خطا متوقف شد"))
 
     # -- helpers ----------------------------------------------------------
     @staticmethod
     def fmt_ping(res, *, rank=None) -> str:
         prefix = f"#{rank} " if rank is not None else ""
         if not res.reachable:
-            return f"{prefix}✖ {res.label} — بدون پاسخ"
+            return f"{prefix}✖ {res.label} — " + tr("بدون پاسخ")
         parts = [f"{res.best_ms:.0f}ms", f"avg {res.avg_ms:.0f}",
                  f"jitter {res.jitter_ms:.0f}"]
         if res.loss > 0:
@@ -161,32 +163,33 @@ class PingWorker(QThread):
         from core.ping import PingTester
         results = self._engine.ping_profiles(self._profiles)
         if not results:
-            self.done.emit("هیچ نتیجه‌ای — پروفایلی نیست یا خطا رخ داد")
+            self.done.emit(tr("هیچ نتیجه‌ای — پروفایلی نیست یا خطا رخ داد"))
             return
         for i, res in enumerate(results, 1):
             self.line.emit(self.fmt_ping(res, rank=i))
         best = PingTester.best(results)
         if best is None:
-            self.done.emit("هیچ سروری پاسخ نداد")
+            self.done.emit(tr("هیچ سروری پاسخ نداد"))
         else:
-            self.done.emit(f"بهترین سرور: {best.label} ({best.best_ms:.0f}ms)")
+            self.done.emit(tr("بهترین سرور: {label} ({ms:.0f}ms)").format(
+                label=best.label, ms=best.best_ms))
 
     def _do_ping_one(self):
         res = self._engine.ping_profile(self._profile)
         if res is None:
-            self.done.emit("نتیجه‌ای دریافت نشد")
+            self.done.emit(tr("نتیجه‌ای دریافت نشد"))
             return
         self.line.emit(self.fmt_ping(res))
         if res.reachable:
             self.done.emit(f"{res.label}: {res.best_ms:.0f}ms")
         else:
-            self.done.emit(f"{res.label}: بدون پاسخ")
+            self.done.emit(f"{res.label}: " + tr("بدون پاسخ"))
 
     def _do_strategy(self):
         report = self._engine.probe_strategies_for(
             self._profile, strategy=(self._strategy or None))
         if not report.results:
-            self.done.emit("استراتژی‌ای تست نشد (آدرس/کاندیدا نامعتبر)")
+            self.done.emit(tr("استراتژی‌ای تست نشد (آدرس/کاندیدا نامعتبر)"))
             return
         for r in report.results:
             mark = "✔" if r.ok else "✖"
@@ -195,10 +198,11 @@ class PingWorker(QThread):
             self.line.emit(f"{mark} {r.strategy:14} — {extra}")
         best = report.best
         if best is None:
-            self.done.emit("هیچ استراتژی‌ای وصل نشد")
+            self.done.emit(tr("هیچ استراتژی‌ای وصل نشد"))
         else:
             self.done.emit(
-                f"بهترین استراتژی: {best.strategy} ({best.latency_ms:.0f}ms)")
+                tr("بهترین استراتژی: {s} ({ms:.0f}ms)").format(
+                    s=best.strategy, ms=best.latency_ms))
 
 
 # ---------------------------------------------------------------------------
@@ -206,15 +210,16 @@ class PingWorker(QThread):
 # ---------------------------------------------------------------------------
 
 def _section_title(text: str, sub: str = "") -> QWidget:
+    # translate centrally (#6) so every page heading is bilingual at once
     w = QWidget()
     lay = QVBoxLayout(w)
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(2)
-    h = QLabel(text)
+    h = QLabel(tr(text))
     h.setObjectName("H1")
     lay.addWidget(h)
     if sub:
-        s = QLabel(sub)
+        s = QLabel(tr(sub))
         s.setObjectName("Muted")
         lay.addWidget(s)
     return w
@@ -289,13 +294,13 @@ class DashboardPage(QWidget):
         row.setSpacing(14)
 
         self.status_dot = PulseDot(diameter=12)
-        self.status_label = QLabel("آماده — متوقف")
+        self.status_label = QLabel(tr("آماده — متوقف"))
         self.status_label.setObjectName("H2")
         row.addWidget(self.status_dot)
         row.addWidget(self.status_label)
         row.addStretch(1)
         # tunnel / proxy badge — answers feedback 7 ("is this a tunnel or proxy?")
-        self.mode_badge = QLabel("پروکسی محلی")
+        self.mode_badge = QLabel(tr("پروکسی محلی"))
         self.mode_badge.setObjectName("ModeBadge")
         self.mode_badge.setProperty("kind", "proxy")
         row.addWidget(self.mode_badge)
@@ -312,7 +317,7 @@ class DashboardPage(QWidget):
         tb = traffic.body()
         thead = QHBoxLayout()
         thead.setSpacing(14)
-        tlabel = QLabel("مصرف زنده")
+        tlabel = QLabel(tr("مصرف زنده"))
         tlabel.setObjectName("H2")
         thead.addWidget(tlabel)
         thead.addStretch(1)
@@ -332,11 +337,11 @@ class DashboardPage(QWidget):
         # --- quick stats row ---
         stats = QHBoxLayout()
         stats.setSpacing(14)
-        self.stat_conns = _stat_card("0", "اتصالات فعال",
+        self.stat_conns = _stat_card("0", tr("اتصالات فعال"),
                                      accent_color=palette.accent)
-        self.stat_total = _stat_card("0 B", "مصرف کل (↓/↑)")
-        self.stat_mode = _stat_card("Tunnel", "حالت")
-        self.stat_strategy = _stat_card("wrong_seq", "استراتژی فعال")
+        self.stat_total = _stat_card("0 B", tr("مصرف کل (↓/↑)"))
+        self.stat_mode = _stat_card("Tunnel", tr("حالت"))
+        self.stat_strategy = _stat_card("wrong_seq", tr("استراتژی فعال"))
         self.stat_cards = [self.stat_conns, self.stat_total,
                            self.stat_mode, self.stat_strategy]
         for c in self.stat_cards:
@@ -344,7 +349,7 @@ class DashboardPage(QWidget):
         root.addLayout(stats)
 
         # --- resilience strip (live fallback state) ---
-        self.lbl_resilience = QLabel("تاب‌آوری: —")
+        self.lbl_resilience = QLabel(tr("تاب‌آوری: —"))
         self.lbl_resilience.setObjectName("Muted")
         root.addWidget(self.lbl_resilience)
 
@@ -367,18 +372,18 @@ class DashboardPage(QWidget):
     def set_status(self, state: str):
         self.status_dot.set_state(state)
         self.btn_start.set_state(state)
-        self.status_label.setText({
+        self.status_label.setText(tr({
             "idle": "آماده — متوقف",
             "connecting": "در حال اتصال…",
             "active": "متصل — تونل فعال",
             "error": "خطا — تلاش دوباره",
-        }.get(state, "آماده — متوقف"))
+        }.get(state, "آماده — متوقف")))
         if state == "idle":
             # reset the live picture when the session ends
             self.spark.clear()
             self.rate_down.setText("↓ 0 B/s")
             self.rate_up.setText("↑ 0 B/s")
-            self.lbl_resilience.setText("تاب‌آوری: —")
+            self.lbl_resilience.setText(tr("تاب‌آوری: —"))
 
     def on_count(self, active: int, total: int):
         """Slot for the engine's connection-count signal."""
@@ -395,7 +400,7 @@ class DashboardPage(QWidget):
 
     def set_resilience(self, text: str):
         """Slot for the live resilience/fallback summary line."""
-        self.lbl_resilience.setText(f"تاب‌آوری: {text}")
+        self.lbl_resilience.setText(tr("تاب‌آوری: {text}").format(text=text))
 
     def set_active_strategy(self, key: str):
         self.stat_strategy.value_label.setText(key)
@@ -405,7 +410,7 @@ class DashboardPage(QWidget):
         kind = mode_kind(mode)
         self.mode_badge.setProperty("kind", kind)
         self.mode_badge.setText(
-            "تونل کامل" if kind == "tunnel" else "پروکسی محلی")
+            tr("تونل کامل") if kind == "tunnel" else tr("پروکسی محلی"))
         # re-polish so the QSS property selector re-applies
         self.mode_badge.style().unpolish(self.mode_badge)
         self.mode_badge.style().polish(self.mode_badge)
@@ -470,7 +475,7 @@ class SettingsPage(QWidget):
         # --- LAN sharing (use the proxy from a phone on the same Wi-Fi) ---
         form.addSpacing(8)
         self.chk_lan = QCheckBox(
-            "اشتراک LAN — پروکسی روی شبکه‌ی محلی باز شود (برای گوشی)")
+            tr("اشتراک LAN — پروکسی روی شبکه‌ی محلی باز شود (برای گوشی)"))
         form.addWidget(self.chk_lan)
         self.lan_hint = QLabel("")
         self.lan_hint.setObjectName("Muted")
@@ -481,7 +486,7 @@ class SettingsPage(QWidget):
         # --- system proxy vs. tunnel (feedback 7) ---
         form.addSpacing(8)
         self.chk_system_proxy = QCheckBox(
-            "پروکسی سیستم — همه‌ی برنامه‌های ویندوز خودکار از تونل رد شوند")
+            tr("پروکسی سیستم — همه‌ی برنامه‌های ویندوز خودکار از تونل رد شوند"))
         form.addWidget(self.chk_system_proxy)
         self.proxy_hint = QLabel("")
         self.proxy_hint.setObjectName("Muted")
@@ -491,7 +496,7 @@ class SettingsPage(QWidget):
 
         save_row = QHBoxLayout()
         save_row.addStretch(1)
-        self.btn_save = QPushButton("ذخیره")
+        self.btn_save = QPushButton(tr("ذخیره"))
         self.btn_save.setObjectName("Primary")
         save_row.addWidget(self.btn_save)
         form.addLayout(save_row)
@@ -534,38 +539,38 @@ class SettingsPage(QWidget):
             self.mode.setCurrentIndex(i)
 
     def _update_mode_hint(self, mode: str) -> None:
-        self.mode_hint.setText(MODE_HINTS.get(mode, ""))
+        self.mode_hint.setText(tr(MODE_HINTS.get(mode, "")))
 
     def _update_lan_hint(self, on: bool) -> None:
         """Show the LAN address the phone should use when sharing is on."""
         if not on:
             self.lan_hint.setText(
-                "خاموش — پروکسی فقط روی همین کامپیوتر (127.0.0.1) در دسترس است")
+                tr("خاموش — پروکسی فقط روی همین کامپیوتر (127.0.0.1) در دسترس است"))
             return
         try:
             from core.xray_manager import lan_ip_address
             ip = lan_ip_address()
         except Exception:
-            ip = "<IP این کامپیوتر>"
+            ip = tr("<IP این کامپیوتر>")
         port = self.spin_socks.value()
         self.lan_hint.setText(
-            f"روشن — در گوشی، پروکسی SOCKS5 را روی {ip}:{port} تنظیم کنید "
-            f"(هر دو دستگاه باید روی یک شبکه/Wi-Fi باشند)")
+            tr("روشن — در گوشی، پروکسی SOCKS5 را روی {ip}:{port} تنظیم کنید "
+               "(هر دو دستگاه باید روی یک شبکه/Wi-Fi باشند)").format(ip=ip, port=port))
 
     def _update_proxy_hint(self, on: bool) -> None:
         """Explain the tunnel-vs-system-proxy choice (feedback 7)."""
         if on:
-            self.proxy_hint.setText(
+            self.proxy_hint.setText(tr(
                 "حالت «پروکسی سیستم»: هنگام اتصال، پروکسی ویندوز روی پورت HTTP "
                 "محلی تنظیم می‌شود و با قطع اتصال خودکار برمی‌گردد. فقط در "
-                "حالت‌های دارای xray (نه SNI Only) و روی ویندوز کار می‌کند.")
+                "حالت‌های دارای xray (نه SNI Only) و روی ویندوز کار می‌کند."))
         else:
-            self.proxy_hint.setText(
+            self.proxy_hint.setText(tr(
                 "حالت «تونل»: فقط برنامه‌هایی که دستی روی پروکسی محلی تنظیم "
-                "شده‌اند رد می‌شوند؛ تنظیمات ویندوز دست‌نخورده می‌ماند.")
+                "شده‌اند رد می‌شوند؛ تنظیمات ویندوز دست‌نخورده می‌ماند."))
 
     def _field_label(self, t: str) -> QLabel:
-        lbl = QLabel(t)
+        lbl = QLabel(tr(t))
         lbl.setObjectName("Muted")
         return lbl
 
@@ -632,11 +637,11 @@ class ProfilesPage(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
-        self.btn_import = QPushButton("افزودن لینک‌ها")
+        self.btn_import = QPushButton(tr("افزودن لینک‌ها"))
         self.btn_import.setObjectName("Primary")
-        self.btn_paste = QPushButton("از کلیپ‌بورد")
+        self.btn_paste = QPushButton(tr("از کلیپ‌بورد"))
         self.btn_paste.setObjectName("Ghost")
-        self.btn_sub = QPushButton("افزودن سابسکریپشن")
+        self.btn_sub = QPushButton(tr("افزودن سابسکریپشن"))
         self.btn_sub.setObjectName("Ghost")
         btn_row.addWidget(self.btn_import)
         btn_row.addWidget(self.btn_paste)
@@ -664,9 +669,9 @@ class ProfilesPage(QWidget):
 
         del_row = QHBoxLayout()
         del_row.addStretch(1)
-        self.btn_edit = QPushButton("\u270e  ویرایش")
+        self.btn_edit = QPushButton(tr("\u270e  ویرایش"))
         self.btn_edit.setObjectName("Ghost")
-        self.btn_delete = QPushButton("\U0001f5d1  حذف انتخاب‌شده")
+        self.btn_delete = QPushButton(tr("\U0001f5d1  حذف انتخاب‌شده"))
         self.btn_delete.setObjectName("Ghost")
         del_row.addWidget(self.btn_edit)
         del_row.addWidget(self.btn_delete)
@@ -682,9 +687,9 @@ class ProfilesPage(QWidget):
 
         ping_btns = QHBoxLayout()
         ping_btns.setSpacing(10)
-        self.btn_ping_all = QPushButton("\U0001f4e1  پینگ همه")
+        self.btn_ping_all = QPushButton(tr("\U0001f4e1  پینگ همه"))
         self.btn_ping_all.setObjectName("Primary")
-        self.btn_ping_one = QPushButton("\U0001f4e1  پینگ این سرور")
+        self.btn_ping_one = QPushButton(tr("\U0001f4e1  پینگ این سرور"))
         self.btn_ping_one.setObjectName("Ghost")
         ping_btns.addWidget(self.btn_ping_all)
         ping_btns.addWidget(self.btn_ping_one)
@@ -694,13 +699,13 @@ class ProfilesPage(QWidget):
         # strategy-ping row: choose a strategy (or "all") to test connectivity with
         strat_row = QHBoxLayout()
         strat_row.setSpacing(10)
-        strat_lbl = QLabel("استراتژی برای تست:")
+        strat_lbl = QLabel(tr("استراتژی برای تست:"))
         strat_lbl.setObjectName("Muted")
         self.cmb_ping_strategy = NoScrollComboBox()
-        self.cmb_ping_strategy.addItem("همه‌ی استراتژی‌ها", "")
+        self.cmb_ping_strategy.addItem(tr("همه‌ی استراتژی‌ها"), "")
         for key, title, _desc in STRATEGIES:
-            self.cmb_ping_strategy.addItem(title, key)
-        self.btn_test_strategies = QPushButton("\U0001f9ea  تست استراتژی‌ها")
+            self.cmb_ping_strategy.addItem(tr(title), key)
+        self.btn_test_strategies = QPushButton(tr("\U0001f9ea  تست استراتژی‌ها"))
         self.btn_test_strategies.setObjectName("Ghost")
         strat_row.addWidget(strat_lbl)
         strat_row.addWidget(self.cmb_ping_strategy, 1)
@@ -714,7 +719,7 @@ class ProfilesPage(QWidget):
         self.ping_output.setObjectName("PingOutput")
         self.ping_output.setReadOnly(True)
         self.ping_output.setMaximumHeight(150)
-        self.ping_output.setPlaceholderText("نتیجه‌ی پینگ/تست استراتژی اینجا نمایش داده می‌شود …")
+        self.ping_output.setPlaceholderText(tr("نتیجه‌ی پینگ/تست استراتژی اینجا نمایش داده می‌شود …"))
         pb.addWidget(self.ping_output)
         root.addWidget(pingc)
 
@@ -733,7 +738,7 @@ class ProfilesPage(QWidget):
         self.refresh()
 
     def _field_label(self, t: str) -> QLabel:
-        lbl = QLabel(t)
+        lbl = QLabel(tr(t))
         lbl.setObjectName("Muted")
         return lbl
 
@@ -763,7 +768,7 @@ class ProfilesPage(QWidget):
             self.list.setCurrentRow(sel)
         # empty-state hint
         if self.list.count() == 0:
-            ph = QListWidgetItem("هنوز پروفایلی اضافه نشده — یک لینک بچسبانید")
+            ph = QListWidgetItem(tr("هنوز پروفایلی اضافه نشده — یک لینک بچسبانید"))
             ph.setFlags(Qt.NoItemFlags)
             self.list.addItem(ph)
         self.list.blockSignals(False)
@@ -810,18 +815,20 @@ class ProfilesPage(QWidget):
             try:
                 profile = parse_link(links[0])
             except ShareLinkError as exc:
-                self._toast(f"لینک نامعتبر: {exc}", "err")
+                self._toast(tr("لینک نامعتبر: {exc}").format(exc=exc), "err")
                 return
             dlg = ProfileDialog(profile, self.window(),
-                                title="افزودن پروفایل جدید")
+                                title=tr("افزودن پروفایل جدید"))
             if dlg.exec() != ProfileDialog.Accepted:
-                self._toast("افزودن لغو شد", "info")
+                self._toast(tr("افزودن لغو شد"), "info")
                 return
             edited = dlg.result_profile
-            self._store.add_profile(edited, select=True)
+            # #1: do not auto-activate the newly added profile if one is
+            # already active — only the first-ever profile becomes active.
+            self._store.add_profile(edited, select=False)
             self.input.clear()
             self.refresh()
-            self._toast(f"پروفایل افزوده شد: {edited.display_name}", "ok")
+            self._toast(tr("پروفایل افزوده شد: {name}").format(name=edited.display_name), "ok")
             self._emit_selection()
             return
 
@@ -834,23 +841,23 @@ class ProfilesPage(QWidget):
             except ShareLinkError:
                 bad += 1
         if not parsed:
-            self._toast("هیچ لینک معتبری یافت نشد", "err")
+            self._toast(tr("هیچ لینک معتبری یافت نشد"), "err")
             return
         added = self._store.add_profiles(parsed)
         self.input.clear()
         self.refresh()
         if bad:
-            self._toast(f"{added} پروفایل افزوده شد ({bad} لینک نامعتبر رد شد)",
-                        "warn")
+            self._toast(tr("{added} پروفایل افزوده شد ({bad} لینک نامعتبر رد شد)")
+                        .format(added=added, bad=bad), "warn")
         else:
-            self._toast(f"{added} پروفایل افزوده شد", "ok")
+            self._toast(tr("{added} پروفایل افزوده شد").format(added=added), "ok")
         self._emit_selection()
 
     def _edit_selected(self):
         """Open the editor on the currently selected profile and save edits."""
         row = self.list.currentRow()
         if not (0 <= row < len(self._store.profiles)):
-            self._toast("ابتدا یک پروفایل را انتخاب کنید", "warn")
+            self._toast(tr("ابتدا یک پروفایل را انتخاب کنید"), "warn")
             return
         self._edit_index(row)
 
@@ -859,7 +866,7 @@ class ProfilesPage(QWidget):
         if not (0 <= row < len(self._store.profiles)):
             return
         current = self._store.profiles[row]
-        dlg = ProfileDialog(current, self.window(), title="ویرایش پروفایل")
+        dlg = ProfileDialog(current, self.window(), title=tr("ویرایش پروفایل"))
         if dlg.exec() != ProfileDialog.Accepted:
             return
         self._store.profiles[row] = dlg.result_profile
@@ -868,12 +875,12 @@ class ProfilesPage(QWidget):
         # re-emit so the engine picks up edits to the active profile
         if row == self._store.selected_index:
             self._emit_selection()
-        self._toast("پروفایل به‌روزرسانی شد", "ok")
+        self._toast(tr("پروفایل به‌روزرسانی شد"), "ok")
 
     def _import_subscription(self):
         text = self.input.toPlainText().strip()
         if not text:
-            self._toast("ابتدا متن/URL سابسکریپشن را وارد کنید", "warn")
+            self._toast(tr("ابتدا متن/URL سابسکریپشن را وارد کنید"), "warn")
             return
         blob = text
         if text.startswith("http://") or text.startswith("https://"):
@@ -882,12 +889,12 @@ class ProfilesPage(QWidget):
                 return
         profiles = parse_subscription(blob)
         if not profiles:
-            self._toast("هیچ پروفایل معتبری در سابسکریپشن یافت نشد", "warn")
+            self._toast(tr("هیچ پروفایل معتبری در سابسکریپشن یافت نشد"), "warn")
             return
         added = self._store.add_profiles(profiles)
         self.input.clear()
         self.refresh()
-        self._toast(f"{added} پروفایل از سابسکریپشن افزوده شد", "ok")
+        self._toast(tr("{added} پروفایل از سابسکریپشن افزوده شد").format(added=added), "ok")
         self._emit_selection()
 
     def _fetch(self, url: str) -> str | None:
@@ -898,7 +905,7 @@ class ProfilesPage(QWidget):
             with urllib.request.urlopen(req, timeout=20) as resp:
                 return resp.read().decode("utf-8", errors="replace")
         except Exception as exc:
-            self._toast(f"واکشی سابسکریپشن ناموفق: {exc}", "err")
+            self._toast(tr("واکشی سابسکریپشن ناموفق: {exc}").format(exc=exc), "err")
             return None
 
     def _paste(self):
@@ -912,12 +919,13 @@ class ProfilesPage(QWidget):
         self._store.remove_profile(row)
         self.refresh()
         self._emit_selection()
-        self._toast("پروفایل حذف شد", "warn")
+        self._toast(tr("پروفایل حذف شد"), "warn")
 
     def _row_changed(self, row: int):
-        if 0 <= row < len(self._store.profiles):
-            self._store.select(row)
-            self._emit_selection()
+        # Highlighting a row no longer activates it (#1/#2): activation is an
+        # explicit action via the row's «فعال‌سازی» button or _activate_index.
+        # This keeps the running server stable while the user browses the list.
+        pass
 
     def _activate_index(self, row: int):
         """One-click activation: select this profile as the active server (#8).
@@ -931,7 +939,7 @@ class ProfilesPage(QWidget):
         self.refresh()
         self._emit_selection()
         prof = self._store.profiles[row]
-        self._toast(f"سرور فعال شد: {prof.display_name}", "ok")
+        self._toast(tr("سرور فعال شد: {name}").format(name=prof.display_name), "ok")
 
     # -- inline per-row ping (#3) -----------------------------------------
     def _ping_row(self, row: int):
@@ -939,11 +947,11 @@ class ProfilesPage(QWidget):
         if not (0 <= row < len(self._store.profiles)):
             return
         if self._engine is None:
-            self._toast("موتور در دسترس نیست", "err")
+            self._toast(tr("موتور در دسترس نیست"), "err")
             return
         if getattr(self, "_inline_worker", None) is not None \
                 and self._inline_worker.isRunning():
-            self._toast("یک پینگ در حال اجراست …", "warn")
+            self._toast(tr("یک پینگ در حال اجراست …"), "warn")
             return
         rows = getattr(self, "_rows", [])
         if row >= len(rows):
@@ -978,15 +986,15 @@ class ProfilesPage(QWidget):
     def _start_ping_job(self, kind: str, *, profile=None, strategy: str = ""):
         """Run a ping/strategy-test job on a background thread (GUI stays live)."""
         if self._engine is None:
-            self._toast("موتور در دسترس نیست", "err")
+            self._toast(tr("موتور در دسترس نیست"), "err")
             return
         if self._ping_worker is not None and self._ping_worker.isRunning():
-            self._toast("یک سنجش در حال اجراست …", "warn")
+            self._toast(tr("یک سنجش در حال اجراست …"), "warn")
             return
         # push freshest ping config into the engine before measuring
         self._engine.update_config(self._store.config)
         self.ping_output.clear()
-        self.ping_status.setText("در حال سنجش …")
+        self.ping_status.setText(tr("در حال سنجش …"))
         self._ping_busy(True)
         worker = PingWorker(self._engine, kind, profile=profile,
                             profiles=list(self._store.profiles),
@@ -1005,21 +1013,21 @@ class ProfilesPage(QWidget):
 
     def _ping_all(self):
         if not self._store.profiles:
-            self._toast("هیچ پروفایلی برای پینگ نیست", "warn")
+            self._toast(tr("هیچ پروفایلی برای پینگ نیست"), "warn")
             return
         self._start_ping_job("ping_all")
 
     def _ping_one(self):
         prof = self._store.selected_profile
         if prof is None:
-            self._toast("ابتدا یک سرور را انتخاب کنید", "warn")
+            self._toast(tr("ابتدا یک سرور را انتخاب کنید"), "warn")
             return
         self._start_ping_job("ping_one", profile=prof)
 
     def _test_strategies(self):
         prof = self._store.selected_profile
         if prof is None:
-            self._toast("ابتدا یک سرور را انتخاب کنید", "warn")
+            self._toast(tr("ابتدا یک سرور را انتخاب کنید"), "warn")
             return
         strategy = self.cmb_ping_strategy.currentData() or ""
         self._start_ping_job("strategy", profile=prof, strategy=strategy)
@@ -1043,13 +1051,13 @@ class InlinePingWorker(QThread):
         try:
             res = self._engine.ping_profile(self._profile)
         except Exception as exc:
-            self.result.emit(f"خطا: {exc}", "err")
+            self.result.emit(tr("خطا: {exc}").format(exc=exc), "err")
             return
         if res is None:
-            self.result.emit("نتیجه‌ای دریافت نشد", "err")
+            self.result.emit(tr("نتیجه‌ای دریافت نشد"), "err")
             return
         if not res.reachable:
-            self.result.emit("✖ بدون پاسخ", "err")
+            self.result.emit(tr("✖ بدون پاسخ"), "err")
             return
         parts = [f"{res.best_ms:.0f}ms"]
         if res.jitter_ms is not None:
@@ -1087,9 +1095,9 @@ class StrategyPage(QWidget):
         ap = Card()
         apb = ap.body()
         row = QHBoxLayout()
-        t = QLabel("پراب خودکار")
+        t = QLabel(tr("پراب خودکار"))
         t.setObjectName("H2")
-        desc = QLabel("بهترین استراتژی را خودکار آزمایش، رتبه‌بندی و قفل می‌کند")
+        desc = QLabel(tr("بهترین استراتژی را خودکار آزمایش، رتبه‌بندی و قفل می‌کند"))
         desc.setObjectName("Faint")
         col = QVBoxLayout()
         col.setSpacing(2)
@@ -1123,16 +1131,16 @@ class StrategyPage(QWidget):
         root.addStretch(1)
 
     def _sync_autoprobe_label(self, enabled: bool) -> None:
-        self.btn_autoprobe.setText("فعال ✓" if enabled else "فعال‌سازی")
+        self.btn_autoprobe.setText(tr("فعال ✓") if enabled else tr("فعال‌سازی"))
 
     def _sync_pick_hint(self, auto_enabled: bool) -> None:
         if auto_enabled:
             self.pick_hint.setText(
-                "پراب خودکار روشن است؛ انتخاب دستی نادیده گرفته می‌شود. "
-                "برای انتخاب دستی، ابتدا پراب خودکار را خاموش کنید.")
+                tr("پراب خودکار روشن است؛ انتخاب دستی نادیده گرفته می‌شود. ")
+                + tr("برای انتخاب دستی، ابتدا پراب خودکار را خاموش کنید."))
         else:
             self.pick_hint.setText(
-                "روی هر استراتژی کلیک کنید تا به‌صورت دستی انتخاب/قفل شود.")
+                tr("روی هر استراتژی کلیک کنید تا به‌صورت دستی انتخاب/قفل شود."))
 
     def _on_autoprobe_toggled(self, enabled: bool) -> None:
         self._sync_autoprobe_label(enabled)
@@ -1150,9 +1158,9 @@ class StrategyPage(QWidget):
         row = QHBoxLayout()
         col = QVBoxLayout()
         col.setSpacing(2)
-        nm = QLabel(name)
+        nm = QLabel(tr(name))
         nm.setObjectName("H2")
-        ds = QLabel(desc)
+        ds = QLabel(tr(desc))
         ds.setObjectName("Faint")
         col.addWidget(nm)
         col.addWidget(ds)
@@ -1193,7 +1201,7 @@ class StrategyPage(QWidget):
             is_sel = (not auto) and (key == self._selected)
             card.setProperty("selected", is_sel)
             if hasattr(card, "_check_label"):
-                card._check_label.setText("✓ انتخاب‌شده" if is_sel else "")
+                card._check_label.setText(tr("✓ انتخاب‌شده") if is_sel else "")
             # re-polish so the [selected="true"] QSS applies immediately
             card.style().unpolish(card)
             card.style().polish(card)
@@ -1220,9 +1228,9 @@ class DiagnosticsPage(QWidget):
         # --- summary card: active strategy + status ---
         summary = Card()
         sb = summary.body()
-        self.lbl_active = QLabel("استراتژی فعال: —")
+        self.lbl_active = QLabel(tr("استراتژی فعال: —"))
         self.lbl_active.setObjectName("H2")
-        self.lbl_status = QLabel("وضعیت: بی‌کار")
+        self.lbl_status = QLabel(tr("وضعیت: بی‌کار"))
         self.lbl_status.setObjectName("Faint")
         sb.addWidget(self.lbl_active)
         sb.addWidget(self.lbl_status)
@@ -1231,7 +1239,7 @@ class DiagnosticsPage(QWidget):
         # --- throughput / throttle card ---
         tp = Card()
         tb = tp.body()
-        h = QLabel("توان عبوری (throughput)")
+        h = QLabel(tr("توان عبوری (throughput)"))
         h.setObjectName("H2")
         tb.addWidget(h)
         # a plain-language explanation so the user knows exactly what this
@@ -1239,31 +1247,31 @@ class DiagnosticsPage(QWidget):
         # هیچ کاری نمی‌کنه"). Throughput = how many bytes/sec are flowing right
         # now; the bar compares that to the connection's own baseline to flag
         # active throttling by the censor.
-        self.lbl_tp_help = QLabel(
+        self.lbl_tp_help = QLabel(tr(
             "سرعت لحظه‌ای عبور داده از تونل را نشان می‌دهد. نوار، سرعت فعلی را با "
             "«خط پایه‌ی» همین اتصال مقایسه می‌کند تا اگر سانسورچی سرعت را خفه کرد "
             "(throttle) معلوم شود. تا وقتی متصل نشده‌اید یا ترافیکی رد و بدل نشده، "
-            "داده‌ای برای نمایش نیست.")
+            "داده‌ای برای نمایش نیست."))
         self.lbl_tp_help.setObjectName("Faint")
         self.lbl_tp_help.setWordWrap(True)
         tb.addWidget(self.lbl_tp_help)
         # live current throughput (always shown while connected, even before a
         # baseline exists — this is the "it does nothing" fix)
-        self.lbl_tp_live = QLabel("سرعت فعلی: —")
+        self.lbl_tp_live = QLabel(tr("سرعت فعلی: —"))
         self.lbl_tp_live.setObjectName("H2")
         tb.addWidget(self.lbl_tp_live)
         self.bar_tp = QProgressBar()
         self.bar_tp.setRange(0, 100)
         self.bar_tp.setTextVisible(False)
         tb.addWidget(self.bar_tp)
-        self.lbl_tp = QLabel("بدون داده")
+        self.lbl_tp = QLabel(tr("بدون داده"))
         self.lbl_tp.setObjectName("Faint")
         self.lbl_tp.setWordWrap(True)
         tb.addWidget(self.lbl_tp)
-        self.lbl_rst = QLabel("RST جعلی: —")
+        self.lbl_rst = QLabel(tr("RST جعلی: —"))
         self.lbl_rst.setObjectName("Faint")
         tb.addWidget(self.lbl_rst)
-        self.lbl_chain = QLabel("زنجیره‌ی fallback: —")
+        self.lbl_chain = QLabel(tr("زنجیره‌ی fallback: —"))
         self.lbl_chain.setObjectName("Faint")
         self.lbl_chain.setWordWrap(True)
         tb.addWidget(self.lbl_chain)
@@ -1272,7 +1280,7 @@ class DiagnosticsPage(QWidget):
         # --- candidate health table card ---
         cand = Card()
         cb = cand.body()
-        ch = QLabel("کاندیداها (probe)")
+        ch = QLabel(tr("کاندیداها (probe)"))
         ch.setObjectName("H2")
         cb.addWidget(ch)
         self.tbl = QPlainTextEdit()
@@ -1317,20 +1325,20 @@ class DiagnosticsPage(QWidget):
 
     def _render(self, snap) -> None:
         self.lbl_active.setText(
-            f"استراتژی فعال: {snap.active_strategy or '—'}")
-        st = self._STATUS_FA.get(snap.status, snap.status)
-        port = f" · پورت {snap.spoof_port}" if snap.spoof_port else ""
-        self.lbl_status.setText(f"وضعیت: {st}{port}")
+            tr("استراتژی فعال: {s}").format(s=snap.active_strategy or '—'))
+        st = tr(self._STATUS_FA.get(snap.status, snap.status))
+        port = tr(" · پورت {p}").format(p=snap.spoof_port) if snap.spoof_port else ""
+        self.lbl_status.setText(tr("وضعیت: {st}{port}").format(st=st, port=port))
 
         # live current throughput — always shown so the card never looks dead
         # while connected (the "هیچ کاری نمی‌کند" complaint, #4).
         if snap.recent_bps > 0:
             self.lbl_tp_live.setText(
-                f"سرعت فعلی: {self._fmt_bps(snap.recent_bps)}")
+                tr("سرعت فعلی: {v}").format(v=self._fmt_bps(snap.recent_bps)))
         elif snap.status == "active":
-            self.lbl_tp_live.setText("سرعت فعلی: در انتظار ترافیک…")
+            self.lbl_tp_live.setText(tr("سرعت فعلی: در انتظار ترافیک…"))
         else:
-            self.lbl_tp_live.setText("سرعت فعلی: — (متصل نیست)")
+            self.lbl_tp_live.setText(tr("سرعت فعلی: — (متصل نیست)"))
 
         # throughput bar = recent/baseline ratio (clamped to 100%). The
         # baseline is the best sustained speed this connection has reached;
@@ -1339,28 +1347,31 @@ class DiagnosticsPage(QWidget):
         if snap.baseline_bps > 0:
             pct = max(0, min(100, int(ratio * 100)))
             self.bar_tp.setValue(pct)
-            tag = "  ⚠ احتمال throttle!" if snap.throttled else ""
+            tag = tr("  ⚠ احتمال throttle!") if snap.throttled else ""
             self.lbl_tp.setText(
-                f"{pct}% از خط پایه — {self._fmt_bps(snap.recent_bps)} از "
-                f"{self._fmt_bps(snap.baseline_bps)}{tag}")
+                tr("{pct}% از خط پایه — {recent} از {base}{tag}").format(
+                    pct=pct, recent=self._fmt_bps(snap.recent_bps),
+                    base=self._fmt_bps(snap.baseline_bps), tag=tag))
         elif snap.status == "active":
             self.bar_tp.setValue(0)
             self.lbl_tp.setText(
-                "در حال ساختن خط پایه… (برای سنجش throttle کمی ترافیک لازم است)")
+                tr("در حال ساختن خط پایه… (برای سنجش throttle کمی ترافیک لازم است)"))
         else:
             self.bar_tp.setValue(0)
-            self.lbl_tp.setText("بدون داده — پس از اتصال و عبور ترافیک پر می‌شود")
+            self.lbl_tp.setText(tr("بدون داده — پس از اتصال و عبور ترافیک پر می‌شود"))
 
         if snap.resilience_on:
             self.lbl_rst.setText(
-                f"RST جعلی: {snap.forged_rst_count} / بودجه {snap.rst_budget}")
+                tr("RST جعلی: {n} / بودجه {b}").format(
+                    n=snap.forged_rst_count, b=snap.rst_budget))
             chain = " → ".join(snap.strategy_chain) or "—"
             ips = " → ".join(snap.ip_chain) or "—"
             self.lbl_chain.setText(
-                f"زنجیره‌ی استراتژی: {chain}\nزنجیره‌ی IP: {ips}")
+                tr("زنجیره‌ی استراتژی: {chain}\nزنجیره‌ی IP: {ips}").format(
+                    chain=chain, ips=ips))
         else:
-            self.lbl_rst.setText("تاب‌آوری غیرفعال است")
-            self.lbl_chain.setText("زنجیره‌ی fallback: —")
+            self.lbl_rst.setText(tr("تاب‌آوری غیرفعال است"))
+            self.lbl_chain.setText(tr("زنجیره‌ی fallback: —"))
 
         self.tbl.setPlainText(self._candidate_table(snap))
 
@@ -1375,8 +1386,8 @@ class DiagnosticsPage(QWidget):
     @staticmethod
     def _candidate_table(snap) -> str:
         if not snap.has_probe_data:
-            return "هنوز probe انجام نشده — هنگام اتصال با «پراب خودکار» پر می‌شود."
-        lines = [f"{'استراتژی':<22}{'امتیاز':>8}{'موفقیت':>9}{'نمونه':>7}  وضعیت"]
+            return tr("هنوز probe انجام نشده — هنگام اتصال با «پراب خودکار» پر می‌شود.")
+        lines = [f"{tr('استراتژی'):<22}{tr('امتیاز'):>8}{tr('موفقیت'):>9}{tr('نمونه'):>7}  {tr('وضعیت')}"]
         for c in snap.candidates:
             mark = "★ " if c.selected else "  "
             lines.append(
@@ -1409,6 +1420,11 @@ class LogPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._buffer = LogBuffer(capacity=2000)
+        # theme-dependent text colours (#4): default to the dark palette; the
+        # host calls set_palette() so the log message + timestamp are always
+        # readable — never white-on-white in the light theme.
+        self._msg_color = "#d8e2ec"
+        self._stamp_color = "#5b6b7b"
 
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
@@ -1426,13 +1442,13 @@ class LogPage(QWidget):
         self.cmb_level = NoScrollComboBox()
         self.cmb_level.setObjectName("LogFilter")
         for lv in ("all",) + LEVELS:
-            self.cmb_level.addItem(self._LEVEL_FA.get(lv, lv), lv)
+            self.cmb_level.addItem(tr(self._LEVEL_FA.get(lv, lv)), lv)
         self.cmb_level.currentIndexChanged.connect(self._rerender)
         bar.addWidget(self.cmb_level)
 
         self.search = QLineEdit()
         self.search.setObjectName("LogSearch")
-        self.search.setPlaceholderText("جستجو در لاگ…")
+        self.search.setPlaceholderText(tr("جستجو در لاگ…"))
         self.search.textChanged.connect(self._rerender)
         bar.addWidget(self.search, 1)
 
@@ -1449,7 +1465,7 @@ class LogPage(QWidget):
 
         clr = QHBoxLayout()
         clr.addStretch(1)
-        self.btn_clear = QPushButton("پاک‌سازی")
+        self.btn_clear = QPushButton(tr("پاک‌سازی"))
         self.btn_clear.setObjectName("Ghost")
         self.btn_clear.clicked.connect(self.clear)
         clr.addWidget(self.btn_clear)
@@ -1458,12 +1474,12 @@ class LogPage(QWidget):
         root.addWidget(card, 1)
 
         # seed lines so the page never looks empty
-        self.append("SNI Spoofer UI بارگذاری شد")
-        self.append("منتظر شروع تونل…")
+        self.append(tr("SNI Spoofer UI بارگذاری شد"))
+        self.append(tr("منتظر شروع تونل…"))
 
     # -- helpers ----------------------------------------------------------
     def _field_label(self, t: str) -> QLabel:
-        lbl = QLabel(t)
+        lbl = QLabel(tr(t))
         lbl.setObjectName("Muted")
         return lbl
 
@@ -1476,10 +1492,16 @@ class LogPage(QWidget):
         # escape minimal HTML so messages can't break the markup
         msg = (entry.message.replace("&", "&amp;")
                             .replace("<", "&lt;").replace(">", "&gt;"))
-        return (f'<span style="color:#5b6b7b">[{entry.stamp}]</span> '
+        return (f'<span style="color:{self._stamp_color}">[{entry.stamp}]</span> '
                 f'<span style="color:{color};font-weight:600">'
                 f'{entry.level.upper():<4}</span> '
-                f'<span style="color:#d8e2ec">{msg}</span>')
+                f'<span style="color:{self._msg_color}">{msg}</span>')
+
+    def set_palette(self, palette) -> None:
+        """Adopt the active theme's text/timestamp colours and re-render (#4)."""
+        self._msg_color = palette.text
+        self._stamp_color = palette.text_faint
+        self._rerender()
 
     def _update_counters(self) -> None:
         c = self._buffer.counts
@@ -1529,6 +1551,14 @@ class MainWindow(QWidget):
         # --- core: persistent store + engine bridge ---
         self.store = ConfigStore()
         self._theme = theme or self.store.get("theme", "dark")
+        # --- language (#6): restore persisted choice and apply it before any
+        # widget text is built, so tr() returns the right language everywhere.
+        from ui import i18n
+        lang = str(self.store.get("language", "fa"))
+        if lang not in ("fa", "en"):
+            lang = "fa"
+        # set the module language directly (no observers yet)
+        i18n._lang = lang
         self.engine = EngineBridge(EngineController(self.store.config))
         self.engine.set_profile(self.store.selected_profile)
 
@@ -1566,6 +1596,7 @@ class MainWindow(QWidget):
         self.title_bar.minimize_clicked.connect(self.showMinimized)
         self.title_bar.close_clicked.connect(self.close)
         self.title_bar.theme_toggled.connect(self.toggle_theme)
+        self.title_bar.language_toggled.connect(self.toggle_language)
         outer.addWidget(self.title_bar)
 
         # --- persistent active-config status bar (visible on every tab, #9) ---
@@ -1646,9 +1677,11 @@ class MainWindow(QWidget):
             self.store.get("bypass_method", "wrong_seq"))
         sel = self.store.selected_profile
         if sel:
-            self.page_log.append(f"[init] پروفایل فعال: {sel.display_name}")
+            self.page_log.append(
+                "[init] " + tr("پروفایل فعال: {name}").format(name=sel.display_name))
         else:
-            self.page_log.append("[init] پروفایلی انتخاب نشده — حالت SNI Only")
+            self.page_log.append(
+                "[init] " + tr("پروفایلی انتخاب نشده — حالت SNI Only"))
 
     def _on_power(self, action: str):
         if action == "start":
@@ -1658,7 +1691,7 @@ class MainWindow(QWidget):
             if (self.store.get("connection_mode") != "SNI Only"
                     and self.store.selected_profile is None):
                 Toast.show_message(
-                    self, "ابتدا یک پروفایل وارد و انتخاب کنید", "warn")
+                    self, tr("ابتدا یک پروفایل وارد و انتخاب کنید"), "warn")
                 self.page_dashboard.set_status("idle")
                 return
             self.engine.start()
@@ -1667,14 +1700,14 @@ class MainWindow(QWidget):
 
     def _on_status(self, status: str):
         if status == "active":
-            Toast.show_message(self, "اتصال برقرار شد — spoofing فعال", "ok")
+            Toast.show_message(self, tr("اتصال برقرار شد — spoofing فعال"), "ok")
             self._resilience_timer.start()
             self._pump_resilience()
         elif status == "idle":
-            Toast.show_message(self, "اتصال قطع شد", "warn")
+            Toast.show_message(self, tr("اتصال قطع شد"), "warn")
             self._resilience_timer.stop()
         elif status == "error":
-            Toast.show_message(self, "خطا در اتصال — لاگ را ببینید", "err")
+            Toast.show_message(self, tr("خطا در اتصال — لاگ را ببینید"), "err")
             self._resilience_timer.stop()
 
     def _pump_resilience(self):
@@ -1684,23 +1717,51 @@ class MainWindow(QWidget):
         except Exception:
             return
         if not getattr(snap, "resilience_on", False):
-            self.page_dashboard.set_resilience("غیرفعال")
+            self.page_dashboard.set_resilience(tr("غیرفعال"))
             return
         chain = " → ".join(snap.strategy_chain) or (snap.active_strategy or "—")
         throttle = " · throttle!" if snap.throttled else ""
         self.page_dashboard.set_resilience(
-            f"RST {snap.forged_rst_count}/{snap.rst_budget} · "
-            f"زنجیره {chain}{throttle}")
+            tr("RST {n}/{b} · زنجیره {chain}{throttle}").format(
+                n=snap.forged_rst_count, b=snap.rst_budget,
+                chain=chain, throttle=throttle))
 
     def _on_strategy_changed(self, method: str):
-        self.page_log.append(f"[strategy] استراتژی فعال: {method}")
+        self.page_log.append(
+            "[strategy] " + tr("استراتژی فعال: {m}").format(m=method))
 
     def _on_profile_selected(self, profile):
+        # #2: if the engine is already running when the user activates a
+        # different server, transparently restart it on the new profile so the
+        # switch takes effect immediately — no manual stop/start needed.
+        was_running = False
+        try:
+            was_running = self.engine.is_running()
+        except Exception:
+            was_running = False
+
         self.engine.set_profile(profile)
         # keep the persistent status bar in sync with the active server (#9)
         self.active_bar.set_profile(profile)
+
+        if was_running:
+            self.page_log.append(
+                "[profile] " + tr("راه‌اندازی مجدد خودکار برای اعمال سرور جدید…"))
+            try:
+                self.engine.stop()
+            except Exception:
+                pass
+            # small delay so sockets/proxy settings unwind before re-start
+            QTimer.singleShot(450, self.engine.start)
+            try:
+                Toast.show_message(
+                    self, tr("سرور جدید فعال شد — اتصال بازنشانی شد"), "ok")
+            except Exception:
+                pass
+
         if profile:
-            self.page_log.append(f"[profile] انتخاب شد: {profile.display_name}")
+            self.page_log.append(
+                "[profile] " + tr("انتخاب شد: {name}").format(name=profile.display_name))
             # auto-switch to Tunnel so the VLESS/VMess/Trojan config is actually
             # used: in "SNI Only" the profile is ignored (the "still need
             # V2RayTun" bug). Only nudge when the user is on the no-core default.
@@ -1713,10 +1774,9 @@ class MainWindow(QWidget):
                     self.page_settings.set_mode("Tunnel")
                 self.page_dashboard.set_mode("Tunnel")
                 self.page_log.append(
-                    "[mode] حالت به «Tunnel» تغییر کرد تا کانفیگ انتخاب‌شده "
-                    "واقعاً استفاده شود")
+                    "[mode] " + tr("حالت به «Tunnel» تغییر کرد تا کانفیگ انتخاب‌شده واقعاً استفاده شود"))
                 Toast.show_message(
-                    self, "حالت به «Tunnel» تغییر کرد (برای استفاده از کانفیگ)",
+                    self, tr("حالت به «Tunnel» تغییر کرد (برای استفاده از کانفیگ)"),
                     "ok")
 
     def _on_auto_prober_changed(self, enabled: bool):
@@ -1724,9 +1784,10 @@ class MainWindow(QWidget):
         self.store.save_config()
         self.engine.update_config(self.store.config)
         self.page_log.append(
-            f"[auto-prober] {'فعال شد' if enabled else 'غیرفعال شد'}")
+            "[auto-prober] " + (tr("فعال شد") if enabled else tr("غیرفعال شد")))
         Toast.show_message(
-            self, "پراب خودکار فعال شد" if enabled else "پراب خودکار غیرفعال شد",
+            self,
+            tr("پراب خودکار فعال شد") if enabled else tr("پراب خودکار غیرفعال شد"),
             "ok")
 
     def _on_strategy_selected(self, key: str):
@@ -1736,8 +1797,10 @@ class MainWindow(QWidget):
         self.engine.update_config(self.store.config)
         # find the human-readable name for the toast/log
         name = next((n for k, n, _ in STRATEGIES if k == key), key)
-        self.page_log.append(f"[strategy] انتخاب دستی: {name} ({key})")
-        Toast.show_message(self, f"استراتژی انتخاب شد: {name}", "ok")
+        self.page_log.append(
+            "[strategy] " + tr("انتخاب دستی: {name} ({key})").format(name=name, key=key))
+        Toast.show_message(
+            self, tr("استراتژی انتخاب شد: {name}").format(name=name), "ok")
 
     def _save_settings(self):
         self.store.update(**self.page_settings.collect())
@@ -1745,7 +1808,7 @@ class MainWindow(QWidget):
         self.engine.update_config(self.store.config)
         self.page_dashboard.set_mode(
             self.store.get("connection_mode", "Tunnel"))
-        Toast.show_message(self, "تنظیمات ذخیره شد", "ok")
+        Toast.show_message(self, tr("تنظیمات ذخیره شد"), "ok")
 
     def _on_page_changed(self, index: int):
         current = self.stack.widget(index)
@@ -1779,7 +1842,7 @@ class MainWindow(QWidget):
             ("لاگ", "\u2261"),         # identical-to (log lines)
         ]
         for idx, (text, icon) in enumerate(items):
-            btn = NavItem(text, icon)
+            btn = NavItem(tr(text), icon)
             btn.clicked.connect(lambda _=False, i=idx: self.stack.setCurrentIndex(i))
             self.nav_group.addButton(btn, idx)
             lay.addWidget(btn)
@@ -1799,6 +1862,17 @@ class MainWindow(QWidget):
         self.setStyleSheet(build_qss(palette))
         # propagate the palette to widgets that paint inline (not via QSS)
         self.page_dashboard.set_palette(palette)
+        # log console text must follow the theme so it's never white-on-white (#4)
+        if hasattr(self, "page_log"):
+            self.page_log.set_palette(palette)
+        # re-tint every Card's drop shadow so the light theme gets a soft, clean
+        # shadow instead of the heavy near-black one (#4)
+        from ui.widgets import Card as _Card
+        for card in self.findChildren(_Card):
+            try:
+                card.tune_shadow_for(palette.is_dark)
+            except Exception:
+                pass
         # recolour the living wave backdrop (accent → secondary gaming accent)
         accent2 = ACCENT2_DARK if palette.is_dark else ACCENT2_LIGHT
         self.wave_bg.set_palette(palette.accent, accent2)
@@ -1816,6 +1890,42 @@ class MainWindow(QWidget):
         self._apply_theme()
         self.store.set("theme", self._theme)
         self.store.save_config()
+
+    def toggle_language(self):
+        """Switch FA⇄EN and rebuild the window so every label retranslates (#6).
+
+        A full in-place retranslate of hundreds of widgets is brittle; instead
+        we persist the new language and recreate MainWindow (fast, < a few ms),
+        carrying over the live theme + layout direction. The engine is stopped
+        cleanly first so no socket/proxy state leaks across the rebuild.
+        """
+        from ui import i18n
+        new_lang = "en" if i18n.language() == "fa" else "fa"
+        i18n.set_language(new_lang)
+        self.store.set("language", new_lang)
+        self.store.save_config()
+        # stop the engine cleanly before tearing the window down
+        try:
+            self.engine.stop()
+        except Exception:
+            pass
+        app = QApplication.instance()
+        if app is not None:
+            from PySide6.QtCore import Qt as _Qt
+            app.setLayoutDirection(
+                _Qt.RightToLeft if new_lang == "fa" else _Qt.LeftToRight)
+        # build the replacement window, then close this one
+        geo = self.geometry()
+        new_win = MainWindow(theme=self._theme)
+        new_win.setGeometry(geo)
+        new_win.show()
+        # keep a reference so it isn't garbage-collected during the swap
+        if app is not None:
+            existing = getattr(app, "_sni_windows", [])
+            existing.append(new_win)
+            app._sni_windows = existing
+        self._is_rebuilding = True
+        self.close()
 
     def resizeEvent(self, event):
         # keep the wave backdrop filling the whole window behind the content
