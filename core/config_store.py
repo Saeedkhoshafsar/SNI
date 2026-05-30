@@ -138,8 +138,15 @@ class ConfigStore:
 
     # -- mutation helpers (each persists immediately) ---------------------
 
-    def add_profile(self, profile: Profile, *, select: bool = True) -> int:
-        """Append a profile, optionally selecting it. Returns its index."""
+    def add_profile(self, profile: Profile, *, select: bool = False) -> int:
+        """Append a profile. Returns its index.
+
+        By default a freshly-added profile does **not** steal the active
+        selection (#1): if a server is already active it stays active, so
+        adding new configs never silently switches the engine target. The
+        very first profile (when nothing is selected yet) is auto-selected so
+        the app is never left with profiles but no active one.
+        """
         self.profiles.append(profile)
         idx = len(self.profiles) - 1
         if select or self.selected_index < 0:
@@ -148,7 +155,13 @@ class ConfigStore:
         return idx
 
     def add_profiles(self, profiles: list[Profile]) -> int:
-        """Append several profiles. Returns how many were added."""
+        """Append several profiles. Returns how many were added.
+
+        Like :meth:`add_profile`, the active selection is preserved (#1) —
+        only when nothing is selected yet does the first new profile become
+        active, so the user's currently-running server is never replaced by a
+        bulk import.
+        """
         if not profiles:
             return 0
         first_new = len(self.profiles)

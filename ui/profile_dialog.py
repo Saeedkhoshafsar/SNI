@@ -20,6 +20,12 @@ from PySide6.QtWidgets import (
 
 from core.profile import Profile, PROTOCOLS, TRANSPORTS, SECURITIES
 from ui.widgets import NoScrollComboBox, NoScrollSpinBox
+from ui.i18n import tr
+
+# Quick-fill defaults for the local spoofer endpoint (#5). One click drops
+# these into the address/port for users who don't know what to type.
+LOCAL_HOST = "127.0.0.1"
+LOCAL_PORT = 40443
 
 
 # Fields shown per section. Each entry: (attr, label, widget-kind).
@@ -71,10 +77,10 @@ class ProfileDialog(QDialog):
         root.setContentsMargins(20, 18, 20, 16)
         root.setSpacing(12)
 
-        head = QLabel(title)
+        head = QLabel(tr(title))
         head.setObjectName("H1")
         root.addWidget(head)
-        hint = QLabel("مقادیر از روی لینک پر شده‌اند — در صورت نیاز ویرایش کنید")
+        hint = QLabel(tr("مقادیر از روی لینک پر شده‌اند — در صورت نیاز ویرایش کنید"))
         hint.setObjectName("Muted")
         root.addWidget(hint)
 
@@ -94,13 +100,13 @@ class ProfileDialog(QDialog):
             ("ترنسپورت", _TRANSPORT),
             ("امنیت / TLS", _SECURITY),
         ):
-            sec = QLabel(section)
+            sec = QLabel(tr(section))
             sec.setObjectName("H2")
             form.addRow(sec)
             for attr, label, kind in fields:
                 w = self._make_widget(attr, kind)
                 self._widgets[attr] = w
-                form.addRow(label, w)
+                form.addRow(tr(label), w)
 
         scroll.setWidget(inner)
         root.addWidget(scroll, 1)
@@ -114,15 +120,24 @@ class ProfileDialog(QDialog):
 
         # buttons
         btns = QHBoxLayout()
+        # #5: one-click "use local endpoint" — fills 127.0.0.1 / 40443 for
+        # less-technical users. Placed next to the action buttons (the user
+        # said this spot is the least ambiguous) with a clear label + tooltip.
+        self.btn_local = QPushButton(tr("محلی (127.0.0.1)"))
+        self.btn_local.setObjectName("Ghost")
+        self.btn_local.setToolTip(
+            f"آدرس سرور = {LOCAL_HOST} و پورت = {LOCAL_PORT} را خودکار پر می‌کند")
+        btns.addWidget(self.btn_local)
         btns.addStretch(1)
-        self.btn_cancel = QPushButton("انصراف")
+        self.btn_cancel = QPushButton(tr("انصراف"))
         self.btn_cancel.setObjectName("Ghost")
-        self.btn_ok = QPushButton("افزودن")
+        self.btn_ok = QPushButton(tr("افزودن"))
         self.btn_ok.setObjectName("Primary")
         btns.addWidget(self.btn_cancel)
         btns.addWidget(self.btn_ok)
         root.addLayout(btns)
 
+        self.btn_local.clicked.connect(self._fill_local)
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_ok.clicked.connect(self._on_accept)
 
@@ -174,6 +189,17 @@ class ProfileDialog(QDialog):
             else:
                 data[attr] = w.text().strip()
         return Profile.from_dict(data)
+
+    # ------------------------------------------------------------------ #5 quick-fill
+    def _fill_local(self) -> None:
+        """Drop the local spoofer endpoint (127.0.0.1:40443) into the form."""
+        addr = self._widgets.get("address")
+        port = self._widgets.get("port")
+        if isinstance(addr, QLineEdit):
+            addr.setText(LOCAL_HOST)
+        if isinstance(port, QSpinBox):
+            port.setValue(LOCAL_PORT)
+        self._err.setText(tr("آدرس/پورت محلی پر شد"))
 
     # ------------------------------------------------------------------ accept
     def _on_accept(self) -> None:

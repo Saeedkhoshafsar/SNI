@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from ui.i18n import tr
+
 
 # ---------------------------------------------------------------------------
 #  Scroll-safe numeric / combo inputs
@@ -68,15 +70,27 @@ class NoScrollComboBox(_NoWheelMixin, QComboBox):
 # ---------------------------------------------------------------------------
 
 class Card(QFrame):
-    """A rounded translucent panel with a soft drop shadow."""
+    """A rounded panel with a soft, *theme-aware* drop shadow.
+
+    The shadow is intentionally subtle (#4): a heavy near-black shadow looked
+    fine on dark surfaces but cheap/dirty on the light theme. Default values
+    are tuned for the dark theme; :meth:`tune_shadow_for` (or the host's
+    theme walk) softens and re-tints them for light.
+    """
+
+    # baseline shadow per theme: (rgba, blur, y-offset)
+    _SHADOW_DARK = ("rgba(0,0,0,0.40)", 26, 6)
+    _SHADOW_LIGHT = ("rgba(20,40,60,0.12)", 22, 4)
 
     def __init__(self, parent: QWidget | None = None, *, object_name: str = "Card",
-                 shadow_color: str = "rgba(0,0,0,0.55)", blur: int = 34,
-                 y_offset: int = 10):
+                 shadow_color: str | None = None, blur: int | None = None,
+                 y_offset: int | None = None):
         super().__init__(parent)
         self.setObjectName(object_name)
         self.setProperty("class", "Card")
-        self._apply_shadow(shadow_color, blur, y_offset)
+        c, b, y = self._SHADOW_DARK
+        self._apply_shadow(shadow_color or c, blur if blur is not None else b,
+                           y_offset if y_offset is not None else y)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 16, 18, 16)
         lay.setSpacing(10)
@@ -92,6 +106,11 @@ class Card(QFrame):
         eff.setColor(_qcolor_from_rgba(color))
         self.setGraphicsEffect(eff)
         self._shadow = eff
+
+    def tune_shadow_for(self, is_dark: bool) -> None:
+        """Re-tint/soften the shadow for the active theme (#4)."""
+        color, blur, y = self._SHADOW_DARK if is_dark else self._SHADOW_LIGHT
+        self.set_shadow(blur=blur, y=y, color=color)
 
     def set_shadow(self, *, blur: int | None = None, y: int | None = None,
                    color: str | None = None) -> None:
@@ -129,6 +148,7 @@ class TitleBar(QFrame):
     minimize_clicked = Signal()
     close_clicked = Signal()
     theme_toggled = Signal()
+    language_toggled = Signal()
 
     def __init__(self, parent: QWidget, title: str = "SNI Spoofer"):
         super().__init__(parent)
@@ -150,16 +170,28 @@ class TitleBar(QFrame):
         lay.addWidget(self.title)
         lay.addStretch(1)
 
+        # language toggle (FA/EN) — #6. Shows the language you'll switch TO.
+        from ui.i18n import language
+        self.btn_lang = self._win_btn(
+            "EN" if language() == "fa" else "FA", "WinBtn")
+        self.btn_lang.setFixedSize(38, 30)
+        self.btn_lang.setToolTip("Language / زبان")
         self.btn_theme = self._win_btn("\u25d1", "WinBtn")   # half-moon
         self.btn_min = self._win_btn("\u2013", "WinBtn")     # en-dash
         self.btn_close = self._win_btn("\u2715", "WinClose") # multiply
 
+        self.btn_lang.clicked.connect(self.language_toggled.emit)
         self.btn_theme.clicked.connect(self.theme_toggled.emit)
         self.btn_min.clicked.connect(self.minimize_clicked.emit)
         self.btn_close.clicked.connect(self.close_clicked.emit)
 
-        for b in (self.btn_theme, self.btn_min, self.btn_close):
+        for b in (self.btn_lang, self.btn_theme, self.btn_min, self.btn_close):
             lay.addWidget(b)
+
+    def update_lang_label(self) -> None:
+        """Refresh the FA/EN button to show the *other* language."""
+        from ui.i18n import language
+        self.btn_lang.setText("EN" if language() == "fa" else "FA")
 
     def _win_btn(self, glyph: str, obj: str) -> QPushButton:
         b = QPushButton(glyph)
@@ -276,7 +308,7 @@ class ProfileRow(QFrame):
         name.setMinimumWidth(0)
         top.addWidget(name, 1)
         if active:
-            pill = QLabel("\u25cf فعال")
+            pill = QLabel(tr("\u25cf فعال"))
             pill.setObjectName("ActivePill")
             top.addWidget(pill, 0, Qt.AlignVCenter)
         col.addLayout(top)
@@ -313,7 +345,7 @@ class ProfileRow(QFrame):
         self.btn_ping.setObjectName("RowPing")
         self.btn_ping.setCursor(Qt.PointingHandCursor)
         self.btn_ping.setFixedSize(28, 28)
-        self.btn_ping.setToolTip("پینگ این سرور")
+        self.btn_ping.setToolTip(tr("پینگ این سرور"))
         self.btn_ping.clicked.connect(self.ping.emit)
         lay.addWidget(self.btn_ping, 0, Qt.AlignVCenter)
 
@@ -323,7 +355,7 @@ class ProfileRow(QFrame):
         self.btn_use.setObjectName("RowUse")
         self.btn_use.setCursor(Qt.PointingHandCursor)
         self.btn_use.setFixedSize(28, 28)
-        self.btn_use.setToolTip("فعال‌سازی این سرور")
+        self.btn_use.setToolTip(tr("فعال‌سازی این سرور"))
         self.btn_use.clicked.connect(self.activate.emit)
         self.btn_use.setVisible(not active)
         lay.addWidget(self.btn_use, 0, Qt.AlignVCenter)
@@ -333,7 +365,7 @@ class ProfileRow(QFrame):
         self.btn_edit.setObjectName("RowEdit")
         self.btn_edit.setCursor(Qt.PointingHandCursor)
         self.btn_edit.setFixedSize(28, 28)
-        self.btn_edit.setToolTip("ویرایش این پروفایل")
+        self.btn_edit.setToolTip(tr("ویرایش این پروفایل"))
         self.btn_edit.clicked.connect(self.edit.emit)
         lay.addWidget(self.btn_edit, 0, Qt.AlignVCenter)
 
@@ -355,7 +387,7 @@ class ProfileRow(QFrame):
 
     def set_pinging(self) -> None:
         self.btn_ping.setEnabled(False)
-        self.set_ping_state("در حال پینگ…", "busy")
+        self.set_ping_state(tr("در حال پینگ…"), "busy")
 
     def set_ping_idle(self) -> None:
         self.btn_ping.setEnabled(True)
@@ -404,7 +436,7 @@ class ActiveConfigBar(QFrame):
         self._dot = QLabel("\u25cf")
         self._dot.setObjectName("ActiveBarDot")
         self._dot.setProperty("state", "idle")
-        self._state = QLabel(self._STATE_FA["idle"])
+        self._state = QLabel(tr(self._STATE_FA["idle"]))
         self._state.setObjectName("ActiveBarState")
         lay.addWidget(self._dot)
         lay.addWidget(self._state)
@@ -413,7 +445,7 @@ class ActiveConfigBar(QFrame):
         sep.setObjectName("ActiveBarSep")
         lay.addWidget(sep)
 
-        self._name = QLabel("سروری انتخاب نشده")
+        self._name = QLabel(tr("سروری انتخاب نشده"))
         self._name.setObjectName("ActiveBarName")
         lay.addWidget(self._name)
 
@@ -427,9 +459,9 @@ class ActiveConfigBar(QFrame):
     def set_profile(self, profile) -> None:
         """Show the active profile's name + endpoint (or an empty hint)."""
         if profile is None:
-            self._name.setText("سروری انتخاب نشده — حالت SNI Only")
+            self._name.setText(tr("سروری انتخاب نشده — حالت SNI Only"))
             return
-        name = getattr(profile, "display_name", "") or "سرور"
+        name = getattr(profile, "display_name", "") or tr("سرور")
         if getattr(profile, "is_spoof_config", False):
             addr = (getattr(profile, "sni", "") or getattr(profile, "host", "")
                     or getattr(profile, "address", ""))
@@ -441,7 +473,7 @@ class ActiveConfigBar(QFrame):
 
     def set_status(self, state: str) -> None:
         self._dot.setProperty("state", state)
-        self._state.setText(self._STATE_FA.get(state, state))
+        self._state.setText(tr(self._STATE_FA.get(state, state)))
         # re-polish so the dot colour (driven by the dynamic property) updates
         self._dot.style().unpolish(self._dot)
         self._dot.style().polish(self._dot)
@@ -482,7 +514,7 @@ class PowerButton(QPushButton):
     }
 
     def __init__(self, palette, parent: QWidget | None = None):
-        super().__init__(self._LABELS["idle"], parent)
+        super().__init__(tr(self._LABELS["idle"]), parent)
         self.setObjectName("Power")
         self.setCursor(Qt.PointingHandCursor)
         self.setMinimumSize(150, 44)
@@ -506,7 +538,7 @@ class PowerButton(QPushButton):
             return
         prev = self._color
         self._state = state
-        self.setText(self._LABELS.get(state, "شروع"))
+        self.setText(tr(self._LABELS.get(state, "شروع")))
         self._ct.run(prev, self._target_color(state), self._on_frame)
 
     def state(self) -> str:

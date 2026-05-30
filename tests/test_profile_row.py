@@ -27,6 +27,13 @@ def setUpModule():
     global _app
     if _HAVE_QT:
         _app = QApplication.instance() or QApplication([])
+        # ensure a deterministic language regardless of test ordering / a
+        # MainWindow built earlier in the same process having flipped it (#6)
+        try:
+            from ui import i18n
+            i18n._lang = "fa"
+        except Exception:
+            pass
 
 
 def _texts(row):

@@ -202,12 +202,25 @@ class Target:
 
 
 def target_from_profile(profile) -> Target:
-    """Build a :class:`Target` from a :class:`core.profile.Profile`."""
+    """Build a :class:`Target` from a :class:`core.profile.Profile`.
+
+    For **SNI-spoof** configs the stored ``address`` is the *local* spoofer
+    (e.g. ``127.0.0.1:40443``), which only answers while the engine is running
+    — so pinging it offline always failed (#3). In that case we instead ping
+    the *real* CDN endpoint the spoofer fronts (its SNI / Host header on the
+    TLS port), so latency is measurable whether or not the tunnel is up.
+    """
     label = getattr(profile, "display_name", None) or "profile"
     if callable(label):  # display_name is a property, not a method, but be safe
         label = label()
     host = getattr(profile, "address", "") or ""
     port = int(getattr(profile, "port", 0) or 0)
+    if getattr(profile, "is_spoof_config", False):
+        real_host = (getattr(profile, "sni", "") or getattr(profile, "host", "")
+                     or host)
+        if real_host:
+            host = real_host
+            port = 443 if getattr(profile, "is_tls", False) else port
     return Target(label=str(label), host=host, port=port)
 
 
