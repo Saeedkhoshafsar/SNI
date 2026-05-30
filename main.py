@@ -200,8 +200,14 @@ class ProxyServer:
     async def _handle(self, incoming_sock: socket.socket, addr):
         self._update_conn_count(1)
         outgoing_sock = None
+        # per-connection diagnostics: a short tag so the user's log clearly
+        # shows the lifecycle of each spoofed connection (helps diagnose the
+        # "connects in V2RayTun but not in our app" class of problems).
+        cid = f"#{self._total_connections}"
         try:
             loop = asyncio.get_running_loop()
+            self._log(f"[conn {cid}] از xray رسید ({addr[0]}:{addr[1]}) → "
+                      f"اتصال به {self.connect_ip}:{self.connect_port}")
 
             fake_data = ClientHelloMaker.get_client_hello_with(
                 os.urandom(32), os.urandom(32), self.fake_sni, os.urandom(32))
@@ -223,11 +229,15 @@ class ProxyServer:
                     loop.sock_connect(outgoing_sock,
                                       (self.connect_ip, self.connect_port)),
                     timeout=10)
-            except Exception:
+            except Exception as exc:
                 fake_conn.monitor = False
                 self._fake_connections.pop(fake_conn.id, None)
-                self._log(f"Connect to {self.connect_ip}:{self.connect_port} failed")
+                self._log(f"[conn {cid}] اتصال به {self.connect_ip}:"
+                          f"{self.connect_port} ناموفق: {exc}", "error")
                 return
+
+            self._log(f"[conn {cid}] TCP وصل شد (مبدأ {self.interface_ipv4}:"
+                      f"{src_port}) — منتظر تأیید ClientHello جعلی…")
 
             # Random micro-jitter to defeat timing-based DPI fingerprinting
             await asyncio.sleep(random.uniform(0.001, 0.008))
@@ -237,22 +247,31 @@ class ProxyServer:
                 if fake_conn.t2a_msg == "unexpected_close":
                     raise ValueError("unexpected close")
                 if fake_conn.t2a_msg != "fake_data_ack_recv":
-                    self._log(f"Injector error: {fake_conn.t2a_msg}", "error")
+                    self._log(f"[conn {cid}] خطای تزریق‌کننده: "
+                              f"{fake_conn.t2a_msg}", "error")
                     return
-            except (asyncio.TimeoutError, ValueError):
-                self._log("Fake handshake failed or timed out")
+            except (asyncio.TimeoutError, ValueError) as exc:
+                self._log(f"[conn {cid}] دست‌دادن جعلی شکست/تایم‌اوت "
+                          f"({type(exc).__name__}: {fake_conn.t2a_msg or exc}) "
+                          f"— آیا WinDivert/درایور نصب و با دسترسی Admin اجرا "
+                          f"شده؟", "error")
                 return
             finally:
                 fake_conn.monitor = False
                 self._fake_connections.pop(fake_conn.id, None)
+
+            self._log(f"[conn {cid}] ✓ ClientHello جعلی تأیید شد — شروع رله")
 
             # Optimize the incoming socket too before relay
             self._configure_sock(incoming_sock, self.gaming_mode)
 
             # Bidirectional relay – clean shutdown, no recursion.
             # incoming = client, outgoing = upstream → up/down metering.
+            up0, down0 = self._up_bytes, self._down_bytes
             await _relay_pair(incoming_sock, outgoing_sock,
                               on_up=self._add_up, on_down=self._add_down)
+            self._log(f"[conn {cid}] رله پایان یافت "
+                      f"(↑{self._up_bytes - up0}B ↓{self._down_bytes - down0}B)")
 
         except asyncio.CancelledError:
             pass
