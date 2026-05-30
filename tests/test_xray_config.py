@@ -54,8 +54,30 @@ def test_vless_xhttp_outbound():
     assert xh["host"] == "worker.example.dev"
     assert xh["path"] == "/vless-xhttp"
     assert xh["mode"] == "auto"
+    # Cloudflare-Worker upload sizing — without these the stream drip-feeds a
+    # few KB/min (regression for the "works in HaPP/Hiddify but not in-app,
+    # data trickles" report). Defaults match what Hiddify/HaPP emit.
+    assert xh["scMaxConcurrentPosts"] == 10
+    assert xh["scMaxEachPostBytes"] == 1000000
+    assert xh["scMinPostsIntervalMs"] == 30
     # no stale tcp settings leaked in
     assert "tcpSettings" not in ss and "wsSettings" not in ss
+
+
+def test_xhttp_sc_params_overridable_via_extra():
+    """Share links / clients can carry custom sc* upload sizing in `extra`;
+    when present those win over our Worker-friendly defaults."""
+    from core.profile import Profile
+    p = Profile(
+        protocol="vless", address="127.0.0.1", port=40443, uuid="u",
+        transport="xhttp", security="tls", sni="h.example", host="h.example",
+        path="/x", mode="auto",
+        extra={"scMaxConcurrentPosts": 5, "scMaxEachPostBytes": 500000,
+               "scMinPostsIntervalMs": 50})
+    xh = build_outbound(p)["streamSettings"]["xhttpSettings"]
+    assert xh["scMaxConcurrentPosts"] == 5
+    assert xh["scMaxEachPostBytes"] == 500000
+    assert xh["scMinPostsIntervalMs"] == 50
 
 
 def test_splithttp_normalises_to_xhttp():

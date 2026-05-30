@@ -84,6 +84,29 @@ def _stream_settings(p: Profile, *, gaming: bool = False) -> dict[str, Any]:
             "path": p.path or "/",
             "mode": p.mode or "auto",
         }
+        # Cloudflare-Worker XHTTP needs explicit upload-stream sizing or it
+        # drip-feeds (a few KB/min) because xray's defaults don't chunk the
+        # POST uploads in a way the Worker accepts. These match the values
+        # Hiddify/HaPP/v2rayN emit for the same link and fix the stall.
+        # Honour any values carried in the share link's `extra`, else default.
+        ex = p.extra if isinstance(p.extra, dict) else {}
+
+        def _num(*keys, default):
+            for k in keys:
+                v = ex.get(k)
+                if v not in (None, "", 0):
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        pass
+            return default
+
+        xhttp["scMaxConcurrentPosts"] = _num(
+            "scMaxConcurrentPosts", "scmaxconcurrentposts", default=10)
+        xhttp["scMaxEachPostBytes"] = _num(
+            "scMaxEachPostBytes", "scmaxeachpostbytes", default=1000000)
+        xhttp["scMinPostsIntervalMs"] = _num(
+            "scMinPostsIntervalMs", "scminpostsintervalms", default=30)
         stream["xhttpSettings"] = xhttp
     elif net == "httpupgrade":
         stream["httpupgradeSettings"] = {

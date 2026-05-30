@@ -543,3 +543,19 @@ V2RayTun هنگام اتصال **پروکسی سیستم/TUN ویندوز** را
 3. کلید `self_test` (پیش‌فرض روشن) به config افزوده شد؛ در تست‌ها خنثی می‌شود تا کال شبکهٔ واقعی نزند.
 
 تست‌ها: ۶۲ سبز.
+
+## 🎯 بازخورد هشتم — ریشهٔ drip-feed: پارامترهای آپلود XHTTP گم بودند (2026-05-30)
+**یافتهٔ کاربر:** تونل ما (با self-test) ثابت شد کار می‌کند، اما ترافیک واقعی **قطره‌چکانی** بود: چند کیلوبایت هر دقیقه، بعد قطع. کاربر کانفیگ کاملِ کارآمد روی HaPP/Hiddify را فرستاد.
+
+### فرق قطعی با کانفیگ ما
+`xhttpSettings` در کانفیگ HaPP که کار می‌کند سه پارامتر داشت که کانفیگ ما **نداشت**:
+```json
+"scMaxConcurrentPosts": 10,
+"scMaxEachPostBytes": 1000000,
+"scMinPostsIntervalMs": 30
+```
+بدون این‌ها، xray از پیش‌فرض‌هایی برای تکه‌تکه‌کردن آپلودِ POST استفاده می‌کند که Cloudflare Worker نمی‌پذیرد → آپلود گیر می‌کند و فقط چند KB رد و بدل می‌شود (drip-feed). این دقیقاً همان الگوی «چند کیلوبایت هر دقیقه» بود.
+
+### رفع (core/xray_config.py)
+به سازندهٔ `xhttpSettings` سه پارامتر `scMaxConcurrentPosts` / `scMaxEachPostBytes` / `scMinPostsIntervalMs` اضافه شد، با پیش‌فرض‌های یکسان با Hiddify/HaPP (10 / 1000000 / 30). اگر share link مقادیر خودش را در `extra` داشته باشد، آن‌ها اولویت دارند.
+تست: `test_vless_xhttp_outbound` به‌روزرسانی + تست جدید `test_xhttp_sc_params_overridable_via_extra`. 24 تستِ xray_config سبز.
