@@ -176,6 +176,24 @@ class EngineControllerTest(unittest.TestCase):
         self.assertTrue(proxy.stopped)
         self.assertTrue(xray.stopped)
 
+    def test_plain_tunnel_runs_xray_directly_no_spoofer(self):
+        # plain "Tunnel" must behave like V2RayTun: xray connects straight to
+        # the server (spoof_port=None) and NO spoofer ProxyServer is started, so
+        # the tunnel handshake is never re-mangled (the slow/broken feedback).
+        ctrl = EngineController({"connection_mode": "Tunnel"})
+        ctrl.set_profile(self._profile())
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+
+        xray = FakeXray.last_instance
+        self.assertIsNotNone(xray)
+        self.assertIsNone(xray.spoof_port)            # direct, no chaining
+        self.assertTrue(xray.started)
+        self.assertIsNone(FakeProxy.last_instance)    # no spoofer at all
+        ctrl.stop()
+        self.assertTrue(xray.stopped)
+        self.assertEqual(ctrl.status, STATUS_IDLE)
+
     def test_count_callback_forwarded(self):
         ctrl = EngineController({"connection_mode": "SNI Only"})
         counts = []

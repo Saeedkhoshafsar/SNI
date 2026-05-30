@@ -52,6 +52,22 @@ class EngineModeTest(unittest.TestCase):
         self.assertFalse(e.uses_core)
         self.assertTrue(e.wants_core_but_no_profile)
 
+    def test_plain_tunnel_does_not_chain_spoofer(self):
+        # plain Tunnel = direct xray (V2RayTun-like), no spoofer mangling
+        e = self._engine("Tunnel", object())
+        self.assertTrue(e.uses_core)
+        self.assertFalse(e.chains_spoofer)
+
+    def test_sni_combo_chains_spoofer(self):
+        # explicit SNI-bypass combos DO chain the spoofer under xray
+        e = self._engine("SNI + Warp", object())
+        self.assertTrue(e.uses_core)
+        self.assertTrue(e.chains_spoofer)
+
+    def test_sni_only_never_chains_spoofer(self):
+        e = self._engine("SNI Only", object())
+        self.assertFalse(e.chains_spoofer)
+
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 not available")
 class SettingsModeHintTest(unittest.TestCase):

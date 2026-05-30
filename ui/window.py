@@ -20,8 +20,30 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPlainTextEdit, QProgressBar, QPushButton,
-    QSpinBox, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
+    QScrollArea, QSpinBox, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
+
+
+def _scrollable(page: QWidget) -> QScrollArea:
+    """Wrap a content page in a vertical scroll area.
+
+    Without this, when the window is short or the content is tall, Qt squeezes
+    the widgets on top of one another (the "overlapping / clipped fields" bug
+    seen on the built Windows app). A resizable scroll area keeps every widget
+    at its natural size and adds a scrollbar instead of overlapping.
+    """
+    sa = QScrollArea()
+    sa.setObjectName("PageScroll")
+    sa.setWidget(page)
+    sa.setWidgetResizable(True)
+    sa.setFrameShape(QFrame.NoFrame)
+    sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    sa.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    # transparent viewport so the themed backdrop shows through
+    sa.viewport().setAutoFillBackground(False)
+    sa.setStyleSheet("QScrollArea#PageScroll{background:transparent;}"
+                     "QScrollArea#PageScroll>QWidget>QWidget{background:transparent;}")
+    return sa
 
 from ui import win_effects
 from ui.theme import get_palette, build_qss
@@ -312,7 +334,7 @@ class DashboardPage(QWidget):
         self.stat_conns = _stat_card("0", "اتصالات فعال",
                                      accent_color=palette.accent)
         self.stat_total = _stat_card("0 B", "مصرف کل (↓/↑)")
-        self.stat_mode = _stat_card("SNI Only", "حالت")
+        self.stat_mode = _stat_card("Tunnel", "حالت")
         self.stat_strategy = _stat_card("wrong_seq", "استراتژی فعال")
         self.stat_cards = [self.stat_conns, self.stat_total,
                            self.stat_mode, self.stat_strategy]
@@ -437,9 +459,8 @@ class SettingsPage(QWidget):
         ports.setSpacing(14)
         ports.addWidget(self._labelled_spin("پورت گوش‌دادن", 40443, out="listen"))
         ports.addWidget(self._labelled_spin("پورت SOCKS", 10808, out="socks"))
-        ports_wrap.setMinimumHeight(78)
         form.addWidget(ports_wrap)
-        form.addSpacing(10)
+        form.addSpacing(6)
 
         form.addWidget(self._field_label("IP اتصال"))
         self.connect_ip = QLineEdit("www.speedtest.net")
@@ -550,22 +571,22 @@ class SettingsPage(QWidget):
     def _labelled_spin(self, t: str, val: int, out: str) -> QWidget:
         from PySide6.QtWidgets import QSizePolicy
         w = QWidget()
-        # the container must claim enough vertical room for label + spinbox,
-        # otherwise the HBox squeezes it and the spinbox text gets clipped
-        # (the "tiny squished port fields" bug).
-        w.setMinimumHeight(74)
-        w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        # let the VBox drive the height (label + spinbox + spacing). A fixed
+        # min-height combined with addStretch was what squeezed the spinbox and
+        # let the next row overlap it on the built app — use a content-driven
+        # size policy instead so the field is always exactly as tall as it needs.
+        w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
-        lay.addWidget(self._field_label(t))
+        lab = self._field_label(t)
+        lay.addWidget(lab)
         sp = QSpinBox()
         sp.setRange(1, 65535)
         sp.setValue(val)
-        sp.setMinimumHeight(42)          # never clipped (the spinbox bug)
+        sp.setMinimumHeight(40)          # never clipped (the spinbox bug)
         sp.setButtonSymbols(QSpinBox.UpDownArrows)
         lay.addWidget(sp)
-        lay.addStretch(1)
         setattr(self, f"spin_{out}", sp)
         return w
 
@@ -1365,9 +1386,16 @@ class MainWindow(QWidget):
         self.page_diagnostics = DiagnosticsPage()
         self.page_diagnostics.set_provider(self.engine.diagnostics)
         self.page_log = LogPage()
+        # wrap every page in a scroll area so tall content scrolls instead of
+        # overlapping/clipping when the window is short (the layout bug on the
+        # built Windows app). ``_scroll`` maps page -> its scroll wrapper so the
+        # page-change / nav logic can still reason about which page is shown.
+        self._scroll: dict[QWidget, QScrollArea] = {}
         for p in (self.page_dashboard, self.page_profiles, self.page_settings,
                   self.page_strategy, self.page_diagnostics, self.page_log):
-            self.stack.addWidget(p)
+            wrap = _scrollable(p)
+            self._scroll[p] = wrap
+            self.stack.addWidget(wrap)
         self.stack.currentChanged.connect(self._on_page_changed)
         body.addWidget(self.stack, 1)
 
@@ -1404,7 +1432,7 @@ class MainWindow(QWidget):
         # initialise widgets from persisted state
         self.page_settings.load_from(self.store.config)
         self.page_dashboard.set_mode(
-            self.store.get("connection_mode", "SNI Only"))
+            self.store.get("connection_mode", "Tunnel"))
         self.page_dashboard.set_active_strategy(
             self.store.get("bypass_method", "wrong_seq"))
         sel = self.store.selected_profile
@@ -1505,15 +1533,16 @@ class MainWindow(QWidget):
         self.store.save_config()
         self.engine.update_config(self.store.config)
         self.page_dashboard.set_mode(
-            self.store.get("connection_mode", "SNI Only"))
+            self.store.get("connection_mode", "Tunnel"))
         Toast.show_message(self, "تنظیمات ذخیره شد", "ok")
 
     def _on_page_changed(self, index: int):
+        current = self.stack.widget(index)
         # replay the dashboard intro when navigating back to it
-        if self.stack.widget(index) is self.page_dashboard:
+        if current is self._scroll.get(self.page_dashboard):
             self.page_dashboard.play_intro()
         # only poll diagnostics while its page is visible (saves cycles)
-        if self.stack.widget(index) is self.page_diagnostics:
+        if current is self._scroll.get(self.page_diagnostics):
             self.page_diagnostics.start_polling()
         else:
             self.page_diagnostics.stop_polling()

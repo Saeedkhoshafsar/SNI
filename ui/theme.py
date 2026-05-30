@@ -421,14 +421,40 @@ def build_qss(p: Palette) -> str:
     QScrollArea#DialogScroll {{ border: none; background: transparent; }}
     QScrollArea#DialogScroll > QWidget > QWidget {{ background: transparent; }}
 
-    /* ---- Log view ---- */
-    QTextEdit#Log {{
+    /* ---- Text views (log + diagnostics table) ---- */
+    /* base rule: NO text edit is ever the default white Windows control */
+    QTextEdit, QPlainTextEdit {{
         background: {p.surface_alt};
         border: 1px solid {p.border};
         border-radius: {p.radius_sm}px;
+        color: {p.text};
+        selection-background-color: {p.accent};
+        selection-color: {p.on_accent};
+    }}
+    QTextEdit#Log, QPlainTextEdit#Log {{
+        background: {p.surface_alt};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+        color: {p.text};
         font-family: "Cascadia Code", "Consolas", monospace;
         font-size: 12.5px;
         padding: 8px;
+    }}
+
+    /* ---- Progress bar (throughput meter) ---- */
+    QProgressBar {{
+        background: {p.surface_alt};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+        min-height: 16px;
+        text-align: center;
+        color: {p.text};
+    }}
+    QProgressBar::chunk {{
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+            stop:0 {p.accent}, stop:1 {p.success});
+        border-radius: {p.radius_sm}px;
+        margin: 1px;
     }}
     QComboBox#LogFilter {{
         min-width: 88px;

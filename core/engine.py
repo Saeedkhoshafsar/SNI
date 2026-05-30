@@ -173,6 +173,23 @@ class EngineController:
         mode = str(self.config.get("connection_mode", "Tunnel"))
         return self.profile is None and mode != "SNI Only"
 
+    @property
+    def chains_spoofer(self) -> bool:
+        """True when the SNI-spoofer should sit *under* the xray core.
+
+        Plain ``"Tunnel"`` mode connects xray straight to the server — exactly
+        like V2RayTun — so the spoofer never re-mangles xray's own TLS/WS
+        handshake (which made the tunnel slow or broke it entirely; the
+        "config still doesn't connect / much slower" feedback). Only the
+        explicit SNI-bypass combos ("SNI + Warp", "SNI + Psiphon", …) chain the
+        spoofer in front, because those modes specifically want DPI evasion on
+        the outer connection.
+        """
+        if not self.uses_core:
+            return False
+        mode = str(self.config.get("connection_mode", "Tunnel"))
+        return mode not in ("Tunnel",)
+
     def diagnostics(self):
         """Return a :class:`core.diagnostics.DiagnosticsSnapshot` of live state.
 
@@ -392,8 +409,47 @@ class EngineController:
             self._log(f"تاب‌آوری راه‌اندازی نشد ({exc}) — بدون آن ادامه می‌دهیم")
             self._resilience = None
 
+    def _start_core_only(self) -> None:
+        """Plain Tunnel: run xray-core alone, connecting straight to the server.
+
+        No spoofer ProxyServer is started, so xray's TLS/WS handshake reaches
+        the real server untouched — identical behaviour to V2RayTun. This is the
+        fast, reliable default for normal configs.
+        """
+        assert self.profile is not None
+        from core.xray_manager import XrayManager
+
+        # the configured strategy is what the UI shows even though no spoofer
+        # is mangling packets (direct tunnel = no DPI bypass on the outer conn)
+        self._emit_strategy(str(self.config.get("bypass_method", "wrong_seq")))
+
+        allow_lan = bool(self.config.get("allow_lan", False))
+        self._xray = XrayManager(
+            self.profile,
+            socks_port=int(self.config.get("socks_port", 10808)),
+            http_port=int(self.config.get("http_port", 10809)),
+            spoof_port=None,                 # direct — no spoofer chaining
+            gaming_mode=bool(self.config.get("gaming_mode", False)),
+            listen="0.0.0.0" if allow_lan else "127.0.0.1",
+        )
+        self._xray.on_log = self._log
+        self._log(
+            f"حالت تونل (مستقیم مثل V2RayTun): xray → "
+            f"{self.profile.address}:{self.profile.port}")
+        if not self._xray.is_available:
+            self._log("هشدار: xray.exe یافت نشد — تونل اجرا نشد")
+            self._set_status(STATUS_ERROR)
+            self._xray = None
+            return
+        self._xray.start()
+
+        self._maybe_enable_system_proxy(True)
+        self._set_status(STATUS_ACTIVE)
+        self._log("✓ اتصال برقرار شد")
+
     def _do_start(self) -> None:
         use_core = self.uses_core
+        chain_spoofer = self.chains_spoofer
 
         # loud, actionable warning when the chosen mode needs a profile but
         # none is selected (otherwise we'd silently do a plain SNI forward that
@@ -404,6 +460,14 @@ class EngineController:
                 "⚠ هیچ کانفیگی انتخاب نشده — این حالت به یک پروفایل "
                 "VLESS/VMess/Trojan نیاز دارد. لطفاً یک کانفیگ انتخاب کنید "
                 "یا حالت را روی «SNI Only» بگذارید.")
+
+        # plain Tunnel: xray talks to the server directly (no spoofer in the
+        # path) so we never run a spoofer ProxyServer at all — this is the fast,
+        # reliable, V2RayTun-equivalent path.
+        if use_core and not chain_spoofer:
+            self._spoof_port = None
+            self._start_core_only()
+            return
 
         # --- 1. work out the spoofer's listen port + upstream target ---
         if use_core:
@@ -457,8 +521,10 @@ class EngineController:
             self._proxy.on_traffic = self._emit_traffic
         self._proxy.start()
 
-        # --- 3. optionally chain xray core in front of the spoofer ---
-        if use_core:
+        # --- 3. chain xray core in front of the spoofer (SNI-bypass combos) ---
+        # NB: plain "Tunnel" returned early via _start_core_only; only the
+        # explicit SNI+X modes reach here with chain_spoofer == True.
+        if chain_spoofer:
             assert self.profile is not None
             from core.xray_manager import XrayManager
             allow_lan = bool(self.config.get("allow_lan", False))
@@ -477,7 +543,7 @@ class EngineController:
                 self._xray.start()
 
         # --- 4. optionally point the OS system proxy at our local HTTP port ---
-        self._maybe_enable_system_proxy(use_core)
+        self._maybe_enable_system_proxy(chain_spoofer)
 
         self._set_status(STATUS_ACTIVE)
         self._log("✓ اتصال برقرار شد")
