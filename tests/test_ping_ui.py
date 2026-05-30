@@ -60,7 +60,7 @@ class FakeEngine:
     def probe_strategies_for(self, profile, *, strategy=None):
         self.strategy_arg = strategy
         rep = StrategyPingReport("S", "h", 443)
-        keys = [strategy] if strategy else ["wrong_seq", "fake_ttl"]
+        keys = [strategy] if strategy else ["wrong_seq", "fake_disorder"]
         for k in keys:
             outcome = OK if k != "wrong_seq" else RST
             lat = 18.0 if outcome == OK else 0.0
@@ -98,8 +98,8 @@ class PingUITest(unittest.TestCase):
         self.assertTrue(hasattr(page, "btn_ping_one"))
         self.assertTrue(hasattr(page, "btn_test_strategies"))
         self.assertTrue(hasattr(page, "cmb_ping_strategy"))
-        # combo has "all" + the 5 strategies
-        self.assertEqual(page.cmb_ping_strategy.count(), 6)
+        # combo has "all" + the 3 shipped strategies
+        self.assertEqual(page.cmb_ping_strategy.count(), 4)
         self.assertEqual(page.cmb_ping_strategy.itemData(0), "")
 
     def test_ping_all_worker_formats_and_ranks(self):
@@ -136,10 +136,10 @@ class PingUITest(unittest.TestCase):
         w.line.connect(lines.append)
         w.done.connect(summary.append)
         w.run()
-        # wrong_seq failed (✖), fake_ttl connected (✔)
+        # wrong_seq failed (✖), fake_disorder connected (✔)
         self.assertTrue(any("✖" in l and "wrong_seq" in l for l in lines))
-        self.assertTrue(any("✔" in l and "fake_ttl" in l for l in lines))
-        self.assertTrue(any("بهترین استراتژی: fake_ttl" in s for s in summary))
+        self.assertTrue(any("✔" in l and "fake_disorder" in l for l in lines))
+        self.assertTrue(any("بهترین استراتژی: fake_disorder" in s for s in summary))
 
     def test_strategy_worker_pins_single(self):
         from ui.window import PingWorker

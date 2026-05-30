@@ -201,19 +201,26 @@ class EngineController:
            spoofer); to be self-contained we run our own xray in its place.
            These chain regardless of mode (even plain "Tunnel").
 
-        2. The explicit SNI-bypass combos ("SNI + Warp", "SNI + Psiphon", …)
-           that want DPI evasion on the outer connection.
+        2. A spoof config in ``"SNI Only"`` mode (the spoofer runs as the
+           standalone DPI-evasion forwarder under xray).
 
-        Plain ``"Tunnel"`` mode with an *ordinary* (routable) config connects
-        xray straight to the real server — no spoofer (the fast, V2RayTun-
-        equivalent path).
+        **#6 — ordinary (routable) configs never chain the spoofer.** A config
+        whose server address is a real, routable host is connected exactly like
+        a normal client (V2RayTun / Hiddify): xray dials the server directly and
+        the connection-mode selector is irrelevant for it. Only *spoof* configs
+        (loopback-IP share links) need the spoofer, so the Tunnel / SNI-Only
+        modes only have an effect for them — this stops the app from spinning up
+        a spoofer ProxyServer (and burning resources) for servers that don't
+        need one.
         """
         if not self.uses_core:
             return False
-        if getattr(self.profile, "is_spoof_config", False):
-            return True
-        mode = str(self.config.get("connection_mode", "Tunnel"))
-        return mode not in ("Tunnel",)
+        # Ordinary configs: always direct, regardless of mode (#6).
+        if not getattr(self.profile, "is_spoof_config", False):
+            return False
+        # Spoof configs: the spoofer is always in the path (Tunnel chains xray
+        # under it; SNI Only runs it as the bypass forwarder under xray).
+        return True
 
     def diagnostics(self):
         """Return a :class:`core.diagnostics.DiagnosticsSnapshot` of live state.

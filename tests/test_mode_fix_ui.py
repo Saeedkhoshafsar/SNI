@@ -70,18 +70,26 @@ class EngineModeTest(unittest.TestCase):
         self.assertTrue(e.uses_core)
         self.assertFalse(e.chains_spoofer)
 
-    def test_sni_combo_chains_spoofer(self):
-        # explicit SNI-bypass combos DO chain the spoofer under xray
-        e = self._engine("SNI + Warp", object())
-        self.assertTrue(e.uses_core)
-        self.assertTrue(e.chains_spoofer)
+    def test_spoof_config_chains_spoofer_regardless_of_mode(self):
+        # #6: a SPOOF (loopback-IP) config always chains the spoofer, because it
+        # genuinely needs it — in both Tunnel and SNI Only.
+        from core.profile import Profile
+        spoof = Profile(protocol="vless", address="127.0.0.1", port=40443,
+                        sni="x.workers.dev", security="tls", uuid="x")
+        for mode in ("Tunnel", "SNI Only"):
+            with self.subTest(mode=mode):
+                e = self._engine(mode, spoof)
+                self.assertTrue(e.uses_core)
+                self.assertTrue(e.chains_spoofer)
 
-    def test_sni_only_ordinary_profile_chains_spoofer(self):
-        # SNI Only + a profile = the user wants DPI evasion on the outer hop,
-        # so the spoofer is chained under xray.
+    def test_sni_only_ordinary_profile_does_not_chain_spoofer(self):
+        # #6: an ORDINARY (routable) config connects directly like a normal
+        # client — the spoofer is never chained, even in SNI Only, so we don't
+        # waste system resources spinning one up for a server that doesn't need
+        # it. object() has no is_spoof_config attribute → treated as routable.
         e = self._engine("SNI Only", object())
         self.assertTrue(e.uses_core)
-        self.assertTrue(e.chains_spoofer)
+        self.assertFalse(e.chains_spoofer)
 
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 not available")
@@ -89,6 +97,21 @@ class SettingsModeHintTest(unittest.TestCase):
     def _page(self):
         from ui.window import SettingsPage
         return SettingsPage()
+
+    def test_only_two_modes_remain(self):
+        # #5: every mode except Tunnel / SNI Only was removed
+        from ui.window import MODES
+        self.assertEqual(set(MODES), {"Tunnel", "SNI Only"})
+
+    def test_set_mode_applicable_toggles_selector(self):
+        # #6: the selector is disabled for ordinary configs and enabled for
+        # spoof configs, with an explanatory hint when disabled.
+        page = self._page()
+        page.set_mode_applicable(False)
+        self.assertFalse(page.mode.isEnabled())
+        self.assertIn("معمولی", page.mode_hint.text())
+        page.set_mode_applicable(True)
+        self.assertTrue(page.mode.isEnabled())
 
     def test_mode_hint_updates(self):
         from ui.window import MODE_HINTS
@@ -123,16 +146,16 @@ class WindowFlagsTest(unittest.TestCase):
         w._on_profile_selected(_P())
         self.assertEqual(w.store.get("connection_mode"), "Tunnel")
 
-    def test_profile_selection_keeps_explicit_nonsni_mode(self):
+    def test_profile_selection_keeps_tunnel_mode(self):
         from ui.window import MainWindow
         w = MainWindow()
-        w.store.set("connection_mode", "Gaming Mode")
+        w.store.set("connection_mode", "Tunnel")
 
         class _P:
             display_name = "test"
         w._on_profile_selected(_P())
-        # should not clobber a deliberate non-SNI mode
-        self.assertEqual(w.store.get("connection_mode"), "Gaming Mode")
+        # Tunnel must be left untouched (only SNI Only is auto-switched)
+        self.assertEqual(w.store.get("connection_mode"), "Tunnel")
 
 
 if __name__ == "__main__":

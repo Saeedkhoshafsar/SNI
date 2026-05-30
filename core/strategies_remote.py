@@ -25,7 +25,7 @@ Manifest shape (canonicalised for signing — see :func:`canonical_bytes`)::
       "version": 7,                         # monotonically increasing
       "updated": "2026-05-29",              # informational
       "recipes": [
-        {"strategy": "fake_ttl", "fragment_tcp": true,  "fragment_tls": false,
+        {"strategy": "multi_fake", "fragment_tcp": true,  "fragment_tls": false,
          "tls_chunk": 64, "score": 0.7, "title": "...", "enabled": true},
         ...
       ]

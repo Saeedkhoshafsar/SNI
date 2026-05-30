@@ -45,11 +45,9 @@ class FormatHelpersTest(unittest.TestCase):
         self.assertEqual(fmt_rate(1048576), "1.0 MB/s")
 
     def test_mode_kind_classifies_tunnel_vs_proxy(self):
+        # only Tunnel / SNI Only remain (#5)
+        self.assertEqual(mode_kind("Tunnel"), "tunnel")
         self.assertEqual(mode_kind("SNI Only"), "proxy")
-        self.assertEqual(mode_kind("SNI + Warp"), "tunnel")
-        self.assertEqual(mode_kind("SNI + Psiphon"), "tunnel")
-        self.assertEqual(mode_kind("SNI + Warp-in-Warp"), "tunnel")
-        self.assertEqual(mode_kind("Gaming Mode"), "tunnel")
         self.assertEqual(mode_kind(""), "proxy")
 
 
@@ -95,7 +93,7 @@ class DashboardPageTest(unittest.TestCase):
 
     def test_mode_badge_flips(self):
         d = self._page()
-        d.set_mode("SNI + Warp")
+        d.set_mode("Tunnel")
         self.assertEqual(d.mode_badge.property("kind"), "tunnel")
         self.assertEqual(d.mode_badge.text(), "تونل کامل")
         d.set_mode("SNI Only")

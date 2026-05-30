@@ -4,9 +4,14 @@ The original tool hard-coded a single ``wrong_seq`` injection technique inside
 ``fake_tcp.FakeTcpInjector.fake_send_thread`` (everything else called
 ``sys.exit("not implemented")``). This package extracts that into a clean,
 extensible :class:`~strategies.base.BypassStrategy` interface plus a registry,
-so new techniques (wrong_checksum, fake_ttl, multi_fake, fake_disorder,
-fragmentation, …) can be added as small self-contained classes and selected by
-name at runtime — and later auto-probed (the "final boss" auto-prober).
+so new techniques (multi_fake, fake_disorder, fragmentation, …) can be added as
+small self-contained classes and selected by name at runtime — and later
+auto-probed (the "final boss" auto-prober).
+
+Note: the early *fire-and-forget* experiments ``fake_ttl`` and
+``wrong_checksum`` were removed — by design the genuine server never ACKs them,
+so the spoofer could never *confirm* the decoy actually reached the DPI box,
+which made them unreliable in practice. Only ACK-confirmed techniques remain.
 
 Public API::
 
@@ -22,8 +27,6 @@ from strategies.base import (
 
 # Importing the implementations registers them as a side effect.
 from strategies import wrong_seq as _wrong_seq  # noqa: F401
-from strategies import wrong_checksum as _wrong_checksum  # noqa: F401
-from strategies import fake_ttl as _fake_ttl  # noqa: F401
 from strategies import multi_fake as _multi_fake  # noqa: F401
 from strategies import fake_disorder as _fake_disorder  # noqa: F401
 

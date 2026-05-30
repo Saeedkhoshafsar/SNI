@@ -65,14 +65,20 @@ class PingTargetTest(unittest.TestCase):
         self.assertEqual(tgt.host, "real.example.com")
         self.assertEqual(tgt.port, 8443)
 
-    def test_spoof_config_pings_real_sni_on_tls_port(self):
-        # local spoofer address + a real SNI + TLS ⇒ ping the SNI on :443
+    def test_spoof_config_pings_connect_ip_with_decoy_sni(self):
+        # #1: the honest offline test of a spoof config's bypass path is a TLS
+        # handshake to the *connect IP* the spoofer dials, presenting the
+        # **decoy** SNI it injects — NOT the real worker SNI directly (DPI would
+        # block that). So if the connect IP is censored, the TLS probe resets →
+        # honest red instead of a misleading green TCP-only ping.
         prof = _profile("spoof", addr="127.0.0.1", port=40443,
                         sni="worker.example.workers.dev", security="tls")
         self.assertTrue(prof.is_spoof_config)
         tgt = target_from_profile(prof)
-        self.assertEqual(tgt.host, "worker.example.workers.dev")
-        self.assertEqual(tgt.port, 443)
+        self.assertEqual(tgt.host, prof.spoof_connect_ip)
+        self.assertEqual(tgt.port, prof.spoof_connect_port)
+        self.assertEqual(tgt.server_name, prof.spoof_fake_sni)
+        self.assertTrue(tgt.tls)
 
 
 class I18nTest(unittest.TestCase):

@@ -43,9 +43,9 @@ class StrategyPageTest(unittest.TestCase):
         return StrategyPage(store or _FakeStore({"bypass_method": "wrong_seq"}))
 
     def test_initial_selection_from_store(self):
-        page = self._page(_FakeStore({"bypass_method": "fake_ttl"}))
-        self.assertEqual(page._selected, "fake_ttl")
-        self.assertTrue(page._cards["fake_ttl"].property("selected"))
+        page = self._page(_FakeStore({"bypass_method": "fake_disorder"}))
+        self.assertEqual(page._selected, "fake_disorder")
+        self.assertTrue(page._cards["fake_disorder"].property("selected"))
         self.assertFalse(page._cards["wrong_seq"].property("selected"))
 
     def test_click_selects_and_persists(self):
@@ -68,11 +68,11 @@ class StrategyPageTest(unittest.TestCase):
         self.assertFalse(store.get("auto_prober"))
 
     def test_auto_prober_hides_manual_selection(self):
-        store = _FakeStore({"bypass_method": "fake_ttl"})
+        store = _FakeStore({"bypass_method": "fake_disorder"})
         page = self._page(store)
         # turning auto-prober on clears the visual selection
         page.btn_autoprobe.setChecked(True)
-        self.assertFalse(page._cards["fake_ttl"].property("selected"))
+        self.assertFalse(page._cards["fake_disorder"].property("selected"))
         self.assertIn("پراب خودکار", page.pick_hint.text())
 
 

@@ -161,14 +161,10 @@ _EN: dict[str, str] = {
         "SNI spoofing without an outer Warp/Psiphon layer. If a config is selected, xray also "
         "runs chained under the spoofer (VLESS configs work). Only when no config is selected "
         "does it run a raw forwarder to bypass DPI on plain HTTPS.",
-    "کانفیگ + لایه‌ی Cloudflare Warp (نیازمند باینری warp).":
-        "Config + a Cloudflare Warp layer (requires the warp binary).",
-    "کانفیگ + لایه‌ی Psiphon (نیازمند باینری psiphon).":
-        "Config + a Psiphon layer (requires the psiphon binary).",
-    "کانفیگ + دو لایه‌ی Warp تو در تو.":
-        "Config + two nested Warp layers.",
-    "بهینه‌سازی تأخیر پایین برای بازی (TCP no-delay/fast-open).":
-        "Low-latency optimisation for gaming (TCP no-delay/fast-open).",
+    "این کانفیگ آدرس سرور معمولی (غیرلوکال) دارد و مثل یک کلاینت معمولی مستقیماً وصل می‌شود؛ حالت تونل/SNI Only فقط برای کانفیگ‌های اسپوف (با IP لوکال) کاربرد دارد.":
+        "This config has an ordinary (non-local) server address and connects "
+        "directly like a normal client; the Tunnel/SNI Only modes only apply to "
+        "spoof configs (with a local IP).",
     # --- settings ---
     "حالت اتصال، SNI و پورت‌ها": "Connection mode, SNI and ports",
     "حالت اتصال": "Connection mode",
@@ -310,6 +306,10 @@ _EN: dict[str, str] = {
     "پراب خودکار غیرفعال شد": "Auto-prober disabled",
     "انتخاب دستی: {name} ({key})": "Manual selection: {name} ({key})",
     "استراتژی انتخاب شد: {name}": "Strategy selected: {name}",
+    "راه‌اندازی مجدد خودکار برای اعمال استراتژی جدید…":
+        "Auto-restarting to apply the new strategy…",
+    "استراتژی «{name}» اعمال شد — اتصال بازنشانی شد":
+        "Strategy “{name}” applied — connection reset",
 }
 
 _FA: dict[str, str] = {}        # identity for Persian; kept for symmetry

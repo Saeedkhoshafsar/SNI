@@ -93,8 +93,8 @@ class Ed25519Test(unittest.TestCase):
 
 class ManifestParseTest(unittest.TestCase):
     def test_recipe_key_composition(self):
-        r = Recipe("fake_ttl", fragment_tcp=True, fragment_tls=True, tls_chunk=48)
-        self.assertEqual(r.key, "fake_ttl+ftcp+ftls48")
+        r = Recipe("fake_disorder", fragment_tcp=True, fragment_tls=True, tls_chunk=48)
+        self.assertEqual(r.key, "fake_disorder+ftcp+ftls48")
         self.assertEqual(Recipe("wrong_seq").key, "wrong_seq")
 
     def test_parse_valid_manifest(self):
@@ -102,13 +102,13 @@ class ManifestParseTest(unittest.TestCase):
             "version": 3, "updated": "2026-05-29",
             "recipes": [
                 {"strategy": "wrong_seq", "score": 0.6},
-                {"strategy": "fake_ttl", "fragment_tcp": True, "enabled": False},
+                {"strategy": "fake_disorder", "fragment_tcp": True, "enabled": False},
             ],
         })
         m = Manifest.parse(raw)
         self.assertEqual(m.version, 3)
         self.assertEqual(len(m.recipes), 2)
-        self.assertEqual(len(m.enabled_recipes()), 1)  # fake_ttl disabled
+        self.assertEqual(len(m.enabled_recipes()), 1)  # fake_disorder disabled
 
     def test_parse_rejects_non_object(self):
         with self.assertRaises(ManifestError):
@@ -238,7 +238,7 @@ class StrategiesUpdaterTest(unittest.TestCase):
     def test_to_candidates_filters_unknown_strategies(self):
         recipes = [
             {"strategy": "wrong_seq", "score": 0.6},
-            {"strategy": "fake_ttl", "fragment_tcp": True, "score": 0.7},
+            {"strategy": "fake_disorder", "fragment_tcp": True, "score": 0.7},
             {"strategy": "does_not_exist", "score": 0.9},
         ]
         store, pub, url = self._store(version=2, recipes=recipes)
@@ -248,13 +248,13 @@ class StrategiesUpdaterTest(unittest.TestCase):
         cands = up.to_candidates()
         keys = {c.key for c in cands}
         self.assertIn("wrong_seq", keys)
-        self.assertIn("fake_ttl+ftcp", keys)
+        self.assertIn("fake_disorder+ftcp", keys)
         self.assertNotIn("does_not_exist", keys)   # unknown filtered out
 
     def test_score_priors_from_manifest(self):
         recipes = [
             {"strategy": "wrong_seq", "score": 0.6},
-            {"strategy": "fake_ttl", "fragment_tcp": True, "score": 0.7},
+            {"strategy": "fake_disorder", "fragment_tcp": True, "score": 0.7},
         ]
         store, pub, url = self._store(version=2, recipes=recipes)
         up = StrategiesUpdater(public_key=pub, mirrors=[url],
@@ -262,7 +262,7 @@ class StrategiesUpdaterTest(unittest.TestCase):
         up.update()
         priors = up.score_priors()
         self.assertEqual(priors["wrong_seq"], 0.6)
-        self.assertEqual(priors["fake_ttl+ftcp"], 0.7)
+        self.assertEqual(priors["fake_disorder+ftcp"], 0.7)
 
     def test_to_candidates_empty_when_no_manifest(self):
         up = StrategiesUpdater(public_key=b"\x00" * 32, mirrors=[])

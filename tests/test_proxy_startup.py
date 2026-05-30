@@ -122,18 +122,36 @@ class ProxyStartupTest(unittest.TestCase):
             blocker.close()
 
     def test_fire_and_forget_handle_relays_without_server_ack(self):
-        """fake_ttl/wrong_checksum must NOT block waiting for a server ACK.
+        """A strategy with ``expects_ack=False`` must NOT block on a server ACK.
 
-        We drive ``_handle`` against a real loopback echo server. A stub
-        injector simulates the WinDivert send-thread: it marks the fake as
-        sent and fires ``t2a_event`` with ``fake_sent_no_ack`` (exactly what
-        the real injector now does for fire-and-forget strategies) — and
-        crucially it NEVER produces a ``fake_data_ack_recv``. The relay must
-        still start and echo bytes, proving the 5s ACK-timeout no longer
-        applies to fire-and-forget techniques.
+        The shipped strategies (wrong_seq / multi_fake / fake_disorder) are all
+        ACK-confirmed, and the early fire-and-forget experiments (fake_ttl /
+        wrong_checksum) were removed. But the ``expects_ack`` extension point is
+        still live infrastructure, so we register a tiny **stub** fire-and-forget
+        strategy here and prove the relay path honours it: the stub injector
+        fires ``t2a_event`` with ``fake_sent_no_ack`` and NEVER produces a
+        ``fake_data_ack_recv``, yet the relay must still start and echo bytes
+        (no 5s ACK-timeout).
         """
         import asyncio
         import threading
+
+        # register a throwaway fire-and-forget strategy for this test only
+        from strategies.base import BypassStrategy, StrategyMeta, REGISTRY
+
+        ff_key = "_test_fire_forget"
+
+        class _StubFF(BypassStrategy):
+            meta = StrategyMeta(key=ff_key, title="stub", description="",
+                                implemented=True)
+            expects_ack = False
+
+            def mutate_fake_packet(self, packet, connection):
+                pass
+
+        if ff_key not in REGISTRY:
+            REGISTRY[ff_key] = _StubFF()
+        self.addCleanup(lambda: REGISTRY.pop(ff_key, None))
 
         # a tiny loopback echo server to stand in for the upstream endpoint
         echo = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -158,7 +176,7 @@ class ProxyStartupTest(unittest.TestCase):
         cfg["CONNECT_IP"] = "127.0.0.1"
         cfg["CONNECT_PORT"] = echo_port
         srv = self.main.ProxyServer(cfg)
-        srv.bypass_method = "fake_ttl"  # a fire-and-forget strategy
+        srv.bypass_method = ff_key  # the stub fire-and-forget strategy
 
         # Stub the injector behaviour: instead of WinDivert, when _handle
         # registers a connection we immediately simulate "fake injected, no
@@ -260,7 +278,7 @@ class ProxyStartupTest(unittest.TestCase):
             if level.lower() in ("error", "warn", "warning"):
                 warnings.append(msg)
         srv._log = _cap
-        srv.bypass_method = "fake_ttl"
+        srv.bypass_method = "multi_fake"
 
         # below the threshold ⇒ no warning yet
         for _ in range(srv.DEAD_RELAY_STREAK - 1):
@@ -270,7 +288,7 @@ class ProxyStartupTest(unittest.TestCase):
         # crossing the threshold ⇒ exactly one warning
         srv._note_relay_result(up_n=1000, down_n=0)
         self.assertEqual(len(warnings), 1)
-        self.assertIn("fake_ttl", warnings[0])
+        self.assertIn("multi_fake", warnings[0])
 
         # further dead relays do not spam additional warnings
         srv._note_relay_result(up_n=1000, down_n=0)
@@ -282,7 +300,7 @@ class ProxyStartupTest(unittest.TestCase):
         srv._log = lambda msg, level="info": (
             warnings.append(msg) if level.lower().startswith(("err", "warn"))
             else None)
-        srv.bypass_method = "wrong_checksum"
+        srv.bypass_method = "fake_disorder"
 
         for _ in range(srv.DEAD_RELAY_STREAK - 1):
             srv._note_relay_result(up_n=500, down_n=0)
