@@ -374,3 +374,29 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **کارت‌های سه‌بعدی/معلق** — `ui/theme.py`: استایل `#StrategyCard` با `:hover` (حاشیهٔ accent + پس‌زمینهٔ روشن‌تر) و `[selected="true"]` (حاشیهٔ ضخیم accent). `ui/widgets.py → Card.set_shadow(blur,y,color)` افزوده شد تا سایهٔ drop در زمان اجرا قابل تنظیم باشد؛ StrategyPage با `enterEvent/leaveEvent` یک hover-lift اعمال می‌کند (عمیق‌تر شدن سایه + بالاآمدن کارت) — کاری که QSS به‌تنهایی نمی‌تواند روی `QGraphicsDropShadowEffect` انجام دهد.
 - **رفع drag پنجره (`ui/widgets.py → TitleBar`)** — به‌جای حلقهٔ دستیِ `move()` که پشت نشانگر می‌لرزید، حالا `QWindow.startSystemMove()` بومیِ سیستم‌عامل استفاده می‌شود (drag روان، سازگار با compositor/DPI/snap-assist). در صورت نبودِ native move، fallback به روش دستی حفظ شده است (`_begin_native_move()` همیشه bool برمی‌گرداند).
 - تست‌ها: `tests/test_strategy_ui.py` (+۶: انتخاب اولیه از store، کلیک→انتخاب/persist/emit، کلیک→خاموش‌شدن auto-prober، پنهان‌شدن انتخاب در حالت auto، fallback امن `_begin_native_move`، `Card.set_shadow`). smoke-test کامل MainWindow هم سبز. مجموعاً **۳۱۳ تست سبز + ۲ skip**.
+
+## ✅ رفع بازخورد نسخهٔ بیلدشده (۴ باگ گزارش‌شده از اپ ویندوزی) (2026-05-30)
+**چرا:** کاربر نسخهٔ واقعیِ بیلدشدهٔ ویندوز را تست کرد و ۴ مشکل گزارش داد (با اسکرین‌شات). همهٔ آن‌ها ریشه‌یابی و رفع شدند.
+
+### باگ ۱ — کانفیگ کار نمی‌کرد (VLESS وصل نمی‌شد، هنوز باید V2RayTun استفاده می‌شد)
+- **ریشه:** حالت پیش‌فرض روی **«SNI Only»** بود؛ در این حالت اسپوفر فقط یک forwarder خام است و **xray اصلاً اجرا نمی‌شود** — یعنی کانفیگ VLESS/VMess/Trojan هرگز استفاده نمی‌شد. تولید xray-config همیشه درست بود؛ مشکل صرفاً انتخاب حالت بود.
+- **اعتبارسنجی:** xray-config تولیدشده برای کانفیگ دقیقِ کاربر (`vless://…@104.19.44.75:443?…type=ws&host=hammm2.pages.dev&path=…vps.webtun.xyz:2087#CF…`) **عیناً** با خروجی V2RayTun مطابقت دارد — `wsSettings.path` با مسیر تودرتو دست‌نخورده می‌ماند.
+- **رفع (`ui/window.py`, `core/engine.py`, `core/config_store.py`):**
+  - حالت جدید **«Tunnel»** افزوده و به‌عنوان پیش‌فرض تنظیم شد (`MODES` با Tunnel شروع می‌شود؛ `DEFAULT_CONFIG["connection_mode"]="Tunnel"`؛ `load_from` پیش‌فرض Tunnel).
+  - `MODE_HINTS` افزوده شد تا تفاوت هر حالت زیر کمبوی حالت توضیح داده شود (به‌ویژه اینکه در «SNI Only» کانفیگ استفاده نمی‌شود).
+  - **سوییچ خودکار:** هنگام انتخاب یک پروفایل، اگر حالت روی «SNI Only» بود به‌صورت خودکار به «Tunnel» تغییر می‌کند (`_on_profile_selected`) + Toast اطلاع‌رسانی.
+  - **هشدار محافظ:** `EngineController.wants_core_but_no_profile` افزوده شد؛ اگر کاربر در حالتِ نیازمندِ هسته باشد ولی کانفیگی انتخاب نکرده، در `_do_start` لاگ هشدار می‌دهد.
+
+### باگ ۲ — پنجره از نوار عنوان جابه‌جا نمی‌شد و دکمهٔ مینیمایز کار نمی‌کرد
+- **ریشه:** `WA_TranslucentBackground` روی پنجرهٔ frameless فعال بود که هم drag و هم مینیمایز را در نسخهٔ بیلدشده خراب می‌کرد.
+- **رفع (`ui/window.py`):** حذف `WA_TranslucentBackground` و حذف فراخوانی `apply_backdrop`؛ افزودن پرچم‌های `WindowMinimizeButtonHint | WindowSystemMenuHint` به‌کنار `FramelessWindowHint`. (drag بومی از استپ ۲۴ با `startSystemMove()` قبلاً درست شده بود.)
+
+### باگ ۳ — به‌هم‌ریختگی UI (فیلدهای کوچک/له‌شده/بریده، اسکرول خراب، متن صفحهٔ استراتژی نصفه)
+- **ریشه:** ظرفِ اسپین‌باکس فقط ۳۸px ارتفاع داشت و اسپین‌باکس ۴۷px را می‌برید؛ متن نامرئی می‌شد.
+- **رفع (`ui/window.py`, `ui/theme.py`):** min-heightهای صریح (ظرف ۷۴px، اسپین‌باکس ۴۲px)، بسته‌بندی پورت‌ها در `ports_wrap` (۷۸px) + فاصله‌گذاری فرم، فاصله قبل از هر چک‌باکس، و QSS کاملِ ورودی‌ها (`min-height`, `padding`, hover/focus، فلش‌های کمبو/اسپین‌باکس). بصری تأیید شد که «۴۰۴۴۳»/«۱۰۸۰۸» واضح دیده می‌شوند.
+
+### باگ ۴ — طراحی UI مدرن/سه‌بعدی/شناور تحویل داده نشده بود
+- **رفع (`ui/theme.py`):** پس‌زمینهٔ `RootBackdrop` به `qlineargradient` مورب + حاشیه + گردیِ ۱۴px؛ کارت‌ها با گرادیان عمودی (`card_grad_top→bottom`) + حاشیهٔ هایلایت بالایی؛ افزودن ۶ فیلد گرادیان به `Palette` (تیره و روشن) و تبدیل سطوح rgba به solid. (به‌همراه سایه/هاور/معلق کارت‌ها از استپ ۲۴.)
+
+- **ابزار:** کشف شد PySide6 در سندباکس نصب نبود (تست‌های UI بی‌صدا skip می‌شدند)؛ PySide6 6.11.1 + libEGL نصب شد تا رندر واقعی و اجرای درست تست‌ها ممکن شود. رندر offscreen (`grab().save()`) برای تأیید بصری همهٔ صفحات (داشبورد/استراتژی/تنظیمات/پروفایل/لاگ) استفاده شد.
+- تست‌ها: `tests/test_mode_fix_ui.py` (+۸: معناشناسی حالت در engine بدون Qt، hint حالت در SettingsPage، پرچم‌های پنجره غیرشفاف/دارای مینیمایز، سوییچ خودکار به Tunnel، حفظ حالت غیر-SNI صریح). مجموعاً **۳۲۱ تست سبز + ۲ skip**.

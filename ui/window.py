@@ -52,12 +52,23 @@ DEFAULT_SNIS = [
 ]
 
 MODES = [
-    "SNI Only",
+    "Tunnel",          # default: VLESS/xray chained under the spoofer (needs a profile)
+    "SNI Only",        # raw forwarder, no xray — for plain HTTPS DPI bypass
     "SNI + Warp",
     "SNI + Psiphon",
     "SNI + Warp-in-Warp",
     "Gaming Mode",
 ]
+
+# human-readable, Persian hint shown under the mode selector
+MODE_HINTS = {
+    "Tunnel": "اتصال کامل از طریق کانفیگ انتخاب‌شده (VLESS/VMess/Trojan) با هسته‌ی xray + اسپوف SNI. برای استفاده از کانفیگ‌ها این حالت را انتخاب کنید.",
+    "SNI Only": "فقط فورواردر اسپوف SNI بدون xray — برای دور زدن DPI روی ترافیک HTTPS عادی. کانفیگ VLESS در این حالت استفاده نمی‌شود.",
+    "SNI + Warp": "کانفیگ + لایه‌ی Cloudflare Warp (نیازمند باینری warp).",
+    "SNI + Psiphon": "کانفیگ + لایه‌ی Psiphon (نیازمند باینری psiphon).",
+    "SNI + Warp-in-Warp": "کانفیگ + دو لایه‌ی Warp تو در تو.",
+    "Gaming Mode": "بهینه‌سازی تأخیر پایین برای بازی (TCP no-delay/fast-open).",
+}
 
 STRATEGIES = [
     ("wrong_seq", "Wrong Sequence", "تزریق ClientHello جعلی با seq خارج از پنجره"),
@@ -401,11 +412,18 @@ class SettingsPage(QWidget):
 
         card = Card()
         form = card.body()
+        form.setSpacing(8)
 
         form.addWidget(self._field_label("حالت اتصال"))
         self.mode = QComboBox()
         self.mode.addItems(MODES)
         form.addWidget(self.mode)
+        self.mode_hint = QLabel("")
+        self.mode_hint.setObjectName("Faint")
+        self.mode_hint.setWordWrap(True)
+        form.addWidget(self.mode_hint)
+        self.mode.currentTextChanged.connect(self._update_mode_hint)
+        self._update_mode_hint(self.mode.currentText())
 
         form.addWidget(self._field_label("SNI جعلی"))
         self.sni = QComboBox()
@@ -413,17 +431,22 @@ class SettingsPage(QWidget):
         self.sni.addItems(DEFAULT_SNIS)
         form.addWidget(self.sni)
 
-        ports = QHBoxLayout()
+        ports_wrap = QWidget()
+        ports = QHBoxLayout(ports_wrap)
+        ports.setContentsMargins(0, 0, 0, 0)
         ports.setSpacing(14)
         ports.addWidget(self._labelled_spin("پورت گوش‌دادن", 40443, out="listen"))
         ports.addWidget(self._labelled_spin("پورت SOCKS", 10808, out="socks"))
-        form.addLayout(ports)
+        ports_wrap.setMinimumHeight(78)
+        form.addWidget(ports_wrap)
+        form.addSpacing(10)
 
         form.addWidget(self._field_label("IP اتصال"))
         self.connect_ip = QLineEdit("www.speedtest.net")
         form.addWidget(self.connect_ip)
 
         # --- LAN sharing (use the proxy from a phone on the same Wi-Fi) ---
+        form.addSpacing(8)
         self.chk_lan = QCheckBox(
             "اشتراک LAN — پروکسی روی شبکه‌ی محلی باز شود (برای گوشی)")
         form.addWidget(self.chk_lan)
@@ -434,6 +457,7 @@ class SettingsPage(QWidget):
         self.chk_lan.toggled.connect(self._update_lan_hint)
 
         # --- system proxy vs. tunnel (feedback 7) ---
+        form.addSpacing(8)
         self.chk_system_proxy = QCheckBox(
             "پروکسی سیستم — همه‌ی برنامه‌های ویندوز خودکار از تونل رد شوند")
         form.addWidget(self.chk_system_proxy)
@@ -456,7 +480,7 @@ class SettingsPage(QWidget):
     # -- config <-> widgets ------------------------------------------------
     def load_from(self, cfg: dict) -> None:
         """Populate the widgets from a config dict."""
-        mode = cfg.get("connection_mode", "SNI Only")
+        mode = cfg.get("connection_mode", "Tunnel")
         i = self.mode.findText(mode)
         if i >= 0:
             self.mode.setCurrentIndex(i)
@@ -480,6 +504,15 @@ class SettingsPage(QWidget):
             "allow_lan": self.chk_lan.isChecked(),
             "system_proxy": self.chk_system_proxy.isChecked(),
         }
+
+    def set_mode(self, mode: str) -> None:
+        """Programmatically select a connection mode (keeps hint in sync)."""
+        i = self.mode.findText(mode)
+        if i >= 0:
+            self.mode.setCurrentIndex(i)
+
+    def _update_mode_hint(self, mode: str) -> None:
+        self.mode_hint.setText(MODE_HINTS.get(mode, ""))
 
     def _update_lan_hint(self, on: bool) -> None:
         """Show the LAN address the phone should use when sharing is on."""
@@ -515,15 +548,24 @@ class SettingsPage(QWidget):
         return lbl
 
     def _labelled_spin(self, t: str, val: int, out: str) -> QWidget:
+        from PySide6.QtWidgets import QSizePolicy
         w = QWidget()
+        # the container must claim enough vertical room for label + spinbox,
+        # otherwise the HBox squeezes it and the spinbox text gets clipped
+        # (the "tiny squished port fields" bug).
+        w.setMinimumHeight(74)
+        w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
+        lay.setSpacing(6)
         lay.addWidget(self._field_label(t))
         sp = QSpinBox()
         sp.setRange(1, 65535)
         sp.setValue(val)
+        sp.setMinimumHeight(42)          # never clipped (the spinbox bug)
+        sp.setButtonSymbols(QSpinBox.UpDownArrows)
         lay.addWidget(sp)
+        lay.addStretch(1)
         setattr(self, f"spin_{out}", sp)
         return w
 
@@ -1283,9 +1325,17 @@ class MainWindow(QWidget):
         self.resize(940, 620)
         self.setMinimumSize(820, 540)
 
-        # frameless + translucent so the Mica backdrop can show through
-        self.setWindowFlag(Qt.FramelessWindowHint, True)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        # Frameless, but keep the window a *real* top-level window so the OS
+        # still gives us minimise + taskbar entry + native system-move. We do
+        # NOT use WA_TranslucentBackground: on Windows it broke showMinimized()
+        # and startSystemMove() and made the UI look "scattered" (feedback 2/3).
+        # Instead the RootBackdrop paints a solid 3-D gradient (feedback 6).
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.FramelessWindowHint
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowSystemMenuHint
+        )
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1412,6 +1462,23 @@ class MainWindow(QWidget):
         self.engine.set_profile(profile)
         if profile:
             self.page_log.append(f"[profile] انتخاب شد: {profile.display_name}")
+            # auto-switch to Tunnel so the VLESS/VMess/Trojan config is actually
+            # used: in "SNI Only" the profile is ignored (the "still need
+            # V2RayTun" bug). Only nudge when the user is on the no-core default.
+            if self.store.get("connection_mode", "Tunnel") == "SNI Only":
+                self.store.set("connection_mode", "Tunnel")
+                self.store.save_config()
+                self.engine.update_config(self.store.config)
+                # keep the Settings combo + Dashboard badge in sync
+                if hasattr(self, "page_settings"):
+                    self.page_settings.set_mode("Tunnel")
+                self.page_dashboard.set_mode("Tunnel")
+                self.page_log.append(
+                    "[mode] حالت به «Tunnel» تغییر کرد تا کانفیگ انتخاب‌شده "
+                    "واقعاً استفاده شود")
+                Toast.show_message(
+                    self, "حالت به «Tunnel» تغییر کرد (برای استفاده از کانفیگ)",
+                    "ok")
 
     def _on_auto_prober_changed(self, enabled: bool):
         # the StrategyPage already persisted the flag; push it to the live engine
@@ -1494,12 +1561,9 @@ class MainWindow(QWidget):
         self.page_dashboard.set_palette(palette)
         try:
             hwnd = int(self.winId())
+            # only keep the dark immersive title region; we paint our own solid
+            # 3-D gradient backdrop now (no Mica/Acrylic — see __init__ note).
             win_effects.set_dark_titlebar(hwnd, palette.is_dark)
-            win_effects.apply_backdrop(
-                hwnd,
-                win_effects.BACKDROP_MICA if palette.is_dark
-                else win_effects.BACKDROP_ACRYLIC,
-            )
         except Exception:
             pass
 

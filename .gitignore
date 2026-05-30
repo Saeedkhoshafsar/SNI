@@ -213,3 +213,5 @@ sni-spoofing-v3-atarevals/SNI-Spoofer-v3.exe
 xray_config.json
 # per-user runtime state (imported servers + selection)
 profiles.json
+# offscreen UI render artifacts (visual QA only)
+_render/

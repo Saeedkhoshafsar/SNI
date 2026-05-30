@@ -1,5 +1,5 @@
 {
-  "connection_mode": "SNI Only",
+  "connection_mode": "Tunnel",
   "LISTEN_HOST": "0.0.0.0",
   "LISTEN_PORT": 40443,
   "CONNECT_IP": "188.114.98.0",

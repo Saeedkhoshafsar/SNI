@@ -25,7 +25,7 @@ from core.profile import Profile
 # Default connection settings — mirror the legacy ``config.json`` so existing
 # behaviour is preserved when no file is present yet.
 DEFAULT_CONFIG: dict[str, Any] = {
-    "connection_mode": "SNI Only",
+    "connection_mode": "Tunnel",
     "LISTEN_HOST": "127.0.0.1",
     "LISTEN_PORT": 40443,
     "CONNECT_IP": "188.114.98.0",

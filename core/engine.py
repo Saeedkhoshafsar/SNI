@@ -154,9 +154,24 @@ class EngineController:
 
     @property
     def uses_core(self) -> bool:
-        """True when an xray core is chained under the spoofer."""
-        mode = str(self.config.get("connection_mode", "SNI Only"))
+        """True when an xray core is chained under the spoofer.
+
+        Any mode other than the raw ``"SNI Only"`` forwarder needs xray-core to
+        carry the VLESS/VMess/Trojan profile. ``"SNI Only"`` is the only mode
+        that runs without a core (and therefore without a profile).
+        """
+        mode = str(self.config.get("connection_mode", "Tunnel"))
         return self.profile is not None and mode != "SNI Only"
+
+    @property
+    def wants_core_but_no_profile(self) -> bool:
+        """True when the chosen mode needs xray but no profile is selected.
+
+        Used by the UI to warn the user instead of silently falling back to a
+        plain SNI forward that can never reach a VLESS server.
+        """
+        mode = str(self.config.get("connection_mode", "Tunnel"))
+        return self.profile is None and mode != "SNI Only"
 
     def diagnostics(self):
         """Return a :class:`core.diagnostics.DiagnosticsSnapshot` of live state.
@@ -379,6 +394,16 @@ class EngineController:
 
     def _do_start(self) -> None:
         use_core = self.uses_core
+
+        # loud, actionable warning when the chosen mode needs a profile but
+        # none is selected (otherwise we'd silently do a plain SNI forward that
+        # can never reach a VLESS/VMess/Trojan server — the "still need V2RayTun"
+        # bug). The user must either pick a profile or switch to "SNI Only".
+        if self.wants_core_but_no_profile:
+            self._log(
+                "⚠ هیچ کانفیگی انتخاب نشده — این حالت به یک پروفایل "
+                "VLESS/VMess/Trojan نیاز دارد. لطفاً یک کانفیگ انتخاب کنید "
+                "یا حالت را روی «SNI Only» بگذارید.")
 
         # --- 1. work out the spoofer's listen port + upstream target ---
         if use_core:

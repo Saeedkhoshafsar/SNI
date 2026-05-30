@@ -47,6 +47,14 @@ class Palette:
     radius: int = 14
     radius_sm: int = 9
     pad: int = 14
+    # 3-D gradient stops (backdrop + cards). Sensible defaults derived from the
+    # base/surface so older code keeps working; each theme overrides them.
+    bg_grad_a: str = "#10141a"
+    bg_grad_b: str = "#0b0e13"
+    bg_grad_c: str = "#070a0e"
+    card_grad_top: str = "rgba(34, 41, 51, 0.96)"
+    card_grad_bottom: str = "rgba(20, 25, 32, 0.96)"
+    card_highlight: str = "rgba(255, 255, 255, 0.06)"
 
 
 # ── Gaming × Hacker dark ──────────────────────────────────────────────
@@ -56,13 +64,13 @@ class Palette:
 DARK = Palette(
     name="dark",
     base="#0a0c10",                       # deep matte near-black
-    surface="rgba(18, 22, 28, 0.82)",     # matte panel
-    surface_alt="rgba(28, 34, 42, 0.88)", # raised / hovered
+    surface="#161b22",                    # matte panel (solid now)
+    surface_alt="#1d242d",                # raised / hovered
     elevated="#12161c",
-    border="rgba(120, 230, 255, 0.10)",   # faint cyan hairline
+    border="rgba(120, 230, 255, 0.12)",   # faint cyan hairline
     text="#d7e3ec",
-    text_muted="#7d8b99",
-    text_faint="#4a5663",
+    text_muted="#8a99a8",
+    text_faint="#5a6675",
     accent="#27e0c8",                      # neon cyan-teal (hacker)
     accent_hover="#46f0d8",
     accent_press="#13c6b0",
@@ -72,6 +80,13 @@ DARK = Palette(
     danger="#ff6b81",
     shadow="rgba(0, 0, 0, 0.65)",
     is_dark=True,
+    # 3-D gradient identity
+    bg_grad_a="#141b24",
+    bg_grad_b="#0c1016",
+    bg_grad_c="#07090d",
+    card_grad_top="#1e252e",
+    card_grad_bottom="#161b22",
+    card_highlight="rgba(255, 255, 255, 0.07)",
 )
 
 # Secondary "gaming" accent (violet) — used by widgets/animations in step 2.
@@ -83,10 +98,10 @@ ACCENT2_DARK = "#9b7bff"
 LIGHT = Palette(
     name="light",
     base="#eef2f4",
-    surface="rgba(255, 255, 255, 0.86)",
-    surface_alt="rgba(226, 234, 236, 0.92)",
+    surface="#ffffff",
+    surface_alt="#e7edf0",
     elevated="#ffffff",
-    border="rgba(10, 60, 70, 0.12)",
+    border="rgba(10, 60, 70, 0.14)",
     text="#10171c",
     text_muted="#48565f",
     text_faint="#8a98a0",
@@ -99,6 +114,12 @@ LIGHT = Palette(
     danger="#d8415c",
     shadow="rgba(20, 40, 50, 0.18)",
     is_dark=False,
+    bg_grad_a="#f4f8fa",
+    bg_grad_b="#e7eef1",
+    bg_grad_c="#dce5e9",
+    card_grad_top="#ffffff",
+    card_grad_bottom="#f1f5f7",
+    card_highlight="rgba(255, 255, 255, 0.9)",
 )
 
 ACCENT2_LIGHT = "#7a52e8"
@@ -125,13 +146,24 @@ def build_qss(p: Palette) -> str:
     }}
 
     QWidget#RootBackdrop {{
-        background: {p.base};
+        /* diagonal multi-stop gradient gives the window real depth (3-D feel,
+           feedback 6) instead of a flat fill */
+        background: qlineargradient(
+            x1:0, y1:0, x2:1, y2:1,
+            stop:0    {p.bg_grad_a},
+            stop:0.55 {p.bg_grad_b},
+            stop:1    {p.bg_grad_c});
+        border: 1px solid {p.border};
+        border-radius: 14px;
     }}
 
     /* ---- Cards / panels ---- */
     QFrame.Card, QFrame#Card {{
-        background: {p.surface};
+        background: qlineargradient(
+            x1:0, y1:0, x2:0, y2:1,
+            stop:0 {p.card_grad_top}, stop:1 {p.card_grad_bottom});
         border: 1px solid {p.border};
+        border-top: 1px solid {p.card_highlight};   /* top edge catches light */
         border-radius: {p.radius}px;
     }}
     QFrame#CardAlt {{
@@ -227,14 +259,33 @@ def build_qss(p: Palette) -> str:
         background: {p.surface_alt};
         border: 1px solid {p.border};
         border-radius: {p.radius_sm}px;
-        padding: 8px 10px;
+        padding: 10px 12px;
+        min-height: 22px;          /* guarantees text is never clipped (Win DPI) */
+        color: {p.text};
+        font-size: 13.5px;
         selection-background-color: {p.accent};
         selection-color: {p.on_accent};
     }}
+    QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{
+        border: 1px solid {p.text_faint};
+    }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
         border: 1px solid {p.accent};
+        background: {p.surface};
     }}
-    QComboBox::drop-down {{ border: none; width: 22px; }}
+    QLineEdit::placeholder {{ color: {p.text_faint}; }}
+
+    QComboBox::drop-down {{
+        border: none; width: 26px;
+        subcontrol-origin: padding; subcontrol-position: center right;
+    }}
+    QComboBox::down-arrow {{
+        image: none;
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-top: 6px solid {p.text_muted};
+        width: 0; height: 0; margin-right: 8px;
+    }}
     QComboBox QAbstractItemView {{
         background: {p.elevated};
         border: 1px solid {p.border};
@@ -242,6 +293,47 @@ def build_qss(p: Palette) -> str:
         selection-background-color: {p.accent};
         selection-color: {p.on_accent};
         padding: 4px;
+        outline: none;
+    }}
+    QComboBox QAbstractItemView::item {{ min-height: 26px; padding: 4px 8px; }}
+
+    /* spinbox up/down buttons — give them real width so they're clickable */
+    QSpinBox::up-button, QSpinBox::down-button {{
+        subcontrol-origin: border;
+        width: 22px;
+        background: {p.surface};
+        border-left: 1px solid {p.border};
+    }}
+    QSpinBox::up-button {{ subcontrol-position: top right; border-top-right-radius: {p.radius_sm}px; }}
+    QSpinBox::down-button {{ subcontrol-position: bottom right; border-bottom-right-radius: {p.radius_sm}px; }}
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {p.elevated}; }}
+    QSpinBox::up-arrow {{
+        border-left: 4px solid transparent; border-right: 4px solid transparent;
+        border-bottom: 5px solid {p.text_muted}; width: 0; height: 0;
+    }}
+    QSpinBox::down-arrow {{
+        border-left: 4px solid transparent; border-right: 4px solid transparent;
+        border-top: 5px solid {p.text_muted}; width: 0; height: 0;
+    }}
+
+    /* ---- Checkboxes ---- */
+    QCheckBox {{
+        color: {p.text};
+        spacing: 9px;
+        padding: 4px 0;
+        font-size: 13.5px;
+    }}
+    QCheckBox::indicator {{
+        width: 19px; height: 19px;
+        border: 1px solid {p.border};
+        border-radius: 5px;
+        background: {p.surface_alt};
+    }}
+    QCheckBox::indicator:hover {{ border: 1px solid {p.accent}; }}
+    QCheckBox::indicator:checked {{
+        background: {p.accent};
+        border: 1px solid {p.accent};
+        image: none;
     }}
 
     /* ---- Scrollbars ---- */
