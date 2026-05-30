@@ -41,6 +41,7 @@ _TRANSPORT = [
     ("host", "Host هدر", "line"),
     ("path", "مسیر / serviceName", "line"),
     ("header_type", "نوع هدر", "line"),
+    ("mode", "حالت XHTTP (auto/packet-up/…)", "line"),
 ]
 _SECURITY = [
     ("security", "امنیت", "combo:security"),

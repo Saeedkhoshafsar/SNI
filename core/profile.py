@@ -16,7 +16,8 @@ from typing import Any
 
 # Supported enumerations (kept as plain strings for JSON friendliness)
 PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks")
-TRANSPORTS = ("tcp", "ws", "grpc", "http", "h2", "quic", "kcp")
+TRANSPORTS = ("tcp", "ws", "grpc", "http", "h2", "quic", "kcp",
+              "xhttp", "splithttp", "httpupgrade")
 SECURITIES = ("none", "tls", "reality", "xtls")
 
 
@@ -43,6 +44,7 @@ class Profile:
     path: str = "/"                  # ws/h2 path  OR  grpc serviceName
     service_name: str = ""           # grpc serviceName (if distinct)
     header_type: str = "none"        # tcp header type (e.g. http)
+    mode: str = ""                   # xhttp/splithttp mode (auto/packet-up/stream-up/stream-one)
 
     # --- security / TLS ---
     security: str = "none"           # one of SECURITIES

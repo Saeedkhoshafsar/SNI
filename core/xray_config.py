@@ -26,10 +26,14 @@ from core.profile import Profile
 
 def _stream_settings(p: Profile, *, gaming: bool = False) -> dict[str, Any]:
     net = p.transport if p.transport in (
-        "tcp", "ws", "grpc", "http", "h2", "quic", "kcp") else "tcp"
+        "tcp", "ws", "grpc", "http", "h2", "quic", "kcp",
+        "xhttp", "splithttp", "httpupgrade") else "tcp"
     # xray uses "http" for h2
     if net == "h2":
         net = "http"
+    # splithttp is the older Xray name for xhttp — normalise to the current one
+    if net == "splithttp":
+        net = "xhttp"
 
     stream: dict[str, Any] = {"network": net}
 
@@ -72,6 +76,19 @@ def _stream_settings(p: Profile, *, gaming: bool = False) -> dict[str, Any]:
         stream["httpSettings"] = {
             "path": p.path or "/",
             "host": [p.host or p.sni or p.address],
+        }
+    elif net == "xhttp":
+        # XHTTP (a.k.a. splithttp) — the modern CDN-friendly HTTP transport.
+        xhttp: dict[str, Any] = {
+            "host": p.host or p.sni or p.address,
+            "path": p.path or "/",
+            "mode": p.mode or "auto",
+        }
+        stream["xhttpSettings"] = xhttp
+    elif net == "httpupgrade":
+        stream["httpupgradeSettings"] = {
+            "path": p.path or "/",
+            "host": p.host or p.sni or p.address,
         }
     elif net == "tcp" and p.header_type == "http":
         stream["tcpSettings"] = {

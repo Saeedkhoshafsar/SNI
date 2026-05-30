@@ -37,6 +37,51 @@ def test_vless_outbound():
     assert ss["tlsSettings"]["fingerprint"] == "chrome"
 
 
+def test_vless_xhttp_outbound():
+    """XHTTP transport must produce xhttpSettings (not silently fall back to
+    tcp) so configs added in-app actually connect — regression for the
+    'still need v2rayN/V2RayTun' report."""
+    link = ("vless://uuid-x@127.0.0.1:40443?encryption=none&security=tls"
+            "&sni=worker.example.dev&fp=chrome&type=xhttp"
+            "&host=worker.example.dev&path=%2Fvless-xhttp&mode=auto#X")
+    ob = build_outbound(parse_link(link))
+    ss = ob["streamSettings"]
+    assert ss["network"] == "xhttp"
+    assert ss["security"] == "tls"
+    assert ss["tlsSettings"]["serverName"] == "worker.example.dev"
+    assert ss["tlsSettings"]["fingerprint"] == "chrome"
+    xh = ss["xhttpSettings"]
+    assert xh["host"] == "worker.example.dev"
+    assert xh["path"] == "/vless-xhttp"
+    assert xh["mode"] == "auto"
+    # no stale tcp settings leaked in
+    assert "tcpSettings" not in ss and "wsSettings" not in ss
+
+
+def test_splithttp_normalises_to_xhttp():
+    link = ("vless://u@h.example:443?type=splithttp&security=tls&sni=h.example"
+            "&host=h.example&path=%2Fs#S")
+    ss = build_outbound(parse_link(link))["streamSettings"]
+    assert ss["network"] == "xhttp"
+    assert ss["xhttpSettings"]["path"] == "/s"
+
+
+def test_xhttp_mode_defaults_auto():
+    link = ("vless://u@h.example:443?type=xhttp&security=tls&sni=h.example"
+            "&host=h.example&path=%2Fx#X")   # no mode= → defaults to auto
+    ss = build_outbound(parse_link(link))["streamSettings"]
+    assert ss["xhttpSettings"]["mode"] == "auto"
+
+
+def test_httpupgrade_outbound():
+    link = ("vless://u@h.example:443?type=httpupgrade&security=tls"
+            "&sni=h.example&host=h.example&path=%2Fhu#HU")
+    ss = build_outbound(parse_link(link))["streamSettings"]
+    assert ss["network"] == "httpupgrade"
+    assert ss["httpupgradeSettings"]["path"] == "/hu"
+    assert ss["httpupgradeSettings"]["host"] == "h.example"
+
+
 def test_vmess_outbound():
     import base64
     payload = {"add": "v.com", "port": "443", "id": "vm-id", "aid": "0",

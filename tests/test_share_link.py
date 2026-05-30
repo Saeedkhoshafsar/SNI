@@ -40,6 +40,45 @@ def test_vless_ws_tls():
     assert p.is_tls and not p.validate()
 
 
+def test_vless_xhttp_cloudflare():
+    """A real-world VLESS+XHTTP-over-Cloudflare link (regression for the
+    'added configs don't work / still need v2rayN' bug)."""
+    link = ("vless://84524180-c2d5-4bc1-83bb-c36f22d69a3b@127.0.0.1:40443"
+            "?encryption=none&security=tls"
+            "&sni=lucky-union-b89c.hamijafayi.workers.dev&fp=chrome"
+            "&insecure=0&allowInsecure=0&type=xhttp"
+            "&host=lucky-union-b89c.hamijafayi.workers.dev"
+            "&path=%2Fvless-xhttp&mode=auto#vls-cf-xhttp")
+    p = parse_vless(link)
+    assert p.transport == "xhttp"
+    assert p.mode == "auto"
+    assert p.security == "tls"
+    assert p.sni == "lucky-union-b89c.hamijafayi.workers.dev"
+    assert p.host == "lucky-union-b89c.hamijafayi.workers.dev"
+    assert p.path == "/vless-xhttp"
+    assert p.fingerprint == "chrome"
+    assert p.is_tls and not p.validate()
+
+
+def test_trojan_xhttp_mode_captured():
+    link = ("trojan://pw@h.example:443?type=xhttp&security=tls&sni=h.example"
+            "&host=h.example&path=%2Fx&mode=stream-up#TJ")
+    p = parse_link(link)
+    assert p.transport == "xhttp" and p.mode == "stream-up"
+
+
+def test_vmess_xhttp_mode_captured():
+    payload = {
+        "v": "2", "ps": "VM", "add": "v.example.com", "port": "443",
+        "id": "aaaa-bbbb", "aid": "0", "net": "xhttp", "type": "none",
+        "host": "v.example.com", "path": "/vm", "tls": "tls",
+        "sni": "v.example.com", "mode": "packet-up",
+    }
+    link = "vmess://" + _b64(json.dumps(payload))
+    p = parse_vmess(link)
+    assert p.transport == "xhttp" and p.mode == "packet-up"
+
+
 def test_vless_reality():
     link = ("vless://uuid-abc@1.2.3.4:8443?type=tcp&security=reality"
             "&sni=microsoft.com&fp=chrome&pbk=PUBKEY&sid=ab12&flow=xtls-rprx-vision#R")

@@ -73,6 +73,22 @@ class ProfileDialogTest(unittest.TestCase):
         # original raw link is preserved for debugging
         self.assertEqual(out.raw, prof.raw)
 
+    def test_xhttp_mode_prefills_and_survives_edit(self):
+        prof = parse_link(
+            "vless://u-9@127.0.0.1:40443?encryption=none&security=tls"
+            "&sni=w.example.dev&fp=chrome&type=xhttp&host=w.example.dev"
+            "&path=%2Fvless-xhttp&mode=auto#X")
+        dlg = ProfileDialog(prof)
+        # xhttp is a selectable transport and mode is shown
+        self.assertEqual(dlg._widgets["transport"].currentText(), "xhttp")
+        self.assertEqual(dlg._widgets["mode"].text(), "auto")
+        # editing an unrelated field keeps xhttp + mode intact
+        dlg._widgets["remark"].setText("Renamed")
+        out = dlg.collect()
+        self.assertEqual(out.transport, "xhttp")
+        self.assertEqual(out.mode, "auto")
+        self.assertEqual(out.path, "/vless-xhttp")
+
     def test_accept_blocks_on_invalid_then_succeeds(self):
         prof = parse_link(self.VLESS)
         dlg = ProfileDialog(prof)
