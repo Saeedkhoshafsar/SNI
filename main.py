@@ -123,6 +123,13 @@ class ProxyServer:
         # optional resilience controller handed in by the engine
         self.resilience = None
 
+        # Startup handshake: ``start()`` blocks on this until the listen socket
+        # is actually bound (or the bind failed). Without it the engine would
+        # launch xray *before* the spoofer is listening on 40443, so xray's very
+        # first dial hits a closed port → "connection refused" → silent failure.
+        self._ready_event = threading.Event()
+        self._start_error: str | None = None
+
         # UI callbacks (thread-safe, fire-and-forget)
         self.on_log = None
         self.on_status_change = None
@@ -289,16 +296,31 @@ class ProxyServer:
     # ---------------------------------------------------------------- server
 
     async def _serve(self):
-        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_sock.setblocking(False)
-        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_sock.bind((self.listen_host, self.listen_port))
-        self._configure_sock(self._server_sock, self.gaming_mode)
-        self._server_sock.listen(128)
+        try:
+            self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._server_sock.setblocking(False)
+            self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._server_sock.bind((self.listen_host, self.listen_port))
+            self._configure_sock(self._server_sock, self.gaming_mode)
+            self._server_sock.listen(128)
+        except OSError as exc:
+            # bind failed (port busy / permission) — report it and unblock the
+            # caller so the engine doesn't hang waiting for a listener that will
+            # never come up.
+            self._start_error = (
+                f"نتوانست روی {self.listen_host}:{self.listen_port} گوش دهد: "
+                f"{exc}. آیا پورت {self.listen_port} توسط برنامهٔ دیگری "
+                f"(مثلاً V2RayTun) اشغال شده؟")
+            self._log(self._start_error, "error")
+            self._running = False
+            self._ready_event.set()
+            return
 
         loop = asyncio.get_running_loop()
         self._log(f"Listening on {self.listen_host}:{self.listen_port}")
         self._running = True
+        # the listen socket is now bound — release start() so xray can dial us
+        self._ready_event.set()
         if self.on_status_change:
             self.on_status_change(True)
 
@@ -346,12 +368,32 @@ class ProxyServer:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
+        # Bring up the WinDivert packet injector first. Opening the WinDivert
+        # handle is exactly where a missing driver / lack of Administrator
+        # rights blows up — previously that exception died silently inside this
+        # daemon thread, so the spoofer "ran" but never injected the decoy
+        # ClientHello and every connection timed out with no explanation. We now
+        # catch it, surface a clear message, and abort the start cleanly.
         w_filter = (
             f"tcp and ((ip.SrcAddr == {self.interface_ipv4}"
             f" and ip.DstAddr == {self.connect_ip})"
             f" or (ip.SrcAddr == {self.connect_ip}"
             f" and ip.DstAddr == {self.interface_ipv4}))")
-        self._injector = FakeTcpInjector(w_filter, self._fake_connections)
+        try:
+            self._injector = FakeTcpInjector(w_filter, self._fake_connections)
+        except Exception as exc:
+            self._start_error = (
+                f"راه‌اندازی WinDivert ناموفق بود: {exc}. مطمئن شوید برنامه "
+                f"«با دسترسی Administrator» اجرا شده و درایور WinDivert نصب "
+                f"است (در حالت SNI-spoof الزامی است).")
+            self._log(self._start_error, "error")
+            self._running = False
+            self._ready_event.set()
+            self._loop.close()
+            self._loop = None
+            if self.on_status_change:
+                self.on_status_change(False)
+            return
         threading.Thread(target=self._injector.run, daemon=True).start()
         self._log("Packet injector started")
 
@@ -359,21 +401,41 @@ class ProxyServer:
             self._loop.run_until_complete(self._serve())
         except Exception:
             self._log(traceback.format_exc(), "error")
+            self._ready_event.set()  # never leave start() hanging
         finally:
             self._loop.close()
             self._loop = None
 
     # ---------------------------------------------------------------- public
 
-    def start(self):
+    def start(self) -> bool:
+        """Start the spoofer and **block until it is listening (or failed)**.
+
+        Returns ``True`` once the listen socket is bound and the injector is up,
+        ``False`` if startup failed (the reason is in :attr:`_start_error` and
+        has already been logged). Blocking until ready is essential: the engine
+        launches xray immediately after this returns, and xray's first dial must
+        land on an already-listening 40443 — otherwise it hits a closed port.
+        """
         if self._thread and self._thread.is_alive():
             self._log("Already running")
-            return
+            return True
         if not self.interface_ipv4:
-            self._log("Cannot detect network interface. Check connection.", "error")
-            return
+            self._start_error = (
+                "نتوانست رابط شبکه را تشخیص دهد. اتصال اینترنت/مسیر به "
+                f"{self.connect_ip} را بررسی کنید.")
+            self._log(self._start_error, "error")
+            return False
+        self._start_error = None
+        self._ready_event.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+        # wait for _serve() to bind (or _run_loop to report a startup error)
+        if not self._ready_event.wait(timeout=10):
+            self._start_error = "راه‌اندازی spoofer در زمان تعیین‌شده کامل نشد"
+            self._log(self._start_error, "error")
+            return False
+        return self._running and self._start_error is None
 
     def stop(self):
         self._running = False

@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import core.engine as engine_mod
 from core.engine import (
-    EngineController, STATUS_IDLE, STATUS_ACTIVE, STATUS_CONNECTING)
+    EngineController, STATUS_IDLE, STATUS_ACTIVE, STATUS_CONNECTING,
+    STATUS_ERROR)
 from core.profile import Profile
 
 
@@ -35,14 +36,18 @@ class FakeProxy:
         self.on_traffic = None
         self.started = False
         self.stopped = False
+        self._start_error = None
         FakeProxy.last_instance = self
 
     def start(self):
+        # mirror the real ProxyServer contract: start() blocks until listening
+        # and returns True on success / False on failure.
         self.started = True
         if self.on_log:
             self.on_log("fake proxy started")
         if self.on_status_change:
             self.on_status_change(True)
+        return True
 
     def stop(self):
         self.stopped = True
@@ -186,6 +191,34 @@ class EngineControllerTest(unittest.TestCase):
         ctrl.stop()
         self.assertTrue(proxy.stopped)
         self.assertTrue(xray.stopped)
+
+    def test_spoofer_start_failure_aborts_and_no_xray(self):
+        # If the spoofer can't come up (e.g. WinDivert missing / port busy),
+        # start() returns False — the engine must NOT launch xray against a
+        # dead port and must report STATUS_ERROR. This is the regression guard
+        # for the "connects in V2RayTun but not standalone" class of bug.
+        class FailingProxy(FakeProxy):
+            def start(self):
+                self.started = True
+                self._start_error = "WinDivert نصب نیست"
+                return False
+
+        import main as fake_main
+        fake_main.ProxyServer = FailingProxy
+        try:
+            ctrl = EngineController({
+                "connection_mode": "SNI + Warp", "LISTEN_PORT": 40443,
+            })
+            ctrl.set_profile(self._profile())
+            logs = []
+            ctrl.on_log = logs.append
+            ctrl.start()
+            self.assertTrue(_wait_status(ctrl, STATUS_ERROR))
+            # xray must never have been chained behind a dead spoofer
+            self.assertIsNone(FakeXray.last_instance)
+            self.assertTrue(any("WinDivert" in m for m in logs))
+        finally:
+            fake_main.ProxyServer = FakeProxy
 
     def test_plain_tunnel_runs_xray_directly_no_spoofer(self):
         # plain "Tunnel" must behave like V2RayTun: xray connects straight to
