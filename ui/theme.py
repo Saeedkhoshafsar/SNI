@@ -311,13 +311,24 @@ def build_qss(p: Palette) -> str:
     QScrollArea#DialogScroll > QWidget > QWidget {{ background: transparent; }}
 
     /* ---- Log view ---- */
-    QPlainTextEdit#Log {{
+    QTextEdit#Log {{
         background: {p.surface_alt};
         border: 1px solid {p.border};
         border-radius: {p.radius_sm}px;
         font-family: "Cascadia Code", "Consolas", monospace;
         font-size: 12.5px;
         padding: 8px;
+    }}
+    QComboBox#LogFilter {{
+        min-width: 88px;
+        padding: 5px 8px;
+    }}
+    QLineEdit#LogSearch {{
+        padding: 6px 10px;
+    }}
+    QLabel#LogCounters {{
+        font-family: "Cascadia Code", "Consolas", monospace;
+        font-size: 11.5px;
     }}
     QPlainTextEdit#PingOutput {{
         background: {p.surface_alt};

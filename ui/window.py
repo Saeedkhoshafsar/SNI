@@ -20,7 +20,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPlainTextEdit, QProgressBar, QPushButton,
-    QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
+    QSpinBox, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from ui import win_effects
@@ -32,6 +32,7 @@ from ui.animations import CountUp, PulseDot, stagger_in
 
 from core.config_store import ConfigStore
 from core.engine import EngineController
+from core.logbuffer import LEVELS, LogBuffer
 from core.profile import Profile
 from core.share_link import parse_link, parse_subscription, ShareLinkError
 from ui.engine_bridge import EngineBridge
@@ -1069,8 +1070,30 @@ class DiagnosticsPage(QWidget):
 
 
 class LogPage(QWidget):
+    """Professional log console (step 23).
+
+    * each line is timestamped + classified (info/ok/warn/err) and coloured
+    * a level filter + a text search narrow what's shown (re-rendered from the
+      backing :class:`~core.logbuffer.LogBuffer`, which stays bounded)
+    * a live per-level counter strip ("info 12 · ok 3 · warn 1 · err 0")
+    The classification/filter/count logic is pure (``core.logbuffer``); this
+    widget only renders it.
+    """
+
+    # per-level text colours (kept here so the QSS file stays theme-only)
+    _COLORS = {
+        "info": "#9fb3c8",
+        "ok":   "#3ddc97",
+        "warn": "#f4b740",
+        "err":  "#ff6b6b",
+    }
+    _LEVEL_FA = {"all": "همه", "info": "اطلاع", "ok": "موفق",
+                 "warn": "هشدار", "err": "خطا"}
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._buffer = LogBuffer(capacity=2000)
+
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
         root.setSpacing(16)
@@ -1079,34 +1102,104 @@ class LogPage(QWidget):
 
         card = Card()
         b = card.body()
-        self.log = QPlainTextEdit()
+
+        # --- toolbar: filter + search + counters ---
+        bar = QHBoxLayout()
+        bar.setSpacing(10)
+        bar.addWidget(self._field_label("سطح"))
+        self.cmb_level = QComboBox()
+        self.cmb_level.setObjectName("LogFilter")
+        for lv in ("all",) + LEVELS:
+            self.cmb_level.addItem(self._LEVEL_FA.get(lv, lv), lv)
+        self.cmb_level.currentIndexChanged.connect(self._rerender)
+        bar.addWidget(self.cmb_level)
+
+        self.search = QLineEdit()
+        self.search.setObjectName("LogSearch")
+        self.search.setPlaceholderText("جستجو در لاگ…")
+        self.search.textChanged.connect(self._rerender)
+        bar.addWidget(self.search, 1)
+
+        self.counters = QLabel("")
+        self.counters.setObjectName("LogCounters")
+        bar.addWidget(self.counters)
+        b.addLayout(bar)
+
+        # --- the console itself (rich text so each line can be coloured) ---
+        self.log = QTextEdit()
         self.log.setObjectName("Log")
         self.log.setReadOnly(True)
-        self.log.setPlainText(
-            "[init] SNI Spoofer UI بارگذاری شد\n"
-            "[init] منتظر شروع تونل…\n"
-        )
         b.addWidget(self.log)
 
         clr = QHBoxLayout()
         clr.addStretch(1)
         self.btn_clear = QPushButton("پاک‌سازی")
         self.btn_clear.setObjectName("Ghost")
-        self.btn_clear.clicked.connect(lambda: self.log.clear())
+        self.btn_clear.clicked.connect(self.clear)
         clr.addWidget(self.btn_clear)
         b.addLayout(clr)
 
         root.addWidget(card, 1)
 
+        # seed lines so the page never looks empty
+        self.append("SNI Spoofer UI بارگذاری شد")
+        self.append("منتظر شروع تونل…")
+
+    # -- helpers ----------------------------------------------------------
+    def _field_label(self, t: str) -> QLabel:
+        lbl = QLabel(t)
+        lbl.setObjectName("Muted")
+        return lbl
+
+    def _current_filter(self) -> str:
+        data = self.cmb_level.currentData()
+        return data if data else "all"
+
+    def _row_html(self, entry) -> str:
+        color = self._COLORS.get(entry.level, self._COLORS["info"])
+        # escape minimal HTML so messages can't break the markup
+        msg = (entry.message.replace("&", "&amp;")
+                            .replace("<", "&lt;").replace(">", "&gt;"))
+        return (f'<span style="color:#5b6b7b">[{entry.stamp}]</span> '
+                f'<span style="color:{color};font-weight:600">'
+                f'{entry.level.upper():<4}</span> '
+                f'<span style="color:#d8e2ec">{msg}</span>')
+
+    def _update_counters(self) -> None:
+        c = self._buffer.counts
+        parts = []
+        for lv in LEVELS:
+            col = self._COLORS[lv]
+            parts.append(f'<span style="color:{col}">{self._LEVEL_FA[lv]} '
+                         f'{c.get(lv, 0)}</span>')
+        self.counters.setText(" · ".join(parts))
+
+    # -- public API (slots) ----------------------------------------------
     def append(self, line: str) -> None:
         """Slot for the engine's log signal (thread-safe via Qt queued conn)."""
-        # keep the buffer bounded so long sessions stay responsive
-        doc = self.log.document()
-        if doc.blockCount() > 1500:
-            self.log.clear()
-        self.log.appendPlainText(line)
+        entry = self._buffer.add(line)
+        self._update_counters()
+        # if the new entry passes the active filter, append it incrementally
+        from core.logbuffer import matches
+        if matches(entry, level=self._current_filter(),
+                   query=self.search.text()):
+            self.log.append(self._row_html(entry))
+            sb = self.log.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+    def _rerender(self, *args) -> None:
+        """Rebuild the visible console from the buffer under current filters."""
+        rows = self._buffer.filtered(level=self._current_filter(),
+                                     query=self.search.text())
+        html = "<br>".join(self._row_html(e) for e in rows)
+        self.log.setHtml(html)
         sb = self.log.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def clear(self) -> None:
+        self._buffer.clear()
+        self.log.clear()
+        self._update_counters()
 
 
 # ---------------------------------------------------------------------------

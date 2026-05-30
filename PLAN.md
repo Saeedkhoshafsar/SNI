@@ -85,7 +85,7 @@ Cloudflare Worker (`type=xhttp`, `mode=auto`). علت ریشه‌ای: `_stream_
 
 - [x] استپ ۲۱ — **رفع باگ XHTTP** (بحرانی): افزودن `xhttp`/`splithttp`/`httpupgrade` به `TRANSPORTS`، فیلد `mode` به `Profile`، گرفتن `mode=` در پارسر (vless/trojan/vmess)، ساخت درست `xhttpSettings`/`httpupgradeSettings` در `_stream_settings` (با نرمال‌سازی `splithttp→xhttp`)، و نمایش/ویرایش `mode` در دیالوگ پروفایل (بازخورد ۱۱)  ✅ 2026-05-30
 - [x] استپ ۲۲ — پروکسی سیستم ویندوز (set/unset رجیستری) + سوییچ در UI «تونل/پروکسی سیستم» (بازخورد ۷)  ✅ 2026-05-30
-- [ ] استپ ۲۳ — لاگ حرفه‌ای: timestamp، سطح‌بندی info/ok/warn/err با رنگ، فیلتر، شمارنده (بازخورد ۱)
+- [x] استپ ۲۳ — لاگ حرفه‌ای: timestamp، سطح‌بندی info/ok/warn/err با رنگ، فیلتر، شمارنده (بازخورد ۱)  ✅ 2026-05-30
 - [ ] استپ ۲۴ — صفحه‌ی استراتژی کلیک‌پذیر + بازطراحی تم سه‌بعدی/مدرن (کارت‌های معلق/شیشه/سایه عمیق/هاور) + رفع drag پنجره (بازخورد ۴/۵/۶)
 
 ---
@@ -351,3 +351,14 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **`ui/window.py`** — در SettingsPage: چک‌باکس `chk_system_proxy` + برچسب راهنمای `proxy_hint` + `_update_proxy_hint` که تفاوت «تونل» و «پروکسی سیستم» را توضیح می‌دهد؛ بارگذاری/جمع‌آوری در `load_from`/`collect`.
 - **چرا فقط در حالت‌های دارای xray:** در «SNI Only» اسپوفر یک forwarder شفاف است و پروکسی HTTP واقعی‌ای وجود ندارد که OS را به آن اشاره دهیم؛ پس toggle در آن حالت نادیده گرفته شده و لاگ می‌شود.
 - تست‌ها: `tests/test_system_proxy.py` (+۱۰: منطق خالص + چرخهٔ enable/disable با `_FakeBackend` + swallow خطای reader) + `tests/test_engine.py` (+۳: enable روی start/disable روی stop، نادیده‌گرفتن در SNI Only، خاموش بودن پیش‌فرض) + `tests/test_ping_ui.py` (+۳: round-trip toggle، خاموش پیش‌فرض، تغییر hint). مجموعاً **۲۸۷ تست سبز + ۲ skip**.
+
+## ✅ استپ ۲۳ — لاگ حرفه‌ای (timestamp + سطح‌بندی رنگی + فیلتر + شمارنده) (2026-05-30)
+**چرا:** بازخورد ۱ — لاگ قبلی فقط یک `QPlainTextEdit` تک‌رنگ بود؛ کاربر می‌خواست لاگ مثل ابزارهای حرفه‌ای: زمان هر رویداد، رنگ بر اساس شدت، امکان فیلتر و شمارش.
+- **`core/logbuffer.py` (جدید)** — تمام منطق به‌صورت خالص و OS-agnostic (الگوی `core/admin.py`/`core/system_proxy.py`)، پس بدون Qt تست می‌شود:
+  - `classify(message)` — استنتاج سطح (`info/ok/warn/err`) از متن پیام؛ engine همچنان فقط رشته می‌فرستد ولی با کلیدواژه‌های فارسی/انگلیسی (`خطا`/`ناموفق`/`failed`→err، `هشدار`/`throttl`/`نادیده`→warn، `✓`/`برقرار شد`/`روشن شد`→ok) رنگ می‌گیرد. شدیدترین تطبیق برنده است (err > warn > ok).
+  - `LogEntry` (message/level/ts با `stamp` به‌صورت `HH:MM:SS` و `format()`).
+  - `matches(entry, level, query)` — فیلتر سطح + جستجوی متنِ case-insensitive (خالص).
+  - `LogBuffer` — بافر کرانمند چرخشی با شمارندهٔ هر سطح؛ `add` (با evict قدیمی‌ترین و کاهش شمارنده)، `clear`، `filtered`، `counts_summary`.
+- **`ui/window.py` — بازنویسی `LogPage`** — از `QPlainTextEdit` به `QTextEdit` (rich text برای رنگ هر خط). نوار ابزار: کمبوی فیلتر سطح (`cmb_level` با گزینه‌های فارسی)، جستجوی متن (`search`)، نوار شمارندهٔ زندهٔ رنگی (`counters`). `append` خط جدید را طبقه‌بندی، شمارش، و در صورت عبور از فیلتر افزایشی رندر می‌کند؛ تغییر فیلتر/جستجو کل نما را از بافر بازسازی می‌کند (`_rerender`). رنگ‌ها داخل ویجت تعریف شده‌اند تا QSS فقط مخصوص تم بماند. HTML پیام escape می‌شود تا markup نشکند.
+- **`ui/theme.py`** — `#Log` از `QPlainTextEdit` به `QTextEdit` تغییر کرد؛ استایل `#LogFilter`/`#LogSearch`/`#LogCounters` افزوده شد.
+- تست‌ها: `tests/test_logbuffer.py` (+۱۵: classify، format، matches، add/count/evict، clear، filtered، summary) + `tests/test_log_ui.py` (+۵: seed، طبقه‌بندی/شمارش، فیلتر سطح، جستجو، clear). مجموعاً **۳۰۷ تست سبز + ۲ skip**.
