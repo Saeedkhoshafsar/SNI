@@ -28,6 +28,10 @@ class WrongChecksumStrategy(BypassStrategy):
         tags=("inject", "stateless-dpi", "no-recalc"),
     )
 
+    # The server's NIC/stack drops the corrupt segment, so it NEVER ACKs the
+    # fake → fire-and-forget. The spoofer must not block waiting for an ACK.
+    expects_ack = False
+
     # an obviously-wrong constant; any non-correct value works because the
     # server drops it and the DPI ignores L4 checksums.
     BAD_CHECKSUM = 0x0000

@@ -237,6 +237,25 @@ def build_qss(p: Palette) -> str:
     QPushButton#WinBtn:hover {{ background: {p.surface_alt}; color: {p.text}; }}
     QPushButton#WinClose:hover {{ background: {p.danger}; color: #fff; }}
 
+    /* ---- Persistent active-config status bar (visible on every tab, #9) ---- */
+    QFrame#ActiveBar {{
+        background: {p.surface};
+        border-top: 1px solid {p.border};
+        border-bottom: 1px solid {p.border};
+    }}
+    QLabel#ActiveBarDot {{ font-size: 11px; color: {p.text_faint}; }}
+    QLabel#ActiveBarDot[state="active"]     {{ color: {p.success}; }}
+    QLabel#ActiveBarDot[state="connecting"] {{ color: {p.warning}; }}
+    QLabel#ActiveBarDot[state="error"]      {{ color: {p.danger}; }}
+    QLabel#ActiveBarDot[state="idle"]       {{ color: {p.text_faint}; }}
+    QLabel#ActiveBarState {{ font-size: 12px; font-weight: 600; color: {p.text_muted}; }}
+    QLabel#ActiveBarSep {{ color: {p.border}; }}
+    QLabel#ActiveBarName {{ font-size: 12.5px; font-weight: 600; color: {p.text}; }}
+    QLabel#ActiveBarRate {{
+        font-family: "Cascadia Code", "Consolas", monospace;
+        font-size: 11.5px; color: {p.text_muted};
+    }}
+
     /* ---- Side navigation (hacker rail w/ accent edge on active) ---- */
     QPushButton#NavItem {{
         background: transparent;
@@ -394,6 +413,10 @@ def build_qss(p: Palette) -> str:
         font-family: "Cascadia Code", "Consolas", monospace;
         font-size: 11.5px; color: {p.text_muted};
     }}
+    /* inline ping-result tinting on the detail line (#3) */
+    QLabel#RowDetail[pingkind="busy"] {{ color: {p.warning}; }}
+    QLabel#RowDetail[pingkind="ok"]   {{ color: {p.success}; }}
+    QLabel#RowDetail[pingkind="err"]  {{ color: {p.danger}; }}
     QLabel#ActivePill {{
         background: {p.success}; color: {p.on_accent};
         border-radius: 8px; padding: 1px 8px;
@@ -405,11 +428,14 @@ def build_qss(p: Palette) -> str:
         padding: 1px 7px; font-size: 10.5px; font-weight: 600;
         letter-spacing: 0.4px;
     }}
-    QPushButton#RowEdit {{
+    QPushButton#RowEdit, QPushButton#RowPing, QPushButton#RowUse {{
         background: transparent; border: 1px solid {p.border};
         border-radius: 7px; color: {p.text_muted}; font-size: 13px;
     }}
     QPushButton#RowEdit:hover {{ background: {p.accent}; color: {p.on_accent}; border-color: {p.accent}; }}
+    QPushButton#RowPing:hover {{ background: {p.warning}; color: {p.on_accent}; border-color: {p.warning}; }}
+    QPushButton#RowPing:disabled {{ color: {p.text_faint}; }}
+    QPushButton#RowUse:hover {{ background: {p.success}; color: {p.on_accent}; border-color: {p.success}; }}
 
     /* ---- Profile editor dialog ---- */
     QDialog#ProfileDialog {{

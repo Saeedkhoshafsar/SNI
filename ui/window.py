@@ -46,11 +46,12 @@ def _scrollable(page: QWidget) -> QScrollArea:
     return sa
 
 from ui import win_effects
-from ui.theme import get_palette, build_qss
+from ui.theme import get_palette, build_qss, ACCENT2_DARK, ACCENT2_LIGHT
 from ui.widgets import (
-    Card, NavItem, PowerButton, ProfileRow, Sparkline, TitleBar, Toast,
+    ActiveConfigBar, Card, NavItem, NoScrollComboBox, NoScrollSpinBox,
+    PowerButton, ProfileRow, Sparkline, TitleBar, Toast,
 )
-from ui.animations import CountUp, PulseDot, stagger_in
+from ui.animations import CountUp, PulseDot, WaveBackdrop, stagger_in
 
 from core.config_store import ConfigStore
 from core.engine import EngineController
@@ -437,7 +438,7 @@ class SettingsPage(QWidget):
         form.setSpacing(8)
 
         form.addWidget(self._field_label("حالت اتصال"))
-        self.mode = QComboBox()
+        self.mode = NoScrollComboBox()
         self.mode.addItems(MODES)
         form.addWidget(self.mode)
         self.mode_hint = QLabel("")
@@ -448,7 +449,7 @@ class SettingsPage(QWidget):
         self._update_mode_hint(self.mode.currentText())
 
         form.addWidget(self._field_label("SNI جعلی"))
-        self.sni = QComboBox()
+        self.sni = NoScrollComboBox()
         self.sni.setEditable(True)
         self.sni.addItems(DEFAULT_SNIS)
         form.addWidget(self.sni)
@@ -581,7 +582,7 @@ class SettingsPage(QWidget):
         lay.setSpacing(6)
         lab = self._field_label(t)
         lay.addWidget(lab)
-        sp = QSpinBox()
+        sp = NoScrollSpinBox()
         sp.setRange(1, 65535)
         sp.setValue(val)
         sp.setMinimumHeight(40)          # never clipped (the spinbox bug)
@@ -618,14 +619,20 @@ class ProfilesPage(QWidget):
         # --- import card ---
         imp = Card()
         ib = imp.body()
-        self.input = QLineEdit()
+        # multi-line box so several links can be pasted at once (#7). One link
+        # per line — exactly what users copy out of channels/sub pages.
+        self.input = QPlainTextEdit()
+        self.input.setObjectName("ImportBox")
         self.input.setPlaceholderText(
-            "vless://… یا trojan://… یا لینک سابسکریپشن را اینجا بچسبانید")
+            "یک یا چند لینک را اینجا بچسبانید — هر لینک در یک خط\n"
+            "vless://…\ntrojan://…\nیا یک لینک سابسکریپشن")
+        self.input.setMaximumHeight(96)
+        self.input.setTabChangesFocus(True)
         ib.addWidget(self.input)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
-        self.btn_import = QPushButton("افزودن لینک")
+        self.btn_import = QPushButton("افزودن لینک‌ها")
         self.btn_import.setObjectName("Primary")
         self.btn_paste = QPushButton("از کلیپ‌بورد")
         self.btn_paste.setObjectName("Ghost")
@@ -689,7 +696,7 @@ class ProfilesPage(QWidget):
         strat_row.setSpacing(10)
         strat_lbl = QLabel("استراتژی برای تست:")
         strat_lbl.setObjectName("Muted")
-        self.cmb_ping_strategy = QComboBox()
+        self.cmb_ping_strategy = NoScrollComboBox()
         self.cmb_ping_strategy.addItem("همه‌ی استراتژی‌ها", "")
         for key, title, _desc in STRATEGIES:
             self.cmb_ping_strategy.addItem(title, key)
@@ -713,7 +720,6 @@ class ProfilesPage(QWidget):
 
         # wiring
         self.btn_import.clicked.connect(self._import_link)
-        self.input.returnPressed.connect(self._import_link)
         self.btn_paste.clicked.connect(self._paste)
         self.btn_sub.clicked.connect(self._import_subscription)
         self.btn_edit.clicked.connect(self._edit_selected)
@@ -736,10 +742,16 @@ class ProfilesPage(QWidget):
         self.list.blockSignals(True)
         self.list.clear()
         sel = self._store.selected_index
+        self._rows = []
         for i, p in enumerate(self._store.profiles):
             item = QListWidgetItem(self.list)
             row = ProfileRow(p, active=(i == sel))
             row.edit.connect(lambda _=False, idx=i: self._edit_index(idx))
+            # one-click activation straight from the row (#8)
+            row.activate.connect(lambda _=False, idx=i: self._activate_index(idx))
+            # inline per-row ping (#3)
+            row.ping.connect(lambda _=False, idx=i: self._ping_row(idx))
+            self._rows.append(row)
             # use a guaranteed minimum row height so the active "● فعال" pill +
             # badges never get clipped (sizeHint can under-report before layout)
             hint = row.sizeHint()
@@ -760,29 +772,78 @@ class ProfilesPage(QWidget):
     def _toast(self, text: str, kind: str = "info"):
         Toast.show_message(self.window(), text, kind)
 
-    def _import_link(self):
-        """Paste a link → parse → open the editable dialog pre-filled.
+    @staticmethod
+    def _split_links(text: str) -> list[str]:
+        """Split a pasted blob into individual share links.
 
-        The user no longer types host/port by hand: every field is decoded
-        from the share link and shown for review/edit before it is stored.
+        Accepts one-per-line *and* several links crammed on one line (we split
+        on whitespace before each ``scheme://``). Blank lines are dropped.
         """
-        text = self.input.text().strip()
+        import re
+        text = (text or "").strip()
         if not text:
+            return []
+        # put a newline before every scheme:// so glued links separate too
+        text = re.sub(r"\s+(?=[a-zA-Z][a-zA-Z0-9+.\-]*://)", "\n", text)
+        out = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                out.append(line)
+        return out
+
+    def _import_link(self):
+        """Paste one or many links → parse → add (bulk-aware, #7).
+
+        * A single link still opens the editable dialog pre-filled so the user
+          can review/tweak fields before adding.
+        * Multiple links are added in one go (bulk) — no per-link dialog — so
+          importing a whole list is one paste + one click. Lines that fail to
+          parse are reported but never abort the rest.
+        """
+        links = self._split_links(self.input.toPlainText())
+        if not links:
             return
-        try:
-            profile = parse_link(text)
-        except ShareLinkError as exc:
-            self._toast(f"لینک نامعتبر: {exc}", "err")
+
+        # single link → keep the familiar review-then-add dialog flow
+        if len(links) == 1:
+            try:
+                profile = parse_link(links[0])
+            except ShareLinkError as exc:
+                self._toast(f"لینک نامعتبر: {exc}", "err")
+                return
+            dlg = ProfileDialog(profile, self.window(),
+                                title="افزودن پروفایل جدید")
+            if dlg.exec() != ProfileDialog.Accepted:
+                self._toast("افزودن لغو شد", "info")
+                return
+            edited = dlg.result_profile
+            self._store.add_profile(edited, select=True)
+            self.input.clear()
+            self.refresh()
+            self._toast(f"پروفایل افزوده شد: {edited.display_name}", "ok")
+            self._emit_selection()
             return
-        dlg = ProfileDialog(profile, self.window(), title="افزودن پروفایل جدید")
-        if dlg.exec() != ProfileDialog.Accepted:
-            self._toast("افزودن لغو شد", "info")
+
+        # multiple links → bulk add, skipping (and counting) bad ones
+        parsed: list[Profile] = []
+        bad = 0
+        for link in links:
+            try:
+                parsed.append(parse_link(link))
+            except ShareLinkError:
+                bad += 1
+        if not parsed:
+            self._toast("هیچ لینک معتبری یافت نشد", "err")
             return
-        edited = dlg.result_profile
-        self._store.add_profile(edited, select=True)
+        added = self._store.add_profiles(parsed)
         self.input.clear()
         self.refresh()
-        self._toast(f"پروفایل افزوده شد: {edited.display_name}", "ok")
+        if bad:
+            self._toast(f"{added} پروفایل افزوده شد ({bad} لینک نامعتبر رد شد)",
+                        "warn")
+        else:
+            self._toast(f"{added} پروفایل افزوده شد", "ok")
         self._emit_selection()
 
     def _edit_selected(self):
@@ -810,7 +871,7 @@ class ProfilesPage(QWidget):
         self._toast("پروفایل به‌روزرسانی شد", "ok")
 
     def _import_subscription(self):
-        text = self.input.text().strip()
+        text = self.input.toPlainText().strip()
         if not text:
             self._toast("ابتدا متن/URL سابسکریپشن را وارد کنید", "warn")
             return
@@ -842,7 +903,7 @@ class ProfilesPage(QWidget):
 
     def _paste(self):
         cb = QGuiApplication.clipboard()
-        self.input.setText(cb.text().strip())
+        self.input.setPlainText(cb.text().strip())
 
     def _delete_selected(self):
         row = self.list.currentRow()
@@ -857,6 +918,53 @@ class ProfilesPage(QWidget):
         if 0 <= row < len(self._store.profiles):
             self._store.select(row)
             self._emit_selection()
+
+    def _activate_index(self, row: int):
+        """One-click activation: select this profile as the active server (#8).
+
+        No dialog, no extra steps — exactly what the user asked for. Refreshes
+        the list so the green ● فعال pill moves to the chosen row immediately.
+        """
+        if not (0 <= row < len(self._store.profiles)):
+            return
+        self._store.select(row)
+        self.refresh()
+        self._emit_selection()
+        prof = self._store.profiles[row]
+        self._toast(f"سرور فعال شد: {prof.display_name}", "ok")
+
+    # -- inline per-row ping (#3) -----------------------------------------
+    def _ping_row(self, row: int):
+        """Ping a single profile and show the result inline on its row."""
+        if not (0 <= row < len(self._store.profiles)):
+            return
+        if self._engine is None:
+            self._toast("موتور در دسترس نیست", "err")
+            return
+        if getattr(self, "_inline_worker", None) is not None \
+                and self._inline_worker.isRunning():
+            self._toast("یک پینگ در حال اجراست …", "warn")
+            return
+        rows = getattr(self, "_rows", [])
+        if row >= len(rows):
+            return
+        widget = rows[row]
+        widget.set_pinging()
+        self._engine.update_config(self._store.config)
+        prof = self._store.profiles[row]
+        worker = InlinePingWorker(self._engine, prof)
+        worker.result.connect(
+            lambda text, kind, w=widget: self._inline_ping_done(w, text, kind))
+        self._inline_worker = worker
+        worker.start()
+
+    def _inline_ping_done(self, widget, text: str, kind: str):
+        try:
+            widget.set_ping_state(text, kind)
+            widget.set_ping_idle()
+        except RuntimeError:
+            # the row widget may have been recreated by a refresh() — ignore
+            pass
 
     def _emit_selection(self):
         if self.on_selection_changed:
@@ -915,6 +1023,42 @@ class ProfilesPage(QWidget):
             return
         strategy = self.cmb_ping_strategy.currentData() or ""
         self._start_ping_job("strategy", profile=prof, strategy=strategy)
+
+
+class InlinePingWorker(QThread):
+    """Ping ONE profile on a worker thread and emit a compact inline result.
+
+    Emits ``result(text, kind)`` once, where ``kind`` ∈ {"ok","err"} so the
+    row can tint the inline text. Used by the per-row 📡 button (#3).
+    """
+
+    result = Signal(str, str)
+
+    def __init__(self, engine, profile, parent=None):
+        super().__init__(parent)
+        self._engine = engine
+        self._profile = profile
+
+    def run(self):  # pragma: no cover - exercised via Qt smoke, not unit
+        try:
+            res = self._engine.ping_profile(self._profile)
+        except Exception as exc:
+            self.result.emit(f"خطا: {exc}", "err")
+            return
+        if res is None:
+            self.result.emit("نتیجه‌ای دریافت نشد", "err")
+            return
+        if not res.reachable:
+            self.result.emit("✖ بدون پاسخ", "err")
+            return
+        parts = [f"{res.best_ms:.0f}ms"]
+        if res.jitter_ms is not None:
+            parts.append(f"jitter {res.jitter_ms:.0f}")
+        if res.loss > 0:
+            parts.append(f"loss {res.loss*100:.0f}%")
+        if getattr(res, "download_kbps", None) is not None:
+            parts.append(f"dl≈{res.download_kbps:.0f}KB/s")
+        self.result.emit("✔ " + " · ".join(parts), "ok")
 
 
 class StrategyPage(QWidget):
@@ -1090,12 +1234,31 @@ class DiagnosticsPage(QWidget):
         h = QLabel("توان عبوری (throughput)")
         h.setObjectName("H2")
         tb.addWidget(h)
+        # a plain-language explanation so the user knows exactly what this
+        # number means and why it may be empty (feedback #4 — "نمی‌فهمم چیه و
+        # هیچ کاری نمی‌کنه"). Throughput = how many bytes/sec are flowing right
+        # now; the bar compares that to the connection's own baseline to flag
+        # active throttling by the censor.
+        self.lbl_tp_help = QLabel(
+            "سرعت لحظه‌ای عبور داده از تونل را نشان می‌دهد. نوار، سرعت فعلی را با "
+            "«خط پایه‌ی» همین اتصال مقایسه می‌کند تا اگر سانسورچی سرعت را خفه کرد "
+            "(throttle) معلوم شود. تا وقتی متصل نشده‌اید یا ترافیکی رد و بدل نشده، "
+            "داده‌ای برای نمایش نیست.")
+        self.lbl_tp_help.setObjectName("Faint")
+        self.lbl_tp_help.setWordWrap(True)
+        tb.addWidget(self.lbl_tp_help)
+        # live current throughput (always shown while connected, even before a
+        # baseline exists — this is the "it does nothing" fix)
+        self.lbl_tp_live = QLabel("سرعت فعلی: —")
+        self.lbl_tp_live.setObjectName("H2")
+        tb.addWidget(self.lbl_tp_live)
         self.bar_tp = QProgressBar()
         self.bar_tp.setRange(0, 100)
         self.bar_tp.setTextVisible(False)
         tb.addWidget(self.bar_tp)
         self.lbl_tp = QLabel("بدون داده")
         self.lbl_tp.setObjectName("Faint")
+        self.lbl_tp.setWordWrap(True)
         tb.addWidget(self.lbl_tp)
         self.lbl_rst = QLabel("RST جعلی: —")
         self.lbl_rst.setObjectName("Faint")
@@ -1159,18 +1322,34 @@ class DiagnosticsPage(QWidget):
         port = f" · پورت {snap.spoof_port}" if snap.spoof_port else ""
         self.lbl_status.setText(f"وضعیت: {st}{port}")
 
-        # throughput bar = recent/baseline ratio (clamped to 100%)
+        # live current throughput — always shown so the card never looks dead
+        # while connected (the "هیچ کاری نمی‌کند" complaint, #4).
+        if snap.recent_bps > 0:
+            self.lbl_tp_live.setText(
+                f"سرعت فعلی: {self._fmt_bps(snap.recent_bps)}")
+        elif snap.status == "active":
+            self.lbl_tp_live.setText("سرعت فعلی: در انتظار ترافیک…")
+        else:
+            self.lbl_tp_live.setText("سرعت فعلی: — (متصل نیست)")
+
+        # throughput bar = recent/baseline ratio (clamped to 100%). The
+        # baseline is the best sustained speed this connection has reached;
+        # a sharp drop below it ⇒ likely throttling.
         ratio = snap.throttle_ratio
         if snap.baseline_bps > 0:
             pct = max(0, min(100, int(ratio * 100)))
             self.bar_tp.setValue(pct)
-            tag = " — throttle!" if snap.throttled else ""
+            tag = "  ⚠ احتمال throttle!" if snap.throttled else ""
             self.lbl_tp.setText(
-                f"{self._fmt_bps(snap.recent_bps)} از "
-                f"{self._fmt_bps(snap.baseline_bps)} ({pct}%){tag}")
+                f"{pct}% از خط پایه — {self._fmt_bps(snap.recent_bps)} از "
+                f"{self._fmt_bps(snap.baseline_bps)}{tag}")
+        elif snap.status == "active":
+            self.bar_tp.setValue(0)
+            self.lbl_tp.setText(
+                "در حال ساختن خط پایه… (برای سنجش throttle کمی ترافیک لازم است)")
         else:
             self.bar_tp.setValue(0)
-            self.lbl_tp.setText("بدون داده")
+            self.lbl_tp.setText("بدون داده — پس از اتصال و عبور ترافیک پر می‌شود")
 
         if snap.resilience_on:
             self.lbl_rst.setText(
@@ -1244,7 +1423,7 @@ class LogPage(QWidget):
         bar = QHBoxLayout()
         bar.setSpacing(10)
         bar.addWidget(self._field_label("سطح"))
-        self.cmb_level = QComboBox()
+        self.cmb_level = NoScrollComboBox()
         self.cmb_level.setObjectName("LogFilter")
         for lv in ("all",) + LEVELS:
             self.cmb_level.addItem(self._LEVEL_FA.get(lv, lv), lv)
@@ -1371,6 +1550,13 @@ class MainWindow(QWidget):
             | Qt.WindowSystemMenuHint
         )
 
+        # --- living mathematical-wave backdrop (#10) ---
+        # A child widget that paints animated superposed sine waves *behind*
+        # all content. It is transparent to mouse events and kept lowered in
+        # the z-order, so the layout/content sit on top unchanged.
+        self.wave_bg = WaveBackdrop(self)
+        self.wave_bg.lower()
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -1381,6 +1567,11 @@ class MainWindow(QWidget):
         self.title_bar.close_clicked.connect(self.close)
         self.title_bar.theme_toggled.connect(self.toggle_theme)
         outer.addWidget(self.title_bar)
+
+        # --- persistent active-config status bar (visible on every tab, #9) ---
+        self.active_bar = ActiveConfigBar(self)
+        self.active_bar.set_profile(self.store.selected_profile)
+        outer.addWidget(self.active_bar)
 
         # --- body: nav + pages ---
         body = QHBoxLayout()
@@ -1426,8 +1617,13 @@ class MainWindow(QWidget):
         self.engine.log.connect(self.page_log.append)
         self.engine.status.connect(self.page_dashboard.set_status)
         self.engine.status.connect(self._on_status)
+        self.engine.status.connect(self.active_bar.set_status)
         self.engine.count.connect(self.page_dashboard.on_count)
         self.engine.traffic.connect(self.page_dashboard.on_traffic)
+        # feed the persistent status bar's live rate (down_bps, up_bps)
+        self.engine.traffic.connect(
+            lambda up, down, up_bps, down_bps:
+                self.active_bar.set_rate(down_bps, up_bps))
         # live bypass method → dashboard stays in sync with Diagnostics
         self.engine.strategy.connect(self.page_dashboard.set_active_strategy)
         self.engine.strategy.connect(self._on_strategy_changed)
@@ -1501,6 +1697,8 @@ class MainWindow(QWidget):
 
     def _on_profile_selected(self, profile):
         self.engine.set_profile(profile)
+        # keep the persistent status bar in sync with the active server (#9)
+        self.active_bar.set_profile(profile)
         if profile:
             self.page_log.append(f"[profile] انتخاب شد: {profile.display_name}")
             # auto-switch to Tunnel so the VLESS/VMess/Trojan config is actually
@@ -1601,6 +1799,10 @@ class MainWindow(QWidget):
         self.setStyleSheet(build_qss(palette))
         # propagate the palette to widgets that paint inline (not via QSS)
         self.page_dashboard.set_palette(palette)
+        # recolour the living wave backdrop (accent → secondary gaming accent)
+        accent2 = ACCENT2_DARK if palette.is_dark else ACCENT2_LIGHT
+        self.wave_bg.set_palette(palette.accent, accent2)
+        self.wave_bg.lower()
         try:
             hwnd = int(self.winId())
             # only keep the dark immersive title region; we paint our own solid
@@ -1615,8 +1817,48 @@ class MainWindow(QWidget):
         self.store.set("theme", self._theme)
         self.store.save_config()
 
+    def resizeEvent(self, event):
+        # keep the wave backdrop filling the whole window behind the content
+        try:
+            self.wave_bg.setGeometry(self.rect())
+            self.wave_bg.lower()
+        except Exception:
+            pass
+        super().resizeEvent(event)
+
+    def showEvent(self, event):
+        # resume the animation when visible
+        try:
+            self.wave_bg.setGeometry(self.rect())
+            self.wave_bg.set_enabled(True)
+        except Exception:
+            pass
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        # park the animation while hidden/minimised so it spends zero CPU
+        try:
+            self.wave_bg.set_enabled(False)
+        except Exception:
+            pass
+        super().hideEvent(event)
+
+    def changeEvent(self, event):
+        # park while minimised, resume when restored
+        try:
+            from PySide6.QtCore import QEvent
+            if event.type() == QEvent.WindowStateChange:
+                self.wave_bg.set_enabled(not self.isMinimized())
+        except Exception:
+            pass
+        super().changeEvent(event)
+
     def closeEvent(self, event):
         """Stop the engine cleanly so no subprocess / thread is orphaned."""
+        try:
+            self.wave_bg.set_enabled(False)
+        except Exception:
+            pass
         try:
             self.engine.stop()
         except Exception:

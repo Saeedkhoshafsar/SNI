@@ -9,9 +9,58 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QPoint, QPointF, QTimer, Signal
 from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QHBoxLayout,
-    QLabel, QPushButton, QVBoxLayout, QWidget,
+    QComboBox, QDoubleSpinBox, QFrame, QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect, QHBoxLayout, QLabel, QPushButton, QSpinBox,
+    QVBoxLayout, QWidget,
 )
+
+
+# ---------------------------------------------------------------------------
+#  Scroll-safe numeric / combo inputs
+# ---------------------------------------------------------------------------
+#
+# Plain QSpinBox / QDoubleSpinBox / QComboBox change their value whenever the
+# mouse wheel rolls over them — even when they don't have focus. Inside a
+# scroll area that's infuriating: scrolling the page silently turns 40443 into
+# 40444 (feedback #6). These subclasses simply *ignore* the wheel and let the
+# event bubble up to the scroll area, so the page scrolls and the value is
+# only ever changed via the arrows, typing, or arrow keys (when focused).
+
+class _NoWheelMixin:
+    def wheelEvent(self, event):  # noqa: D401 - Qt override
+        # Don't consume the wheel — pass it to the parent (scroll area) so the
+        # page scrolls instead of the value changing under the cursor.
+        event.ignore()
+
+    def focusInEvent(self, event):  # keep keyboard editing fully functional
+        super().focusInEvent(event)
+        # never grab the wheel even when focused; matches the user's request
+        # that scrolling should never bump these fields.
+        self.setFocusPolicy(Qt.StrongFocus)
+
+
+class NoScrollSpinBox(_NoWheelMixin, QSpinBox):
+    """A QSpinBox that never changes value on mouse-wheel scroll."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+
+class NoScrollDoubleSpinBox(_NoWheelMixin, QDoubleSpinBox):
+    """A QDoubleSpinBox that never changes value on mouse-wheel scroll."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+
+class NoScrollComboBox(_NoWheelMixin, QComboBox):
+    """A QComboBox that never changes selection on mouse-wheel scroll."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.setFocusPolicy(Qt.StrongFocus)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +240,8 @@ class ProfileRow(QFrame):
     """
 
     edit = Signal()
+    ping = Signal()       # inline "ping this server" button clicked
+    activate = Signal()   # inline "use this server" button clicked
 
     def __init__(self, profile, *, active: bool = False,
                  parent: QWidget | None = None):
@@ -242,6 +293,11 @@ class ProfileRow(QFrame):
             _port = profile.port
         detail = QLabel(f"{profile.protocol} · {_addr}:{_port}")
         detail.setObjectName("RowDetail")
+        # the detail line doubles as the inline ping-result slot: a small
+        # bullet + latency is appended right next to the address so the user
+        # never has to dig into a separate panel (feedback #3).
+        self._detail = detail
+        self._detail_base = detail.text()
         col.addWidget(detail)
         lay.addLayout(col, 1)
 
@@ -251,6 +307,27 @@ class ProfileRow(QFrame):
             b.setObjectName("RowBadge")
             lay.addWidget(b, 0, Qt.AlignVCenter)
 
+        # inline ping button — measure THIS server's latency right here and
+        # show the result inline, instead of a buried separate panel (#3).
+        self.btn_ping = QPushButton("\U0001f4e1")
+        self.btn_ping.setObjectName("RowPing")
+        self.btn_ping.setCursor(Qt.PointingHandCursor)
+        self.btn_ping.setFixedSize(28, 28)
+        self.btn_ping.setToolTip("پینگ این سرور")
+        self.btn_ping.clicked.connect(self.ping.emit)
+        lay.addWidget(self.btn_ping, 0, Qt.AlignVCenter)
+
+        # inline "use this server" button — one click activates the profile
+        # without opening any dialog (#8). Hidden when already active.
+        self.btn_use = QPushButton("\u2714")
+        self.btn_use.setObjectName("RowUse")
+        self.btn_use.setCursor(Qt.PointingHandCursor)
+        self.btn_use.setFixedSize(28, 28)
+        self.btn_use.setToolTip("فعال‌سازی این سرور")
+        self.btn_use.clicked.connect(self.activate.emit)
+        self.btn_use.setVisible(not active)
+        lay.addWidget(self.btn_use, 0, Qt.AlignVCenter)
+
         # inline edit button
         self.btn_edit = QPushButton("\u270e")
         self.btn_edit.setObjectName("RowEdit")
@@ -259,6 +336,29 @@ class ProfileRow(QFrame):
         self.btn_edit.setToolTip("ویرایش این پروفایل")
         self.btn_edit.clicked.connect(self.edit.emit)
         lay.addWidget(self.btn_edit, 0, Qt.AlignVCenter)
+
+    # -- inline ping result -------------------------------------------------
+    def set_ping_state(self, text: str, kind: str = "info") -> None:
+        """Show an inline ping status/result appended to the detail line.
+
+        ``kind`` ∈ {"info","busy","ok","err"} — used for colour via the
+        ``pingkind`` dynamic property so the stylesheet can tint the text.
+        """
+        self._detail.setProperty("pingkind", kind)
+        if text:
+            self._detail.setText(f"{self._detail_base}   ·   {text}")
+        else:
+            self._detail.setText(self._detail_base)
+        # re-polish so the dynamic-property style refreshes
+        self._detail.style().unpolish(self._detail)
+        self._detail.style().polish(self._detail)
+
+    def set_pinging(self) -> None:
+        self.btn_ping.setEnabled(False)
+        self.set_ping_state("در حال پینگ…", "busy")
+
+    def set_ping_idle(self) -> None:
+        self.btn_ping.setEnabled(True)
 
     @staticmethod
     def _badges(profile) -> list[str]:
@@ -270,6 +370,93 @@ class ProfileRow(QFrame):
         if sec in ("tls", "reality", "xtls"):
             out.append(sec.upper())
         return out
+
+
+# ---------------------------------------------------------------------------
+#  Persistent active-config status bar (visible on every tab)
+# ---------------------------------------------------------------------------
+
+class ActiveConfigBar(QFrame):
+    """A slim always-visible strip showing the active server + live status.
+
+    Sits directly under the title bar so, no matter which tab the user is on,
+    they can always see *which config is active* and whether the engine is
+    connected (feedback #9). Three zones: a status dot + state text on one
+    side, the active profile name/endpoint in the centre, and a compact live
+    up/down readout on the other side.
+    """
+
+    _STATE_FA = {
+        "idle": "متوقف",
+        "connecting": "در حال اتصال…",
+        "active": "متصل",
+        "error": "خطا",
+    }
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("ActiveBar")
+        self.setFixedHeight(34)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 0, 16, 0)
+        lay.setSpacing(10)
+
+        self._dot = QLabel("\u25cf")
+        self._dot.setObjectName("ActiveBarDot")
+        self._dot.setProperty("state", "idle")
+        self._state = QLabel(self._STATE_FA["idle"])
+        self._state.setObjectName("ActiveBarState")
+        lay.addWidget(self._dot)
+        lay.addWidget(self._state)
+
+        sep = QLabel("\u2502")
+        sep.setObjectName("ActiveBarSep")
+        lay.addWidget(sep)
+
+        self._name = QLabel("سروری انتخاب نشده")
+        self._name.setObjectName("ActiveBarName")
+        lay.addWidget(self._name)
+
+        lay.addStretch(1)
+
+        self._rate = QLabel("")
+        self._rate.setObjectName("ActiveBarRate")
+        lay.addWidget(self._rate)
+
+    # -- public API --------------------------------------------------------
+    def set_profile(self, profile) -> None:
+        """Show the active profile's name + endpoint (or an empty hint)."""
+        if profile is None:
+            self._name.setText("سروری انتخاب نشده — حالت SNI Only")
+            return
+        name = getattr(profile, "display_name", "") or "سرور"
+        if getattr(profile, "is_spoof_config", False):
+            addr = (getattr(profile, "sni", "") or getattr(profile, "host", "")
+                    or getattr(profile, "address", ""))
+        else:
+            addr = getattr(profile, "address", "")
+        proto = getattr(profile, "protocol", "")
+        detail = f"{proto} · {addr}" if addr else proto
+        self._name.setText(f"{name}   —   {detail}" if detail else name)
+
+    def set_status(self, state: str) -> None:
+        self._dot.setProperty("state", state)
+        self._state.setText(self._STATE_FA.get(state, state))
+        # re-polish so the dot colour (driven by the dynamic property) updates
+        self._dot.style().unpolish(self._dot)
+        self._dot.style().polish(self._dot)
+        if state != "active":
+            self._rate.setText("")
+
+    def set_rate(self, down_bps: float, up_bps: float) -> None:
+        def _h(n: float) -> str:
+            n = max(0.0, float(n))
+            for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+                if n < 1024 or unit == "GB/s":
+                    return f"{n:.0f} {unit}" if unit == "B/s" else f"{n:.1f} {unit}"
+                n /= 1024
+            return f"{n:.1f} GB/s"
+        self._rate.setText(f"\u2193 {_h(down_bps)}    \u2191 {_h(up_bps)}")
 
 
 # ---------------------------------------------------------------------------

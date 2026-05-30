@@ -28,6 +28,12 @@ class FakeTTLStrategy(BypassStrategy):
         tags=("inject", "ttl", "hop-limited"),
     )
 
+    # The fake is engineered to die in transit (TTL → 0 at an intermediate
+    # router) so the genuine server NEVER receives it → it never ACKs. The
+    # spoofer must therefore treat this as fire-and-forget and not block
+    # waiting for an acknowledgement that will never arrive.
+    expects_ack = False
+
     DEFAULT_TTL = 4  # hops to the censor's DPI; tunable per connection
 
     def mutate_fake_packet(self, packet: Any, connection: Any) -> None:

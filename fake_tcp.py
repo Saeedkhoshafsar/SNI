@@ -51,6 +51,23 @@ class FakeTcpInjector(TcpInjector):
             strategy.mutate_fake_packet(packet, connection)
             strategy.send_fake(self, packet, connection)
 
+            # Fire-and-forget strategies (fake_ttl / wrong_checksum) never get
+            # a server ACK back, so there is nothing more to monitor once the
+            # fake is on the wire. Stop intercepting immediately — while still
+            # holding ``thread_lock`` — so the *real* ClientHello that follows
+            # is passed straight through instead of tripping the
+            # "packet after fake sent!" guard in on_outbound_packet(). We also
+            # signal the waiting _handle() so it can begin relaying without the
+            # 5-second timeout.
+            if not getattr(strategy, "expects_ack", True):
+                connection.monitor = False
+                connection.t2a_msg = "fake_sent_no_ack"
+                try:
+                    connection.running_loop.call_soon_threadsafe(
+                        connection.t2a_event.set)
+                except Exception:
+                    pass
+
     def on_unexpected_packet(self, packet: Packet, connection: FakeInjectiveConnection, info_m: str):
         print(info_m, packet)
         connection.sock.close()

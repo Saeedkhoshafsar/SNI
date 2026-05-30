@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.profile import Profile, PROTOCOLS, TRANSPORTS, SECURITIES
+from ui.widgets import NoScrollComboBox, NoScrollSpinBox
 
 
 # Fields shown per section. Each entry: (attr, label, widget-kind).
@@ -130,11 +131,11 @@ class ProfileDialog(QDialog):
     # ------------------------------------------------------------------ widgets
     def _make_widget(self, attr: str, kind: str) -> QWidget:
         if kind == "int":
-            w = QSpinBox()
+            w = NoScrollSpinBox()
             w.setRange(0, 65535)
             return w
         if kind.startswith("combo:"):
-            w = QComboBox()
+            w = NoScrollComboBox()
             which = kind.split(":", 1)[1]
             items = {
                 "proto": PROTOCOLS,

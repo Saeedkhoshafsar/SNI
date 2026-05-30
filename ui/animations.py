@@ -16,13 +16,14 @@ product feels alive without coupling motion into the widgets themselves.
 """
 from __future__ import annotations
 
+import math
 from typing import Callable, Iterable
 
 from PySide6.QtCore import (
-    QEasingCurve, QObject, QPoint, QPropertyAnimation, QTimer,
+    QEasingCurve, QObject, QPoint, QPointF, QPropertyAnimation, QTimer,
     QVariantAnimation, Qt, Signal,
 )
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QLabel, QWidget
 
 
@@ -246,3 +247,119 @@ class CountUp(QObject):
         self._anim.setStartValue(current)
         self._anim.setEndValue(target)
         self._anim.start()
+
+
+# ---------------------------------------------------------------------------
+#  Dynamic mathematical wave backdrop (#10)
+# ---------------------------------------------------------------------------
+
+class WaveBackdrop(QWidget):
+    """A living backdrop that paints superposed sine waves drifting over time.
+
+    The motion is pure maths — each layer is ``A·sin(k·x + φ + ω·t)`` with its
+    own amplitude/frequency/phase/speed, so the crests interfere and slowly
+    breathe rather than scroll mechanically. It paints below all content
+    (``WA_TransparentForMouseEvents`` so clicks pass straight through) and is
+    palette-aware: :meth:`set_palette` recolours the layers for dark/light.
+
+    Cheap by design: ~20 FPS timer, antialiased filled paths, no per-pixel
+    work. Honours :meth:`set_enabled` so it can be parked when the window is
+    hidden/minimised to spend zero CPU.
+    """
+
+    # phase offsets + relative speeds give each layer its own personality.
+    _LAYERS = (
+        # (amp_frac, wavelength_frac, phase, speed, y_frac, alpha)
+        (0.060, 0.85, 0.0,            0.55, 0.78, 46),
+        (0.045, 0.55, math.pi * 0.6,  0.80, 0.86, 34),
+        (0.075, 1.25, math.pi * 1.3, -0.40, 0.70, 26),
+    )
+
+    def __init__(self, parent: QWidget | None = None, *, fps: int = 20):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self._t = 0.0
+        self._c_from = QColor("#27e0c8")
+        self._c_to = QColor("#9b7bff")
+        self._enabled = True
+        self._timer = QTimer(self)
+        self._timer.setInterval(max(16, int(1000 / max(1, fps))))
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    # -- public API ---------------------------------------------------------
+    def set_palette(self, c_from: str, c_to: str) -> None:
+        """Recolour the two ends of the wave gradient (accent → accent2)."""
+        self._c_from = QColor(c_from)
+        self._c_to = QColor(c_to)
+        self.update()
+
+    def set_enabled(self, on: bool) -> None:
+        """Park (stop ticking) or resume the animation to save CPU."""
+        self._enabled = on
+        if on and not self._timer.isActive():
+            self._timer.start()
+        elif not on and self._timer.isActive():
+            self._timer.stop()
+
+    # -- internals ----------------------------------------------------------
+    def _tick(self) -> None:
+        if not self._enabled or not self.isVisible():
+            return
+        self._t += 0.045
+        self.update()
+
+    def _mix(self, f: float) -> QColor:
+        """Linear blend c_from → c_to at fraction *f* (0..1)."""
+        f = max(0.0, min(1.0, f))
+        a, b = self._c_from, self._c_to
+        return QColor(
+            int(a.red()   + (b.red()   - a.red())   * f),
+            int(a.green() + (b.green() - a.green()) * f),
+            int(a.blue()  + (b.blue()  - a.blue())  * f),
+        )
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 (Qt signature)
+        w = self.width()
+        h = self.height()
+        if w <= 2 or h <= 2:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+
+        step = max(6, w // 90)                  # sample density (perf vs smooth)
+        for i, (amp_f, wl_f, phase, speed, y_f, alpha) in enumerate(self._LAYERS):
+            amp = amp_f * h
+            wavelength = max(40.0, wl_f * w)
+            k = 2.0 * math.pi / wavelength
+            omega = speed
+            base_y = y_f * h
+
+            path = QPainterPath()
+            path.moveTo(0.0, h)
+            x = 0.0
+            first = True
+            while x <= w:
+                # superpose a slow second harmonic for organic, non-repeating crests
+                y = (base_y
+                     + amp * math.sin(k * x + phase + omega * self._t)
+                     + 0.35 * amp * math.sin(0.5 * k * x - 0.7 * omega * self._t))
+                if first:
+                    path.lineTo(QPointF(x, y))
+                    first = False
+                else:
+                    path.lineTo(QPointF(x, y))
+                x += step
+            path.lineTo(QPointF(float(w), h))
+            path.closeSubpath()
+
+            col = self._mix(i / max(1, len(self._LAYERS) - 1))
+            grad = QLinearGradient(0.0, base_y - amp, 0.0, float(h))
+            top = QColor(col); top.setAlpha(alpha)
+            bot = QColor(col); bot.setAlpha(0)
+            grad.setColorAt(0.0, top)
+            grad.setColorAt(1.0, bot)
+            painter.fillPath(path, grad)
+        painter.end()

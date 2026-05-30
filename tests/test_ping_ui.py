@@ -168,6 +168,52 @@ def _store_profiles(page):
 
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 / Qt platform unavailable")
+class BulkImportTest(unittest.TestCase):
+    """ProfilesPage bulk import: paste many links, add them all at once (#7)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def test_split_links_one_per_line(self):
+        from ui.window import ProfilesPage
+        links = ProfilesPage._split_links(
+            "vless://a@h1:443#A\ntrojan://pw@h2:443#B\n")
+        self.assertEqual(len(links), 2)
+
+    def test_split_links_glued_on_one_line(self):
+        from ui.window import ProfilesPage
+        links = ProfilesPage._split_links(
+            "vless://a@h1:443#A trojan://pw@h2:443#B")
+        self.assertEqual(len(links), 2)
+        self.assertTrue(links[0].startswith("vless://"))
+        self.assertTrue(links[1].startswith("trojan://"))
+
+    def test_split_links_empty(self):
+        from ui.window import ProfilesPage
+        self.assertEqual(ProfilesPage._split_links("   \n  "), [])
+
+    def test_bulk_import_adds_all_without_dialog(self):
+        page, _eng, store = _make_page(self._tmp, with_profiles=False)
+        blob = ("vless://u1@h1.example:443?security=tls&sni=h1#A\n"
+                "trojan://pw@h2.example:443#B\n"
+                "vless://u3@h3.example:8443?type=ws#C")
+        page.input.setPlainText(blob)
+        page._import_link()           # 3 links → bulk path, no dialog
+        self.assertEqual(len(store.profiles), 3)
+        self.assertEqual(page.input.toPlainText(), "")   # cleared on success
+
+    def test_bulk_import_skips_invalid_lines(self):
+        page, _eng, store = _make_page(self._tmp, with_profiles=False)
+        blob = ("vless://u1@h1.example:443#A\n"
+                "this-is-not-a-link\n"
+                "trojan://pw@h2.example:443#B")
+        page.input.setPlainText(blob)
+        page._import_link()
+        # the 2 valid links are added, the junk line is skipped
+        self.assertEqual(len(store.profiles), 2)
+
+
+@unittest.skipUnless(_HAVE_QT, "PySide6 / Qt platform unavailable")
 class LanSettingsTest(unittest.TestCase):
     """SettingsPage LAN-sharing toggle (share proxy to a phone)."""
 

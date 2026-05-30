@@ -121,6 +121,113 @@ class ProxyStartupTest(unittest.TestCase):
             srv.stop()
             blocker.close()
 
+    def test_fire_and_forget_handle_relays_without_server_ack(self):
+        """fake_ttl/wrong_checksum must NOT block waiting for a server ACK.
+
+        We drive ``_handle`` against a real loopback echo server. A stub
+        injector simulates the WinDivert send-thread: it marks the fake as
+        sent and fires ``t2a_event`` with ``fake_sent_no_ack`` (exactly what
+        the real injector now does for fire-and-forget strategies) — and
+        crucially it NEVER produces a ``fake_data_ack_recv``. The relay must
+        still start and echo bytes, proving the 5s ACK-timeout no longer
+        applies to fire-and-forget techniques.
+        """
+        import asyncio
+        import threading
+
+        # a tiny loopback echo server to stand in for the upstream endpoint
+        echo = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        echo.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        echo.bind(("127.0.0.1", 0))
+        echo.listen(1)
+        echo_port = echo.getsockname()[1]
+
+        def _echo_accept():
+            try:
+                conn, _ = echo.accept()
+                data = conn.recv(65536)
+                if data:
+                    conn.sendall(data)
+                conn.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=_echo_accept, daemon=True).start()
+
+        cfg = self._cfg(_free_port())
+        cfg["CONNECT_IP"] = "127.0.0.1"
+        cfg["CONNECT_PORT"] = echo_port
+        srv = self.main.ProxyServer(cfg)
+        srv.bypass_method = "fake_ttl"  # a fire-and-forget strategy
+
+        # Stub the injector behaviour: instead of WinDivert, when _handle
+        # registers a connection we immediately simulate "fake injected, no
+        # ACK expected" on a tiny timer.
+        orig_set = self.main.FakeInjectiveConnection
+
+        captured = {}
+
+        def _wrap_conn(*a, **k):
+            conn = orig_set(*a, **k)
+            captured["conn"] = conn
+            return conn
+
+        self.main.FakeInjectiveConnection = _wrap_conn
+
+        async def _drive():
+            loop = asyncio.get_running_loop()
+            srv._loop = loop
+            # a real loopback TCP pair (emulating xray ↔ spoofer). AF_UNIX
+            # socketpair() can't take TCP_NODELAY, which _configure_sock sets.
+            lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            lst.bind(("127.0.0.1", 0))
+            lst.listen(1)
+            lp = lst.getsockname()[1]
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client.connect(("127.0.0.1", lp))
+            server_side, _ = lst.accept()
+            lst.close()
+            client.setblocking(False)
+            server_side.setblocking(False)
+
+            async def _simulate_injector():
+                # wait until _handle has built the FakeInjectiveConnection
+                for _ in range(500):
+                    if "conn" in captured:
+                        break
+                    await asyncio.sleep(0.001)
+                conn = captured["conn"]
+                conn.fake_sent = True
+                conn.t2a_msg = "fake_sent_no_ack"
+                conn.t2a_event.set()
+
+            handle_task = asyncio.create_task(
+                srv._handle(server_side, ("127.0.0.1", 12345)))
+            inj_task = asyncio.create_task(_simulate_injector())
+
+            # once relay is up, send through the client side and read the echo
+            await asyncio.sleep(0.2)
+            await loop.sock_sendall(client, b"ping")
+            echoed = b""
+            try:
+                echoed = await asyncio.wait_for(loop.sock_recv(client, 64), 3)
+            except asyncio.TimeoutError:
+                pass
+            client.close()
+            await asyncio.gather(handle_task, inj_task,
+                                  return_exceptions=True)
+            return echoed
+
+        try:
+            result = asyncio.run(_drive())
+            self.assertEqual(result, b"ping",
+                             "fire-and-forget relay did not echo data "
+                             "(it likely blocked on the missing server ACK)")
+        finally:
+            self.main.FakeInjectiveConnection = orig_set
+            echo.close()
+
     def test_start_reports_failure_when_injector_cannot_open(self):
         # Simulate "WinDivert missing / no admin": injector ctor raises.
         class _BoomInjector:

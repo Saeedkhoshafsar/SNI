@@ -58,6 +58,24 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertFalse(snap.has_probe_data)
         self.assertIsNone(snap.active_strategy)
 
+    def test_live_throughput_surfaced_without_resilience(self):
+        # #4: even with resilience OFF, the engine's live rate must show up as
+        # recent_bps so the diagnostics throughput card isn't dead.
+        eng = _FakeEngine(status="active")
+        eng._live_down_bps = 1500.0
+        eng._live_up_bps = 500.0
+        snap = eng.diagnostics()
+        self.assertFalse(snap.resilience_on)
+        self.assertEqual(snap.recent_bps, 2000.0)   # down + up
+        # no baseline ⇒ throttle ratio stays 0 (bar empty, but live speed shown)
+        self.assertEqual(snap.baseline_bps, 0.0)
+        self.assertEqual(snap.throttle_ratio, 0.0)
+
+    def test_no_live_attrs_is_tolerated(self):
+        # an engine that never reported traffic → recent_bps falls back to 0
+        snap = _FakeEngine(status="active").diagnostics()
+        self.assertEqual(snap.recent_bps, 0.0)
+
     def test_reports_active_strategy_and_candidate_stats(self):
         p = _build_prober(winner="fake_ttl")
         snap = _FakeEngine(status="active", spoof_port=40443,

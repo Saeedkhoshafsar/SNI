@@ -273,6 +273,32 @@ def test_base_default_score():
 
 
 # ---------------------------------------------------------------------------
+#  expects_ack contract — fire-and-forget vs wait-for-server-ACK
+# ---------------------------------------------------------------------------
+
+def test_base_expects_ack_default_true():
+    # The safe default: assume the server ACKs the fake (classic techniques).
+    assert BypassStrategy().expects_ack is True
+
+
+def test_out_of_window_strategies_expect_ack():
+    # wrong_seq / multi_fake / fake_disorder all leave the fake within reach of
+    # the server (out-of-window seq) → it replies with a duplicate-ACK, so the
+    # spoofer waits for confirmation.
+    for key in ("wrong_seq", "multi_fake", "fake_disorder"):
+        assert get_strategy(key).expects_ack is True, key
+
+
+def test_fire_and_forget_strategies_do_not_expect_ack():
+    # fake_ttl (packet TTL-dies before the server) and wrong_checksum (server
+    # drops the corrupt segment) are designed so the server NEVER receives the
+    # fake → no ACK ever returns. They must declare expects_ack=False so the
+    # spoofer relays immediately instead of timing out after 5s.
+    for key in ("fake_ttl", "wrong_checksum"):
+        assert get_strategy(key).expects_ack is False, key
+
+
+# ---------------------------------------------------------------------------
 #  shared helper
 # ---------------------------------------------------------------------------
 

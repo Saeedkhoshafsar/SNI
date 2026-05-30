@@ -133,10 +133,17 @@ def snapshot(engine: Any) -> DiagnosticsSnapshot:
         except Exception:
             pass
 
+    # No resilience layer (or it failed) → still surface the engine's live
+    # throughput so the diagnostics card shows real-time speed instead of
+    # looking dead (feedback #4). There is no baseline in this mode, so the
+    # throttle bar stays empty but ``recent_bps`` is the live rate.
+    live_bps = float(getattr(engine, "_live_down_bps", 0.0)) \
+        + float(getattr(engine, "_live_up_bps", 0.0))
     return DiagnosticsSnapshot(
         status=status,
         active_strategy=active_strategy,
         spoof_port=spoof_port,
         candidates=candidates,
         resilience_on=False,
+        recent_bps=live_bps,
     )
