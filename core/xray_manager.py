@@ -97,10 +97,11 @@ class XrayManager:
 
     @property
     def real_server(self) -> tuple[str, int]:
-        """The real, routable upstream xray (or the spoofer) connects to.
+        """The transport hop xray's outbound dials when run *directly*.
 
-        For CDN-placeholder configs this resolves the loopback stand-in to the
-        real CDN endpoint carried in the SNI/Host header.
+        For ordinary configs that's ``profile.address:port``. (Spoof configs
+        never run direct — they always chain through the spoofer, which dials
+        the real CDN IP itself.)
         """
         return self.profile.dial_address, self.profile.dial_port
 
@@ -109,13 +110,14 @@ class XrayManager:
     def generate_config(self) -> str:
         """Write the Xray JSON config for this profile and return its path."""
         if self.spoof_port is not None:
-            # route the outbound through the local spoofer
+            # route the outbound through the local spoofer; the spoofer dials
+            # the real CDN IP + injects the decoy ClientHello. The real SNI /
+            # host / path still come from the profile (carried in TLS), so the
+            # upstream Cloudflare handshake is correct end-to-end.
             dest_address: str | None = "127.0.0.1"
             dest_port: int | None = self.spoof_port
         else:
-            # connect directly to the REAL routable endpoint — for ordinary
-            # configs that's the profile address, for CDN-placeholder configs
-            # it's the resolved CDN host:443 (never the loopback 127.0.0.1).
+            # ordinary config, no spoofer — connect straight to the real server
             dest_address = self.profile.dial_address
             dest_port = self.profile.dial_port
 

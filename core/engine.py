@@ -177,19 +177,27 @@ class EngineController:
     def chains_spoofer(self) -> bool:
         """True when the SNI-spoofer should sit *under* the xray core.
 
-        Only the explicit SNI-bypass combos ("SNI + Warp", "SNI + Psiphon", …)
-        chain the spoofer beneath xray, because those modes specifically want
-        DPI evasion on the outer connection.
+        Two situations chain the spoofer beneath xray:
 
-        Plain ``"Tunnel"`` mode — including CDN-placeholder configs whose host
-        slot is ``127.0.0.1:40443`` — connects xray **straight** to the real
-        server. The old ``40443`` local portal was only needed by the previous
-        client that lacked a full xray core; we ship a full core, so xray dials
-        the CDN endpoint directly (see ``Profile.dial_address``) and the spoofer
-        never re-mangles xray's own TLS/XHTTP handshake (which broke it).
+        1. **Spoof configs** — share links whose server address is a loopback
+           stand-in (e.g. ``vless://...@127.0.0.1:40443?...sni=foo.workers.dev``).
+           That ``127.0.0.1:40443`` *is* our SNI spoofer: xray dials it, and the
+           spoofer forwards to a fixed Cloudflare IP while injecting a decoy
+           ClientHello. This is exactly what V2RayTun does (it dials our
+           spoofer); to be self-contained we run our own xray in its place.
+           These chain regardless of mode (even plain "Tunnel").
+
+        2. The explicit SNI-bypass combos ("SNI + Warp", "SNI + Psiphon", …)
+           that want DPI evasion on the outer connection.
+
+        Plain ``"Tunnel"`` mode with an *ordinary* (routable) config connects
+        xray straight to the real server — no spoofer (the fast, V2RayTun-
+        equivalent path).
         """
         if not self.uses_core:
             return False
+        if getattr(self.profile, "is_spoof_config", False):
+            return True
         mode = str(self.config.get("connection_mode", "Tunnel"))
         return mode not in ("Tunnel",)
 
@@ -475,22 +483,48 @@ class EngineController:
             return
 
         # --- 1. work out the spoofer's listen port + upstream target ---
+        # The spoofer always connects to a *fixed Cloudflare IP* and injects a
+        # decoy ClientHello (FAKE_SNI); the real SNI rides end-to-end inside
+        # xray's TLS, untouched. We never resolve / dial the workers.dev host
+        # ourselves — that's xray's job, through the spoofer.
         if use_core:
             assert self.profile is not None
+            prof = self.profile
             from core.xray_manager import find_free_port
-            self._spoof_port = find_free_port(
-                int(self.config.get("LISTEN_PORT", 40443)))
-            # use the *real* routable endpoint (CDN host for placeholder
-            # configs), never the loopback stand-in the share link carries
-            connect_ip = self.profile.dial_address
-            connect_port = self.profile.dial_port
-            self._log(
-                f"حالت v2rayN: spoofer روی 127.0.0.1:{self._spoof_port} "
-                f"→ {connect_ip}:{connect_port}")
+            if prof.is_spoof_config:
+                # the share link's own loopback port (e.g. 40443) is where the
+                # core expects the spoofer to listen — keep it so the config's
+                # 127.0.0.1:40443 target lands exactly on our spoofer.
+                self._spoof_port = find_free_port(prof.dial_port)
+                # the spoofer dials the fixed CDN IP with the decoy SNI; let an
+                # explicit config CONNECT_IP / FAKE_SNI override the profile.
+                connect_ip = (str(self.config.get("CONNECT_IP", "")).strip()
+                              or prof.spoof_connect_ip)
+                connect_port = (int(self.config.get("CONNECT_PORT", 0))
+                                or prof.spoof_connect_port)
+                fake_sni = (str(self.config.get("FAKE_SNI", "")).strip()
+                            or prof.spoof_fake_sni)
+                self._log(
+                    f"حالت SNI-spoof (خودکفا): xray → 127.0.0.1:"
+                    f"{self._spoof_port} → spoofer → {connect_ip}:{connect_port}"
+                    f" (SNI جعلی: {fake_sni}، SNI واقعی: "
+                    f"{prof.sni or prof.host})")
+            else:
+                self._spoof_port = find_free_port(
+                    int(self.config.get("LISTEN_PORT", 40443)))
+                connect_ip = (str(self.config.get("CONNECT_IP", "")).strip()
+                              or prof.address)
+                connect_port = (int(self.config.get("CONNECT_PORT", 0))
+                                or prof.port)
+                fake_sni = str(self.config.get("FAKE_SNI", "www.speedtest.net"))
+                self._log(
+                    f"حالت v2rayN: spoofer روی 127.0.0.1:{self._spoof_port} "
+                    f"→ {connect_ip}:{connect_port}")
         else:
             self._spoof_port = int(self.config.get("LISTEN_PORT", 40443))
             connect_ip = str(self.config.get("CONNECT_IP", ""))
             connect_port = int(self.config.get("CONNECT_PORT", 443))
+            fake_sni = str(self.config.get("FAKE_SNI", "www.speedtest.net"))
             self._log("حالت SNI Only: فقط فورواردر spoofer")
 
         # --- 2. build + start the spoofer (main.ProxyServer) ---
@@ -500,7 +534,7 @@ class EngineController:
             "LISTEN_PORT": self._spoof_port,
             "CONNECT_IP": connect_ip,
             "CONNECT_PORT": connect_port,
-            "FAKE_SNI": str(self.config.get("FAKE_SNI", "www.speedtest.net")),
+            "FAKE_SNI": fake_sni,
             "gaming_mode": bool(self.config.get("gaming_mode", False)),
         }
         # choose the bypass method: auto-probe if enabled, else the configured one
@@ -528,12 +562,13 @@ class EngineController:
             self._proxy.on_traffic = self._emit_traffic
         self._proxy.start()
 
-        # --- 3. chain xray core in front of the spoofer (SNI-bypass combos) ---
-        # NB: plain "Tunnel" (including CDN-placeholder configs) returned early
-        # via _start_core_only — xray dials the real endpoint directly. We only
-        # reach here for the explicit SNI+X modes, where xray dials the local
-        # spoofer (127.0.0.1:<spoof_port>) and the spoofer carries the real
-        # (CDN-resolved) upstream with DPI evasion.
+        # --- 3. chain xray core in front of the spoofer ---
+        # Reached for spoof configs (127.0.0.1:40443 links) and the explicit
+        # SNI+X modes. xray dials the local spoofer (127.0.0.1:<spoof_port>)
+        # carrying the *real* SNI/host/path inside its TLS; the spoofer rewrites
+        # the destination to the fixed CDN IP and injects the decoy ClientHello.
+        # Plain "Tunnel" with an ordinary config returned early via
+        # _start_core_only (xray straight to the real server, no spoofer).
         if chain_spoofer:
             assert self.profile is not None
             from core.xray_manager import XrayManager

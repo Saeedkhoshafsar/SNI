@@ -194,10 +194,10 @@ class EngineControllerTest(unittest.TestCase):
         self.assertTrue(xray.stopped)
         self.assertEqual(ctrl.status, STATUS_IDLE)
 
-    def _cdn_placeholder_profile(self):
-        # CDN-placeholder config: the host slot is a loopback stand-in left
-        # over from an old client that lacked a full xray core; the real
-        # endpoint is the Cloudflare domain in the SNI/Host header.
+    def _spoof_profile(self):
+        # SNI-spoof config: the 127.0.0.1:40443 target IS our spoofer. xray
+        # dials it; the spoofer forwards to a fixed Cloudflare IP and injects a
+        # decoy ClientHello. The real sni/host/path ride inside xray's TLS.
         return Profile(
             protocol="vless", address="127.0.0.1", port=40443,
             uuid="84524180-c2d5-4bc1-83bb-c36f22d69a3b",
@@ -206,29 +206,56 @@ class EngineControllerTest(unittest.TestCase):
             host="lucky-union-b89c.hamijafayi.workers.dev",
             path="/vless-xhttp", mode="auto", fingerprint="chrome")
 
-    def test_cdn_placeholder_tunnel_runs_xray_directly_to_cdn(self):
-        # We ship a full xray core, so the old local 40443 portal is NOT
-        # needed: in Tunnel mode xray connects straight to the real CDN
-        # endpoint (no spoofer, no loopback hop). This is what makes the config
-        # actually connect (the bug was xray dialing an empty 127.0.0.1:40443).
+    def test_spoof_config_chains_xray_through_spoofer_to_fixed_cdn_ip(self):
+        # The defining bug fix: a 127.0.0.1:40443 config must run BOTH our xray
+        # (dialing the local spoofer) AND the spoofer (dialing the fixed CF IP
+        # with the decoy SNI) — self-contained, replacing V2RayTun. It connects
+        # in V2RayTun precisely because V2RayTun dials our spoofer; we now do
+        # the same internally instead of dialing workers.dev directly.
         ctrl = EngineController({"connection_mode": "Tunnel"})
-        prof = self._cdn_placeholder_profile()
+        prof = self._spoof_profile()
         ctrl.set_profile(prof)
-        self.assertTrue(prof.is_cdn_placeholder)
-        self.assertFalse(ctrl.chains_spoofer)   # NO spoofer chaining
+        self.assertTrue(prof.is_spoof_config)
+        self.assertTrue(ctrl.chains_spoofer)    # spoofer IS chained
         ctrl.start()
         self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
 
+        # xray dials the local spoofer on the config's own port (40443)
         xray = FakeXray.last_instance
         self.assertIsNotNone(xray)
-        self.assertIsNone(xray.spoof_port)            # direct, no chaining
-        self.assertIsNone(FakeProxy.last_instance)    # no spoofer at all
-        # the profile resolves to the real CDN endpoint for the direct dial
-        self.assertEqual(prof.dial_address,
-                         "lucky-union-b89c.hamijafayi.workers.dev")
-        self.assertEqual(prof.dial_port, 443)
+        self.assertEqual(xray.spoof_port, 40443)
+        self.assertTrue(xray.started)
+
+        # the spoofer dials the FIXED Cloudflare IP and injects the decoy SNI
+        proxy = FakeProxy.last_instance
+        self.assertIsNotNone(proxy)
+        self.assertEqual(proxy.config["LISTEN_PORT"], 40443)
+        self.assertEqual(proxy.config["CONNECT_IP"], "104.19.229.21")
+        self.assertEqual(proxy.config["CONNECT_PORT"], 443)
+        self.assertEqual(proxy.config["FAKE_SNI"], "www.hcaptcha.com")
+
+        # xray's transport hop is the loopback spoofer, never workers.dev
+        self.assertEqual(prof.dial_address, "127.0.0.1")
+        self.assertEqual(prof.dial_port, 40443)
         ctrl.stop()
         self.assertTrue(xray.stopped)
+        self.assertTrue(proxy.stopped)
+
+    def test_spoof_config_honours_explicit_connect_ip_and_fake_sni(self):
+        # An explicit CONNECT_IP / FAKE_SNI in the engine config overrides the
+        # profile/spoof defaults (lets the user tune the two knobs).
+        ctrl = EngineController({
+            "connection_mode": "Tunnel",
+            "CONNECT_IP": "104.16.0.1",
+            "FAKE_SNI": "www.bing.com",
+        })
+        ctrl.set_profile(self._spoof_profile())
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        proxy = FakeProxy.last_instance
+        self.assertEqual(proxy.config["CONNECT_IP"], "104.16.0.1")
+        self.assertEqual(proxy.config["FAKE_SNI"], "www.bing.com")
+        ctrl.stop()
 
     def test_count_callback_forwarded(self):
         ctrl = EngineController({"connection_mode": "SNI Only"})

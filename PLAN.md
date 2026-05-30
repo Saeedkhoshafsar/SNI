@@ -458,3 +458,29 @@ xray کامل (socks 10808) → مستقیم به lucky-union-...workers.dev:443
 (دقیقاً مثل اجرای همان کانفیگ در یک کلاینت xray معمولی؛ هیچ هلپر/پورت لوکالی در میان نیست.)
 
 - تست‌ها: `tests/test_xray_config.py` (۴ تست بازنویسی‌شده: تشخیص placeholder، عدم تأثیر بر کانفیگ عادی، xray مستقیم به CDN با socks=10808، `real_server`→CDN) + `tests/test_engine.py` (Tunnel با کانفیگ placeholder → xray مستقیم، **بدون** اسپوفر). مجموعاً **۳۳۰ تست سبز + ۲ skip**. صفحهٔ پروفایل در ۱۰۲۴×۶۸۰ با کانفیگ placeholderِ فعال رندر و تأیید شد (پیل «● فعال» بدون بریدگی، خطِ جزئیات = `workers.dev:443`).
+
+## ✅ تصحیح بازخورد چهارم (نهایی) — معماری واقعی: xray ما → اسپوفر(40443) → IP ثابت Cloudflare با SNI جعلی (2026-05-30)
+**چرا دو تصحیح قبلی اشتباه بودند:** هم `5ccc179` و هم `9a80e9c` باعث می‌شدند xray **مستقیم** به `workers.dev` وصل شود. غلط بود — DPI آن‌وقت SNI واقعی را می‌دید و می‌بست. کاربر معماری دقیق را فاش کرد و پروژهٔ اصلی سبک‌تر را معرفی کرد (https://github.com/atarevals/SNI-Spoofing):
+> «این کانفیگ توی V2RayTun وصل می‌شه ولی توی خود نرم‌افزار نه. توی V2RayTun، [کانفیگ] **نرم‌افزار ما رو گوش می‌ده** (به ۴۰۴۴۳). نرم‌افزار ما تنها این دو گزینه رو عوض می‌کنه: اتصال IP=104.19.229.21، SNI جعلی=www.hcaptcha.com.»
+
+### تشخیص درست (تأییدشده از روی پروژهٔ اصلی atarevals/SNI-Spoofing)
+بررسی `core/xray_manager.py` و `config.json` پروژهٔ اصلی نشان داد:
+- outbound xray همیشه `address:127.0.0.1, port:40443` را صدا می‌زند (= اسپوفر ما)، اما `tlsSettings.serverName` همان **SNI واقعی** (`...workers.dev`) است که دست‌نخورده تا Cloudflare می‌رود.
+- اسپوفر (`main.ProxyServer`، `LISTEN_PORT:40443`) به `CONNECT_IP:443` (یک IP ثابت Cloudflare) وصل می‌شود و یک ClientHello جعلی با `FAKE_SNI` تزریق می‌کند (فریبِ DPI). TLS واقعی end-to-end بین xray و Cloudflare است؛ اسپوفر آن را رمزگشایی نمی‌کند — فقط IP مقصد را عوض و decoy تزریق می‌کند.
+- **پس کانفیگ `127.0.0.1:40443` خودش = اشاره به اسپوفر ماست**، نه placeholder. V2RayTun دقیقاً همین کار را می‌کرد. برای خودکفا‌شدن، xray خودِ ما جای V2RayTun می‌نشیند.
+- دو SNI در کار است: DPI ایران **ClientHello جعلی** (`www.hcaptcha.com`) را می‌بیند و رد می‌شود؛ لبهٔ Cloudflare **TLS واقعی** (SNI واقعی `...workers.dev`) را می‌بیند و به Worker می‌برد. تناقضی نیست چون اسپوفر TLS واقعی را دست نمی‌زند.
+
+### رفع (`core/profile.py`, `core/engine.py`, `core/xray_manager.py`, `ui/widgets.py`)
+- `core/profile.py`: `is_cdn_placeholder`→`is_spoof_config` (آدرس loopback = اشاره به اسپوفر ما). `dial_address/dial_port` دیگر به workers.dev بازنویسی **نمی‌شوند** — برای کانفیگ spoof همان loopback (`127.0.0.1:40443`) را برمی‌گردانند (xray باید اسپوفر را صدا بزند). افزودن `spoof_connect_ip` (پیش‌فرض `104.19.229.21`)، `spoof_connect_port` (۴۴۳)، `spoof_fake_sni` (پیش‌فرض `www.hcaptcha.com`) — قابل override از `extra` یا config.
+- `core/engine.py`: `chains_spoofer` برای کانفیگ‌های spoof **حتی در Tunnel** True است. در مسیر زنجیره، اسپوفر روی پورت خودِ لینک (۴۰۴۴۳) گوش می‌دهد و به `spoof_connect_ip:port` با `spoof_fake_sni` فوروارد می‌کند؛ xray هم `127.0.0.1:40443` را با SNI/host/path **واقعی** صدا می‌زند. `CONNECT_IP`/`FAKE_SNI` صریح در config بر پیش‌فرض پروفایل اولویت دارند.
+- `core/xray_manager.py`: در حالت زنجیره (`spoof_port` ست) outbound به `127.0.0.1:<spoof_port>` می‌رود؛ SNI/host/path واقعی از پروفایل می‌آید (داخل TLS).
+- `ui/widgets.py`: خطِ جزئیات برای کانفیگ spoof دامنهٔ CDN واقعی (`sni/host:443`) را نشان می‌دهد نه loopback.
+
+### جریان نهایی درست (خودکفا، بدون V2RayTun)
+```
+کاربر → xray ما (socks 10808) → 127.0.0.1:40443 (اسپوفر ما، با SNI واقعی داخل TLS)
+      → اسپوفر به 104.19.229.21:443 + تزریق ClientHello جعلی (www.hcaptcha.com)
+      → لبهٔ Cloudflare (SNI واقعی را داخل TLS می‌بیند) → Worker → اینترنت ✓
+```
+
+- تست‌ها: `tests/test_xray_config.py` (تشخیص spoof، override از extra، xray به اسپوفر لوکال با SNI واقعی) + `tests/test_engine.py` (Tunnel با کانفیگ spoof → xray↔اسپوفر زنجیر، اسپوفر→104.19.229.21 با FAKE_SNI=www.hcaptcha.com؛ + احترام به CONNECT_IP/FAKE_SNI صریح). مجموعاً **۳۳۱ تست سبز + ۲ skip**.

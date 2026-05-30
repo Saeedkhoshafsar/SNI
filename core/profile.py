@@ -94,57 +94,100 @@ class Profile:
     def is_tls(self) -> bool:
         return self.security in ("tls", "reality", "xtls")
 
+    # Default decoy SNI + Cloudflare anycast IP the spoofer dials when the
+    # share link doesn't override them. These match the values the user runs
+    # in V2RayTun: the spoofer connects to ``104.19.229.21:443`` and injects a
+    # fake ClientHello carrying ``www.hcaptcha.com`` to fool the DPI box.
+    SPOOF_DEFAULT_CONNECT_IP = "104.19.229.21"
+    SPOOF_DEFAULT_FAKE_SNI = "www.hcaptcha.com"
+
     @property
-    def is_cdn_placeholder(self) -> bool:
-        """True for configs whose host slot is a loopback placeholder.
+    def is_spoof_config(self) -> bool:
+        """True for configs whose server address points at *our* SNI spoofer.
 
-        Some share links (e.g.
-        ``vless://...@127.0.0.1:40443?...host=foo.workers.dev``) were authored
-        for an *old* client that lacked a full xray core: it opened a local
-        portal on the placeholder port (``40443``) and tunnelled through a
-        helper (V2RayTun) to reach the real CDN endpoint carried in the
-        SNI / Host header (Cloudflare ``workers.dev`` / ``pages.dev``).
+        Share links such as
+        ``vless://...@127.0.0.1:40443?...sni=foo.workers.dev&type=xhttp`` are
+        authored so that the proxy *core* (xray, or V2RayTun) dials a **local**
+        loopback port — that port is **our SNI spoofer**, not the real server.
 
-        Our app ships a **full xray core**, so the local portal/helper is no
-        longer needed at all: xray can dial the real CDN endpoint directly. We
-        only need to (a) recognise these placeholder configs and (b) rewrite
-        the dial target to the real CDN host:port (see ``dial_address`` /
-        ``dial_port``). No local 40443 port, no spoofer chaining.
+        The architecture (verified against the original SNI-Spoofing project)::
+
+            xray  →  127.0.0.1:40443  (our spoofer: ProxyServer)
+                  →  CONNECT_IP:443   (a fixed Cloudflare anycast IP)
+                     + injects a fake ClientHello (FAKE_SNI) to beat DPI
+                  →  Cloudflare CDN  →  the real Worker (from the real SNI)
+
+        The real TLS handshake (real SNI / Host / path from the link) travels
+        end-to-end between xray and Cloudflare; the spoofer never decrypts it —
+        it only rewrites the *destination IP* and injects a decoy ClientHello so
+        DPI sees ``www.hcaptcha.com`` while Cloudflare's edge still reads the
+        real ``workers.dev`` SNI inside the genuine TLS and routes to the Worker.
+
+        So for these configs xray must dial the loopback address **as-is** and
+        we must run the spoofer; the previous attempts that made xray dial the
+        ``workers.dev`` host directly were wrong (they bypassed the spoofer, so
+        DPI saw the real SNI and blocked it — only V2RayTun, which kept the
+        spoofer in the path, worked).
         """
-        if not _is_local_addr(self.address):
-            return False
-        for cand in (self.sni, self.host):
-            if (cand or "").strip() and not _is_local_addr(cand):
-                return True
-        return False
+        return _is_local_addr(self.address)
+
+    @property
+    def spoof_connect_ip(self) -> str:
+        """The fixed CDN IP the spoofer dials for a spoof config.
+
+        Taken from the share link's ``extra`` (keys ``connect_ip`` / ``ip``)
+        when present, else the default Cloudflare anycast IP. Only meaningful
+        for ``is_spoof_config`` profiles.
+        """
+        if isinstance(self.extra, dict):
+            for key in ("connect_ip", "CONNECT_IP", "ip"):
+                v = (self.extra.get(key) or "").strip()
+                if v:
+                    return v
+        return self.SPOOF_DEFAULT_CONNECT_IP
+
+    @property
+    def spoof_connect_port(self) -> int:
+        """The port the spoofer dials on the fixed CDN IP (default 443)."""
+        if isinstance(self.extra, dict):
+            for key in ("connect_port", "CONNECT_PORT"):
+                v = self.extra.get(key)
+                if v:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        pass
+        return 443 if self.is_tls else 80
+
+    @property
+    def spoof_fake_sni(self) -> str:
+        """The decoy SNI the spoofer injects (default ``www.hcaptcha.com``)."""
+        if isinstance(self.extra, dict):
+            for key in ("fake_sni", "FAKE_SNI"):
+                v = (self.extra.get(key) or "").strip()
+                if v:
+                    return v
+        return self.SPOOF_DEFAULT_FAKE_SNI
 
     @property
     def dial_address(self) -> str:
-        """The real, routable host xray should connect to **directly**.
+        """The host xray's outbound connects to (the *transport* hop).
 
-        For ordinary configs this is just ``address``. For CDN-placeholder
-        configs the literal address is a loopback stand-in, so we resolve the
-        real endpoint from the SNI / Host header (the CDN domain) — xray dials
-        it directly, exactly like any normal VLESS-over-CDN config.
+        For ordinary configs this is the real ``address``. For spoof configs
+        it stays the loopback address **as-is** — xray must dial our spoofer
+        (e.g. ``127.0.0.1``), which then forwards to the real CDN. We never
+        rewrite it to the ``workers.dev`` host, because the real SNI must reach
+        Cloudflare *through* the spoofer, not be dialled directly.
         """
-        if self.is_cdn_placeholder:
-            for cand in (self.sni, self.host):
-                cand = (cand or "").strip()
-                if cand and not _is_local_addr(cand):
-                    return cand
         return (self.address or "").strip()
 
     @property
     def dial_port(self) -> int:
-        """The real port xray should connect to **directly**.
+        """The port xray's outbound connects to (the *transport* hop).
 
-        For CDN-placeholder configs the placeholder port (e.g. ``40443``) was
-        the old local-portal port, not reachable on the CDN. Cloudflare-style
-        WS/XHTTP+TLS endpoints are served on the standard HTTPS port, so we
-        dial ``443`` (or ``80`` for a plaintext fallback).
+        For spoof configs this is the loopback spoofer port from the link
+        (e.g. ``40443``); for ordinary configs it's the real ``port``.
         """
-        if self.is_cdn_placeholder:
-            return 443 if self.is_tls else 80
         return self.port
 
     @property

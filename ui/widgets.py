@@ -230,10 +230,16 @@ class ProfileRow(QFrame):
             top.addWidget(pill, 0, Qt.AlignVCenter)
         col.addLayout(top)
 
-        # show the *routable* endpoint (real CDN host for placeholder configs),
-        # not the loopback stand-in, so the detail line is meaningful
-        _addr = getattr(profile, "dial_address", None) or profile.address
-        _port = getattr(profile, "dial_port", None) or profile.port
+        # show a meaningful endpoint. For SNI-spoof configs (127.0.0.1:40443)
+        # the literal address is just our local spoofer, so display the real
+        # CDN host from the SNI/Host header instead — that's what the user
+        # recognises. Otherwise show the real server address:port.
+        if getattr(profile, "is_spoof_config", False):
+            _addr = (profile.sni or profile.host or profile.address)
+            _port = 443 if getattr(profile, "is_tls", False) else profile.port
+        else:
+            _addr = profile.address
+            _port = profile.port
         detail = QLabel(f"{profile.protocol} · {_addr}:{_port}")
         detail.setObjectName("RowDetail")
         col.addWidget(detail)

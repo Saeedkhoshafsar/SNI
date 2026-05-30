@@ -225,15 +225,15 @@ def test_manager_direct_wiring():
 
 
 # ---------------------------------------------------------------------------
-#  CDN-placeholder configs
-#  ``vless://...@127.0.0.1:40443?...host=foo.workers.dev`` — the host slot is a
-#  loopback stand-in left over from an OLD client that lacked a full xray core
-#  (it tunnelled through a local 40443 portal / V2RayTun to reach the CDN). We
-#  ship a full xray core, so xray dials the real CDN endpoint (SNI/Host) on 443
-#  DIRECTLY — no local portal, no spoofer.
+#  SNI-spoof configs
+#  ``vless://...@127.0.0.1:40443?...sni=foo.workers.dev&type=xhttp`` — the
+#  ``127.0.0.1:40443`` target is OUR SNI spoofer, not the real server. xray
+#  dials the spoofer; the spoofer forwards to a fixed Cloudflare IP and injects
+#  a decoy ClientHello (fake SNI). The REAL sni/host/path ride end-to-end inside
+#  xray's TLS, untouched. This matches what V2RayTun does (it dials our spoofer).
 # ---------------------------------------------------------------------------
 
-def _cdn_placeholder_profile():
+def _spoof_profile():
     return parse_link(
         "vless://84524180-c2d5-4bc1-83bb-c36f22d69a3b@127.0.0.1:40443"
         "?encryption=none&security=tls&type=xhttp&mode=auto"
@@ -242,45 +242,54 @@ def _cdn_placeholder_profile():
         "&path=%2Fvless-xhttp&fp=chrome#vls-cf-xhttp")
 
 
-def test_profile_detects_cdn_placeholder():
-    p = _cdn_placeholder_profile()
-    assert p.is_cdn_placeholder is True
-    assert p.dial_address == "lucky-union-b89c.hamijafayi.workers.dev"
-    assert p.dial_port == 443
+def test_profile_detects_spoof_config():
+    p = _spoof_profile()
+    assert p.is_spoof_config is True
+    # xray's transport hop stays the loopback spoofer (NOT workers.dev)
+    assert p.dial_address == "127.0.0.1"
+    assert p.dial_port == 40443
+    # the spoofer dials the fixed CF IP + injects the decoy SNI
+    assert p.spoof_connect_ip == "104.19.229.21"
+    assert p.spoof_connect_port == 443
+    assert p.spoof_fake_sni == "www.hcaptcha.com"
 
 
-def test_normal_profile_is_not_placeholder():
+def test_normal_profile_is_not_spoof_config():
     p = _vless_ws_tls()
-    assert p.is_cdn_placeholder is False
+    assert p.is_spoof_config is False
     assert p.dial_address == "real.example.com"
     assert p.dial_port == 443
 
 
-def test_cdn_placeholder_xray_dials_cdn_directly():
-    # Direct Tunnel (spoof_port=None): xray's outbound must point at the real
-    # CDN host:443, NOT the loopback placeholder. socks inbound = 10808.
+def test_spoof_config_overrides_from_extra():
+    p = _spoof_profile()
+    p.extra = {"connect_ip": "104.16.0.1", "fake_sni": "www.bing.com",
+               "connect_port": "8443"}
+    assert p.spoof_connect_ip == "104.16.0.1"
+    assert p.spoof_fake_sni == "www.bing.com"
+    assert p.spoof_connect_port == 8443
+
+
+def test_spoof_config_xray_dials_local_spoofer_with_real_sni():
+    # Chained (spoof_port set): xray's outbound dials 127.0.0.1:<spoof_port>,
+    # but the TLS serverName / xhttp host/path are the REAL CDN values so the
+    # end-to-end handshake through the spoofer reaches Cloudflare correctly.
     from core.xray_manager import XrayManager
-    mgr = XrayManager(_cdn_placeholder_profile(), spoof_port=None,
+    mgr = XrayManager(_spoof_profile(), spoof_port=40443,
                       socks_port=10808, http_port=10809)
     path = mgr.generate_config()
     with open(path, encoding="utf-8") as fp:
         cfg = json.load(fp)
     v = cfg["outbounds"][0]["settings"]["vnext"][0]
-    assert v["address"] == "lucky-union-b89c.hamijafayi.workers.dev"
-    assert v["port"] == 443
+    assert v["address"] == "127.0.0.1"
+    assert v["port"] == 40443
     assert cfg["inbounds"][0]["port"] == 10808
     ss = cfg["outbounds"][0]["streamSettings"]
     assert ss["tlsSettings"]["serverName"] == \
         "lucky-union-b89c.hamijafayi.workers.dev"
+    assert ss["xhttpSettings"]["host"] == \
+        "lucky-union-b89c.hamijafayi.workers.dev"
     assert ss["xhttpSettings"]["path"] == "/vless-xhttp"
-
-
-def test_cdn_placeholder_manager_real_server_resolves_to_cdn():
-    from core.xray_manager import XrayManager
-    mgr = XrayManager(_cdn_placeholder_profile(), spoof_port=None)
-    host, port = mgr.real_server
-    assert host == "lucky-union-b89c.hamijafayi.workers.dev"
-    assert port == 443
 
 
 if __name__ == "__main__":
