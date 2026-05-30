@@ -6,8 +6,8 @@ ripple) lives in ``animations.py`` and is layered on top of these in step 2.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QPoint, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QPoint, QPointF, QTimer, Signal
+from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QHBoxLayout,
     QLabel, QPushButton, QVBoxLayout, QWidget,
@@ -367,3 +367,111 @@ class Toast(QFrame):
             duration,
             lambda: fade_out(t, 260, on_done=t.deleteLater))
         return t
+
+
+# ---------------------------------------------------------------------------
+#  Live throughput sparkline (download + upload)
+# ---------------------------------------------------------------------------
+
+class Sparkline(QWidget):
+    """A lightweight dual-series area sparkline for live up/down throughput.
+
+    Holds a rolling window of samples for two series (download + upload) and
+    redraws on every :meth:`push`. Pure-``QPainter`` (no external charting dep)
+    so it stays cheap and dependency-free. The y-scale auto-fits to the largest
+    value currently on screen so spikes stay readable.
+    """
+
+    def __init__(self, capacity: int = 60, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Sparkline")
+        self._cap = max(8, int(capacity))
+        self._down: list[float] = []
+        self._up: list[float] = []
+        # colours are refreshed from the palette via :meth:`set_colors`
+        self._c_down = QColor("#4f8cff")
+        self._c_up = QColor("#36d399")
+        self._c_grid = QColor(255, 255, 255, 22)
+        self.setMinimumHeight(96)
+
+    def set_colors(self, down: str, up: str, grid: str | None = None) -> None:
+        self._c_down = QColor(down)
+        self._c_up = QColor(up)
+        if grid:
+            self._c_grid = QColor(grid)
+        self.update()
+
+    def push(self, down_bps: float, up_bps: float) -> None:
+        """Append one sample (bytes/sec) for each series and repaint."""
+        self._down.append(max(0.0, float(down_bps)))
+        self._up.append(max(0.0, float(up_bps)))
+        if len(self._down) > self._cap:
+            self._down = self._down[-self._cap:]
+            self._up = self._up[-self._cap:]
+        self.update()
+
+    def clear(self) -> None:
+        self._down.clear()
+        self._up.clear()
+        self.update()
+
+    # -- painting ---------------------------------------------------------
+    def _peak(self) -> float:
+        peak = 0.0
+        for s in (self._down, self._up):
+            if s:
+                peak = max(peak, max(s))
+        return peak
+
+    def paintEvent(self, _ev):  # pragma: no cover - visual; logic tested apart
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        w, h = self.width(), self.height()
+        pad = 6
+        # baseline grid
+        p.setPen(QPen(self._c_grid, 1))
+        for i in range(1, 4):
+            y = pad + (h - 2 * pad) * i / 4
+            p.drawLine(pad, int(y), w - pad, int(y))
+
+        peak = self._peak()
+        if peak <= 0 or len(self._down) < 2:
+            return
+        # draw download under upload so upload stays visible on top
+        self._draw_series(p, self._down, peak, self._c_down, pad, w, h)
+        self._draw_series(p, self._up, peak, self._c_up, pad, w, h)
+
+    def _draw_series(self, p, data, peak, color, pad, w, h):
+        n = len(data)
+        plot_w = w - 2 * pad
+        plot_h = h - 2 * pad
+        step = plot_w / (self._cap - 1)
+        # right-align the newest sample
+        x0 = w - pad - (n - 1) * step
+
+        def pt(i: int) -> QPointF:
+            x = x0 + i * step
+            y = (h - pad) - (data[i] / peak) * plot_h
+            return QPointF(x, y)
+
+        line = QPainterPath()
+        line.moveTo(pt(0))
+        for i in range(1, n):
+            line.lineTo(pt(i))
+
+        area = QPainterPath(line)
+        area.lineTo(QPointF(x0 + (n - 1) * step, h - pad))
+        area.lineTo(QPointF(x0, h - pad))
+        area.closeSubpath()
+
+        grad = QLinearGradient(0, pad, 0, h - pad)
+        fill = QColor(color)
+        fill.setAlpha(70)
+        grad.setColorAt(0.0, fill)
+        tail = QColor(color)
+        tail.setAlpha(10)
+        grad.setColorAt(1.0, tail)
+        p.fillPath(area, grad)
+
+        p.setPen(QPen(color, 2))
+        p.drawPath(line)

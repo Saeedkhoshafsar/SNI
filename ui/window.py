@@ -25,7 +25,9 @@ from PySide6.QtWidgets import (
 
 from ui import win_effects
 from ui.theme import get_palette, build_qss
-from ui.widgets import Card, NavItem, PowerButton, ProfileRow, TitleBar, Toast
+from ui.widgets import (
+    Card, NavItem, PowerButton, ProfileRow, Sparkline, TitleBar, Toast,
+)
 from ui.animations import CountUp, PulseDot, stagger_in
 
 from core.config_store import ConfigStore
@@ -183,6 +185,30 @@ def _section_title(text: str, sub: str = "") -> QWidget:
     return w
 
 
+def fmt_bytes(n: float) -> str:
+    """Human-readable byte total (e.g. 1.4 MB)."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def fmt_rate(bps: float) -> str:
+    """Human-readable throughput (e.g. 320 KB/s)."""
+    return fmt_bytes(bps) + "/s"
+
+
+# which connection modes are full tunnels vs. local proxy only
+def mode_kind(mode: str) -> str:
+    """Return 'tunnel' for warp/psiphon chained modes, else 'proxy'."""
+    m = (mode or "").lower()
+    if "warp" in m or "psiphon" in m or "gaming" in m:
+        return "tunnel"
+    return "proxy"
+
+
 def _stat_card(value: str, label: str, accent_color: str | None = None) -> Card:
     c = Card(object_name="CardAlt")
     b = c.body()
@@ -218,7 +244,7 @@ class DashboardPage(QWidget):
         root.setSpacing(16)
 
         self.header = _section_title(
-            "داشبورد", "وضعیت زنده‌ی تونل و کنترل سریع روشن/خاموش")
+            "کنترل‌مرکز", "وضعیت زنده‌ی تونل، مصرف و کنترل سریع روشن/خاموش")
         root.addWidget(self.header)
 
         # --- status hero card ---
@@ -233,6 +259,11 @@ class DashboardPage(QWidget):
         row.addWidget(self.status_dot)
         row.addWidget(self.status_label)
         row.addStretch(1)
+        # tunnel / proxy badge — answers feedback 7 ("is this a tunnel or proxy?")
+        self.mode_badge = QLabel("پروکسی محلی")
+        self.mode_badge.setObjectName("ModeBadge")
+        self.mode_badge.setProperty("kind", "proxy")
+        row.addWidget(self.mode_badge)
 
         self.btn_start = PowerButton(palette)
         self.btn_start.request.connect(self._on_power)
@@ -241,17 +272,46 @@ class DashboardPage(QWidget):
         self.hero = hero
         root.addWidget(hero)
 
+        # --- live throughput card (download / upload sparkline) ---
+        traffic = Card()
+        tb = traffic.body()
+        thead = QHBoxLayout()
+        thead.setSpacing(14)
+        tlabel = QLabel("مصرف زنده")
+        tlabel.setObjectName("H2")
+        thead.addWidget(tlabel)
+        thead.addStretch(1)
+        self.rate_down = QLabel("↓ 0 B/s")
+        self.rate_down.setObjectName("RateDown")
+        self.rate_up = QLabel("↑ 0 B/s")
+        self.rate_up.setObjectName("RateUp")
+        thead.addWidget(self.rate_down)
+        thead.addWidget(self.rate_up)
+        tb.addLayout(thead)
+        self.spark = Sparkline(capacity=60)
+        self.spark.set_colors(palette.accent, palette.success)
+        tb.addWidget(self.spark)
+        self.traffic_card = traffic
+        root.addWidget(traffic)
+
         # --- quick stats row ---
         stats = QHBoxLayout()
         stats.setSpacing(14)
         self.stat_conns = _stat_card("0", "اتصالات فعال",
                                      accent_color=palette.accent)
+        self.stat_total = _stat_card("0 B", "مصرف کل (↓/↑)")
         self.stat_mode = _stat_card("SNI Only", "حالت")
         self.stat_strategy = _stat_card("wrong_seq", "استراتژی فعال")
-        self.stat_cards = [self.stat_conns, self.stat_mode, self.stat_strategy]
+        self.stat_cards = [self.stat_conns, self.stat_total,
+                           self.stat_mode, self.stat_strategy]
         for c in self.stat_cards:
             stats.addWidget(c)
         root.addLayout(stats)
+
+        # --- resilience strip (live fallback state) ---
+        self.lbl_resilience = QLabel("تاب‌آوری: —")
+        self.lbl_resilience.setObjectName("Muted")
+        root.addWidget(self.lbl_resilience)
 
         root.addStretch(1)
 
@@ -260,7 +320,8 @@ class DashboardPage(QWidget):
 
     # -- entrance animation (called when page becomes visible) -------------
     def play_intro(self):
-        stagger_in([self.header, self.hero, *self.stat_cards], step=70)
+        stagger_in([self.header, self.hero, self.traffic_card,
+                    *self.stat_cards], step=60)
 
     # -- power button → delegate to the engine via the host window ---------
     def _on_power(self, action: str):
@@ -277,16 +338,42 @@ class DashboardPage(QWidget):
             "active": "متصل — تونل فعال",
             "error": "خطا — تلاش دوباره",
         }.get(state, "آماده — متوقف"))
+        if state == "idle":
+            # reset the live picture when the session ends
+            self.spark.clear()
+            self.rate_down.setText("↓ 0 B/s")
+            self.rate_up.setText("↑ 0 B/s")
+            self.lbl_resilience.setText("تاب‌آوری: —")
 
     def on_count(self, active: int, total: int):
         """Slot for the engine's connection-count signal."""
         self._count.to(active)
+
+    def on_traffic(self, up_bytes: int, down_bytes: int,
+                   up_bps: float, down_bps: float):
+        """Slot for the engine's live traffic signal (step 20)."""
+        self.spark.push(down_bps, up_bps)
+        self.rate_down.setText(f"↓ {fmt_rate(down_bps)}")
+        self.rate_up.setText(f"↑ {fmt_rate(up_bps)}")
+        self.stat_total.value_label.setText(
+            f"{fmt_bytes(down_bytes)} / {fmt_bytes(up_bytes)}")
+
+    def set_resilience(self, text: str):
+        """Slot for the live resilience/fallback summary line."""
+        self.lbl_resilience.setText(f"تاب‌آوری: {text}")
 
     def set_active_strategy(self, key: str):
         self.stat_strategy.value_label.setText(key)
 
     def set_mode(self, mode: str):
         self.stat_mode.value_label.setText(mode)
+        kind = mode_kind(mode)
+        self.mode_badge.setProperty("kind", kind)
+        self.mode_badge.setText(
+            "تونل کامل" if kind == "tunnel" else "پروکسی محلی")
+        # re-polish so the QSS property selector re-applies
+        self.mode_badge.style().unpolish(self.mode_badge)
+        self.mode_badge.style().polish(self.mode_badge)
 
     def _toast(self, text: str, kind: str):
         win = self.window()
@@ -296,6 +383,7 @@ class DashboardPage(QWidget):
         self._palette = palette
         self.btn_start.set_palette(palette)
         self.stat_conns.value_label.setStyleSheet(f"color:{palette.accent};")
+        self.spark.set_colors(palette.accent, palette.success)
 
 
 class SettingsPage(QWidget):
@@ -1068,9 +1156,15 @@ class MainWindow(QWidget):
         self.engine.status.connect(self.page_dashboard.set_status)
         self.engine.status.connect(self._on_status)
         self.engine.count.connect(self.page_dashboard.on_count)
+        self.engine.traffic.connect(self.page_dashboard.on_traffic)
         # live bypass method → dashboard stays in sync with Diagnostics
         self.engine.strategy.connect(self.page_dashboard.set_active_strategy)
         self.engine.strategy.connect(self._on_strategy_changed)
+
+        # poll the resilience layer for the dashboard strip while active
+        self._resilience_timer = QTimer(self)
+        self._resilience_timer.setInterval(1500)
+        self._resilience_timer.timeout.connect(self._pump_resilience)
 
         # UI → engine
         self.page_dashboard.power_handler = self._on_power
@@ -1107,10 +1201,29 @@ class MainWindow(QWidget):
     def _on_status(self, status: str):
         if status == "active":
             Toast.show_message(self, "اتصال برقرار شد — spoofing فعال", "ok")
+            self._resilience_timer.start()
+            self._pump_resilience()
         elif status == "idle":
             Toast.show_message(self, "اتصال قطع شد", "warn")
+            self._resilience_timer.stop()
         elif status == "error":
             Toast.show_message(self, "خطا در اتصال — لاگ را ببینید", "err")
+            self._resilience_timer.stop()
+
+    def _pump_resilience(self):
+        """Push a concise live resilience summary into the dashboard strip."""
+        try:
+            snap = self.engine.diagnostics()
+        except Exception:
+            return
+        if not getattr(snap, "resilience_on", False):
+            self.page_dashboard.set_resilience("غیرفعال")
+            return
+        chain = " → ".join(snap.strategy_chain) or (snap.active_strategy or "—")
+        throttle = " · throttle!" if snap.throttled else ""
+        self.page_dashboard.set_resilience(
+            f"RST {snap.forged_rst_count}/{snap.rst_budget} · "
+            f"زنجیره {chain}{throttle}")
 
     def _on_strategy_changed(self, method: str):
         self.page_log.append(f"[strategy] استراتژی فعال: {method}")

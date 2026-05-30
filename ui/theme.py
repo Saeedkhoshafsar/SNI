@@ -328,4 +328,29 @@ def build_qss(p: Palette) -> str:
         font-size: 12.5px;
         padding: 8px;
     }}
+    QLabel#ModeBadge {{
+        padding: 4px 12px;
+        border-radius: 11px;
+        font-size: 12px;
+        font-weight: 600;
+        border: 1px solid {p.border};
+        color: {p.text_muted};
+        background: {p.surface_alt};
+    }}
+    QLabel#ModeBadge[kind="tunnel"] {{
+        color: {p.on_accent};
+        background: {p.accent};
+        border: 1px solid {p.accent};
+    }}
+    QLabel#ModeBadge[kind="proxy"] {{
+        color: {p.text_muted};
+        background: {p.surface_alt};
+    }}
+    QLabel#RateDown {{ color: {p.accent}; font-weight: 600; }}
+    QLabel#RateUp {{ color: {p.success}; font-weight: 600; }}
+    QWidget#Sparkline {{
+        background: {p.surface_alt};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+    }}
     """
