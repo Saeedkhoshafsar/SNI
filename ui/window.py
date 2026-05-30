@@ -846,10 +846,16 @@ class StrategyPage(QWidget):
 
     # emitted when the auto-prober toggle changes (True == enabled)
     auto_prober_changed = Signal(bool)
+    # emitted when the user clicks a strategy card to select it manually
+    strategy_selected = Signal(str)
 
     def __init__(self, store: "ConfigStore | None" = None, parent=None):
         super().__init__(parent)
         self.store = store
+        self._cards: dict[str, QFrame] = {}
+        self._selected = (str(store.get("bypass_method", "wrong_seq"))
+                          if store else "wrong_seq")
+
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
         root.setSpacing(16)
@@ -882,23 +888,44 @@ class StrategyPage(QWidget):
         apb.addLayout(row)
         root.addWidget(ap)
 
-        # strategy list
+        # manual-pick hint
+        self.pick_hint = QLabel("")
+        self.pick_hint.setObjectName("Faint")
+        self.pick_hint.setWordWrap(True)
+        root.addWidget(self.pick_hint)
+        self._sync_pick_hint(enabled)
+
+        # clickable strategy list
         for key, name, desc in STRATEGIES:
             root.addWidget(self._strategy_row(key, name, desc))
 
+        self._refresh_selection()
         root.addStretch(1)
 
     def _sync_autoprobe_label(self, enabled: bool) -> None:
         self.btn_autoprobe.setText("فعال ✓" if enabled else "فعال‌سازی")
 
+    def _sync_pick_hint(self, auto_enabled: bool) -> None:
+        if auto_enabled:
+            self.pick_hint.setText(
+                "پراب خودکار روشن است؛ انتخاب دستی نادیده گرفته می‌شود. "
+                "برای انتخاب دستی، ابتدا پراب خودکار را خاموش کنید.")
+        else:
+            self.pick_hint.setText(
+                "روی هر استراتژی کلیک کنید تا به‌صورت دستی انتخاب/قفل شود.")
+
     def _on_autoprobe_toggled(self, enabled: bool) -> None:
         self._sync_autoprobe_label(enabled)
+        self._sync_pick_hint(enabled)
+        self._refresh_selection()
         if self.store is not None:
             self.store.set("auto_prober", bool(enabled))
         self.auto_prober_changed.emit(bool(enabled))
 
-    def _strategy_row(self, key: str, name: str, desc: str) -> Card:
-        c = Card(object_name="CardAlt")
+    def _strategy_row(self, key: str, name: str, desc: str) -> QFrame:
+        c = Card(object_name="StrategyCard")
+        c.setProperty("selected", False)
+        c.setCursor(Qt.PointingHandCursor)
         b = c.body()
         row = QHBoxLayout()
         col = QVBoxLayout()
@@ -911,11 +938,45 @@ class StrategyPage(QWidget):
         col.addWidget(ds)
         row.addLayout(col)
         row.addStretch(1)
+        check = QLabel("")
+        check.setObjectName("StrategyCheck")
+        row.addWidget(check)
         badge = QLabel(key)
         badge.setObjectName("Mono")
         row.addWidget(badge)
         b.addLayout(row)
+        # make the whole card clickable
+        c.mousePressEvent = lambda ev, k=key: self._on_card_clicked(k)
+        # hover-lift: deepen the shadow + raise the card on enter (3D feel)
+        c.enterEvent = lambda ev, card=c: card.set_shadow(
+            blur=46, y=16, color="rgba(0,0,0,0.6)")
+        c.leaveEvent = lambda ev, card=c: card.set_shadow(
+            blur=34, y=10, color="rgba(0,0,0,0.55)")
+        c._check_label = check  # stash for selection rendering
+        self._cards[key] = c
         return c
+
+    def _on_card_clicked(self, key: str) -> None:
+        # manual pick disables auto-prober (the two are mutually exclusive)
+        if self.btn_autoprobe.isChecked():
+            self.btn_autoprobe.setChecked(False)  # fires _on_autoprobe_toggled
+        self._selected = key
+        self._refresh_selection()
+        if self.store is not None:
+            self.store.set("bypass_method", key)
+        self.strategy_selected.emit(key)
+
+    def _refresh_selection(self) -> None:
+        """Repaint cards so the active one stands out (and re-polish QSS)."""
+        auto = self.btn_autoprobe.isChecked()
+        for key, card in self._cards.items():
+            is_sel = (not auto) and (key == self._selected)
+            card.setProperty("selected", is_sel)
+            if hasattr(card, "_check_label"):
+                card._check_label.setText("✓ انتخاب‌شده" if is_sel else "")
+            # re-polish so the [selected="true"] QSS applies immediately
+            card.style().unpolish(card)
+            card.style().polish(card)
 
 
 class DiagnosticsPage(QWidget):
@@ -1250,6 +1311,7 @@ class MainWindow(QWidget):
         self.page_settings = SettingsPage()
         self.page_strategy = StrategyPage(self.store)
         self.page_strategy.auto_prober_changed.connect(self._on_auto_prober_changed)
+        self.page_strategy.strategy_selected.connect(self._on_strategy_selected)
         self.page_diagnostics = DiagnosticsPage()
         self.page_diagnostics.set_provider(self.engine.diagnostics)
         self.page_log = LogPage()
@@ -1360,6 +1422,16 @@ class MainWindow(QWidget):
         Toast.show_message(
             self, "پراب خودکار فعال شد" if enabled else "پراب خودکار غیرفعال شد",
             "ok")
+
+    def _on_strategy_selected(self, key: str):
+        # StrategyPage already persisted bypass_method (and cleared auto_prober);
+        # push to the live engine so the next connection uses it.
+        self.store.save_config()
+        self.engine.update_config(self.store.config)
+        # find the human-readable name for the toast/log
+        name = next((n for k, n, _ in STRATEGIES if k == key), key)
+        self.page_log.append(f"[strategy] انتخاب دستی: {name} ({key})")
+        Toast.show_message(self, f"استراتژی انتخاب شد: {name}", "ok")
 
     def _save_settings(self):
         self.store.update(**self.page_settings.collect())

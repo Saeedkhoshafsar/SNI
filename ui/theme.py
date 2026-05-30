@@ -139,6 +139,25 @@ def build_qss(p: Palette) -> str:
         border: 1px solid {p.border};
         border-radius: {p.radius_sm}px;
     }}
+    /* ---- Clickable strategy cards (step 24) ---- */
+    QFrame#StrategyCard {{
+        background: {p.surface_alt};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+    }}
+    QFrame#StrategyCard:hover {{
+        border: 1px solid {p.accent};
+        background: {p.surface};
+    }}
+    QFrame#StrategyCard[selected="true"] {{
+        border: 1.5px solid {p.accent};
+        background: {p.surface};
+    }}
+    QLabel#StrategyCheck {{
+        color: {p.accent};
+        font-size: 12px;
+        font-weight: 600;
+    }}
 
     /* ---- Headings ---- */
     QLabel#H1 {{ font-size: 22px; font-weight: 700; color: {p.text}; }}

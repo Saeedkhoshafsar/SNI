@@ -42,6 +42,20 @@ class Card(QFrame):
         eff.setOffset(0, y)
         eff.setColor(_qcolor_from_rgba(color))
         self.setGraphicsEffect(eff)
+        self._shadow = eff
+
+    def set_shadow(self, *, blur: int | None = None, y: int | None = None,
+                   color: str | None = None) -> None:
+        """Adjust the drop shadow at runtime (used for hover-lift, step 24)."""
+        eff = getattr(self, "_shadow", None)
+        if eff is None:
+            return
+        if blur is not None:
+            eff.setBlurRadius(blur)
+        if y is not None:
+            eff.setOffset(0, y)
+        if color is not None:
+            eff.setColor(_qcolor_from_rgba(color))
 
 
 def _qcolor_from_rgba(s: str) -> QColor:
@@ -106,12 +120,32 @@ class TitleBar(QFrame):
         return b
 
     # --- window dragging --------------------------------------------------
+    #
+    # Prefer the OS-native window move (``QWindow.startSystemMove``): on
+    # frameless windows it produces buttery-smooth dragging that respects the
+    # compositor / DPI / snap-assist, instead of the jittery manual ``move()``
+    # loop that lagged behind the cursor (the bug in feedback 6). We fall back
+    # to the manual approach only when the native move is unavailable.
+    def _begin_native_move(self) -> bool:
+        win = self._win.windowHandle() if self._win else None
+        if win is not None and hasattr(win, "startSystemMove"):
+            try:
+                return bool(win.startSystemMove())
+            except Exception:
+                return False
+        return False
+
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
-            self._drag_pos = e.globalPosition().toPoint() - self._win.frameGeometry().topLeft()
+            if self._begin_native_move():
+                self._drag_pos = None       # OS now owns the drag
+            else:
+                self._drag_pos = (e.globalPosition().toPoint()
+                                  - self._win.frameGeometry().topLeft())
             e.accept()
 
     def mouseMoveEvent(self, e):
+        # manual fallback only (native move handles its own motion)
         if self._drag_pos is not None and e.buttons() & Qt.LeftButton:
             self._win.move(e.globalPosition().toPoint() - self._drag_pos)
             e.accept()

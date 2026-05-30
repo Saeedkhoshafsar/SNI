@@ -86,7 +86,7 @@ Cloudflare Worker (`type=xhttp`, `mode=auto`). علت ریشه‌ای: `_stream_
 - [x] استپ ۲۱ — **رفع باگ XHTTP** (بحرانی): افزودن `xhttp`/`splithttp`/`httpupgrade` به `TRANSPORTS`، فیلد `mode` به `Profile`، گرفتن `mode=` در پارسر (vless/trojan/vmess)، ساخت درست `xhttpSettings`/`httpupgradeSettings` در `_stream_settings` (با نرمال‌سازی `splithttp→xhttp`)، و نمایش/ویرایش `mode` در دیالوگ پروفایل (بازخورد ۱۱)  ✅ 2026-05-30
 - [x] استپ ۲۲ — پروکسی سیستم ویندوز (set/unset رجیستری) + سوییچ در UI «تونل/پروکسی سیستم» (بازخورد ۷)  ✅ 2026-05-30
 - [x] استپ ۲۳ — لاگ حرفه‌ای: timestamp، سطح‌بندی info/ok/warn/err با رنگ، فیلتر، شمارنده (بازخورد ۱)  ✅ 2026-05-30
-- [ ] استپ ۲۴ — صفحه‌ی استراتژی کلیک‌پذیر + بازطراحی تم سه‌بعدی/مدرن (کارت‌های معلق/شیشه/سایه عمیق/هاور) + رفع drag پنجره (بازخورد ۴/۵/۶)
+- [x] استپ ۲۴ — صفحه‌ی استراتژی کلیک‌پذیر + بازطراحی تم سه‌بعدی/مدرن (کارت‌های معلق/شیشه/سایه عمیق/هاور) + رفع drag پنجره (بازخورد ۴/۵/۶)  ✅ 2026-05-30
 
 ---
 
@@ -362,3 +362,15 @@ PyInstaller (onefile)، embed باینری‌ها (xray/vwarp/wintun)، آیکو
 - **`ui/window.py` — بازنویسی `LogPage`** — از `QPlainTextEdit` به `QTextEdit` (rich text برای رنگ هر خط). نوار ابزار: کمبوی فیلتر سطح (`cmb_level` با گزینه‌های فارسی)، جستجوی متن (`search`)، نوار شمارندهٔ زندهٔ رنگی (`counters`). `append` خط جدید را طبقه‌بندی، شمارش، و در صورت عبور از فیلتر افزایشی رندر می‌کند؛ تغییر فیلتر/جستجو کل نما را از بافر بازسازی می‌کند (`_rerender`). رنگ‌ها داخل ویجت تعریف شده‌اند تا QSS فقط مخصوص تم بماند. HTML پیام escape می‌شود تا markup نشکند.
 - **`ui/theme.py`** — `#Log` از `QPlainTextEdit` به `QTextEdit` تغییر کرد؛ استایل `#LogFilter`/`#LogSearch`/`#LogCounters` افزوده شد.
 - تست‌ها: `tests/test_logbuffer.py` (+۱۵: classify، format، matches، add/count/evict، clear، filtered، summary) + `tests/test_log_ui.py` (+۵: seed، طبقه‌بندی/شمارش، فیلتر سطح، جستجو، clear). مجموعاً **۳۰۷ تست سبز + ۲ skip**.
+
+## ✅ استپ ۲۴ — استراتژی کلیک‌پذیر + کارت‌های سه‌بعدی + رفع drag پنجره (2026-05-30)
+**چرا:** بازخورد ۴ (صفحهٔ استراتژی فقط نمایشی بود و انتخاب نداشت)، بازخورد ۵ (حس تخت — نیاز به کارت‌های معلق/سایه عمیق/هاور)، بازخورد ۶ (drag پنجرهٔ frameless کند و لرزان بود).
+- **استراتژی کلیک‌پذیر (`ui/window.py` → `StrategyPage`)** — هر کارت استراتژی حالا قابل‌کلیک است (cursor دست، `mousePressEvent` روی کل کارت). کلیک:
+  - `bypass_method` را در store ذخیره می‌کند و سیگنال جدید `strategy_selected(key)` را emit می‌کند؛
+  - چون انتخاب دستی و پراب خودکار متقابلاً انحصاری‌اند، کلیک‌کردن `auto_prober` را خاموش می‌کند؛
+  - کارت انتخاب‌شده با `setProperty("selected", True)` + برچسب «✓ انتخاب‌شده» متمایز می‌شود (re-polish QSS برای اعمال فوری).
+  - راهنمای `pick_hint` وضعیت را توضیح می‌دهد (در حالت پراب خودکار، انتخاب دستی نادیده گرفته می‌شود).
+  - **`MainWindow._on_strategy_selected`** — flag را save و به engine زندهٔ push می‌کند + لاگ + Toast.
+- **کارت‌های سه‌بعدی/معلق** — `ui/theme.py`: استایل `#StrategyCard` با `:hover` (حاشیهٔ accent + پس‌زمینهٔ روشن‌تر) و `[selected="true"]` (حاشیهٔ ضخیم accent). `ui/widgets.py → Card.set_shadow(blur,y,color)` افزوده شد تا سایهٔ drop در زمان اجرا قابل تنظیم باشد؛ StrategyPage با `enterEvent/leaveEvent` یک hover-lift اعمال می‌کند (عمیق‌تر شدن سایه + بالاآمدن کارت) — کاری که QSS به‌تنهایی نمی‌تواند روی `QGraphicsDropShadowEffect` انجام دهد.
+- **رفع drag پنجره (`ui/widgets.py → TitleBar`)** — به‌جای حلقهٔ دستیِ `move()` که پشت نشانگر می‌لرزید، حالا `QWindow.startSystemMove()` بومیِ سیستم‌عامل استفاده می‌شود (drag روان، سازگار با compositor/DPI/snap-assist). در صورت نبودِ native move، fallback به روش دستی حفظ شده است (`_begin_native_move()` همیشه bool برمی‌گرداند).
+- تست‌ها: `tests/test_strategy_ui.py` (+۶: انتخاب اولیه از store، کلیک→انتخاب/persist/emit، کلیک→خاموش‌شدن auto-prober، پنهان‌شدن انتخاب در حالت auto، fallback امن `_begin_native_move`، `Card.set_shadow`). smoke-test کامل MainWindow هم سبز. مجموعاً **۳۱۳ تست سبز + ۲ skip**.
