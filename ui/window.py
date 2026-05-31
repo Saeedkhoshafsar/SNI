@@ -489,6 +489,18 @@ class SettingsPage(QWidget):
         form.addWidget(self.proxy_hint)
         self.chk_system_proxy.toggled.connect(self._update_proxy_hint)
 
+        # --- force SNI-spoof for ordinary configs (issue #1) ---
+        form.addSpacing(8)
+        self.chk_force_spoof = QCheckBox(
+            tr("اسپوف SNI اجباری برای کانفیگ‌های معمولی — حتی کانفیگ‌هایی که "
+               "آدرس سرورشان IP/دامنه‌ی واقعی است، از طریق اسپوفر رد شوند"))
+        form.addWidget(self.chk_force_spoof)
+        self.force_spoof_hint = QLabel("")
+        self.force_spoof_hint.setObjectName("Muted")
+        self.force_spoof_hint.setWordWrap(True)
+        form.addWidget(self.force_spoof_hint)
+        self.chk_force_spoof.toggled.connect(self._update_force_spoof_hint)
+
         save_row = QHBoxLayout()
         save_row.addStretch(1)
         self.btn_save = QPushButton(tr("ذخیره"))
@@ -514,6 +526,8 @@ class SettingsPage(QWidget):
         self._update_lan_hint(self.chk_lan.isChecked())
         self.chk_system_proxy.setChecked(bool(cfg.get("system_proxy", False)))
         self._update_proxy_hint(self.chk_system_proxy.isChecked())
+        self.chk_force_spoof.setChecked(bool(cfg.get("force_spoof", False)))
+        self._update_force_spoof_hint(self.chk_force_spoof.isChecked())
 
     def collect(self) -> dict:
         """Read the widgets back into a config dict fragment."""
@@ -525,6 +539,7 @@ class SettingsPage(QWidget):
             "CONNECT_IP": self.connect_ip.text().strip(),
             "allow_lan": self.chk_lan.isChecked(),
             "system_proxy": self.chk_system_proxy.isChecked(),
+            "force_spoof": self.chk_force_spoof.isChecked(),
         }
 
     def set_mode(self, mode: str) -> None:
@@ -585,6 +600,21 @@ class SettingsPage(QWidget):
             self.proxy_hint.setText(tr(
                 "حالت «تونل»: فقط برنامه‌هایی که دستی روی پروکسی محلی تنظیم "
                 "شده‌اند رد می‌شوند؛ تنظیمات ویندوز دست‌نخورده می‌ماند."))
+
+    def _update_force_spoof_hint(self, on: bool) -> None:
+        """Explain the force-SNI-spoof option for ordinary configs (issue #1)."""
+        if on:
+            self.force_spoof_hint.setText(tr(
+                "روشن — کانفیگ‌های معمولی (با IP/دامنه‌ی واقعی) هم به‌جای اتصال "
+                "مستقیم، از طریق اسپوفر وصل می‌شوند: xray → اسپوفر → همان "
+                "IP/پورت کانفیگ، با تزریق ClientHello جعلی برای دور زدن DPI. "
+                "اگر کانفیگ تمیزی در V2RayTun کار می‌کند ولی اینجا مستقیم وصل "
+                "نمی‌شود، این گزینه را روشن کنید (نیازمند دسترسی Administrator "
+                "و درایور WinDivert)."))
+        else:
+            self.force_spoof_hint.setText(tr(
+                "خاموش — کانفیگ‌های معمولی مستقیماً وصل می‌شوند (مثل V2RayTun)؛ "
+                "فقط کانفیگ‌های اسپوف (لینک‌های لوکال) از اسپوفر رد می‌شوند."))
 
     def _field_label(self, t: str) -> QLabel:
         lbl = QLabel(tr(t))
@@ -773,6 +803,10 @@ class ProfilesPage(QWidget):
             row.activate.connect(lambda _=False, idx=i: self._activate_index(idx))
             # inline per-row ping (#3)
             row.ping.connect(lambda _=False, idx=i: self._ping_row(idx))
+            # copy this config back to a share link (issue #2)
+            row.share.connect(lambda _=False, idx=i: self._share_index(idx))
+            # scan clean Cloudflare IPs using this config as reference (issue #3)
+            row.scan.connect(lambda _=False, idx=i: self._scan_index(idx))
             self._rows.append(row)
             # use a guaranteed minimum row height so the active "● فعال" pill +
             # badges never get clipped (sizeHint can under-report before layout)
@@ -957,6 +991,50 @@ class ProfilesPage(QWidget):
         self._emit_selection()
         prof = self._store.profiles[row]
         self._toast(tr("سرور فعال شد: {name}").format(name=prof.display_name), "ok")
+
+    # -- share / export to link (issue #2) --------------------------------
+    def _share_index(self, row: int):
+        """Re-serialise a profile back to a share link and copy it (issue #2)."""
+        if not (0 <= row < len(self._store.profiles)):
+            return
+        prof = self._store.profiles[row]
+        try:
+            from core.share_link import profile_to_link
+            link = profile_to_link(prof)
+        except Exception as exc:
+            self._toast(tr("ساخت لینک ناموفق: {exc}").format(exc=exc), "err")
+            return
+        QGuiApplication.clipboard().setText(link)
+        self._toast(
+            tr("لینک کانفیگ کپی شد — حالا می‌توانید به اشتراک بگذارید"), "ok")
+
+    # -- Cloudflare clean-IP scanner (issue #3) ---------------------------
+    def _scan_index(self, row: int):
+        """Open the clean-IP scanner using this profile as the reference (#3).
+
+        Clean IPs found by the scan are turned into new profiles — byte-for-byte
+        identical to the reference config except their server address is the
+        chosen clean IP — and added to the store.
+        """
+        if not (0 <= row < len(self._store.profiles)):
+            return
+        prof = self._store.profiles[row]
+        try:
+            from ui.scanner_dialog import ScannerDialog
+        except Exception as exc:
+            self._toast(tr("اسکنر در دسترس نیست: {exc}").format(exc=exc), "err")
+            return
+        dlg = ScannerDialog(prof, self.window())
+        if dlg.exec() != ScannerDialog.Accepted:
+            return
+        new_profiles = list(dlg.result_profiles)
+        if not new_profiles:
+            return
+        added = self._store.add_profiles(new_profiles)
+        self.refresh()
+        self._emit_selection()
+        self._toast(
+            tr("{n} کانفیگ با IP تمیز افزوده شد").format(n=added), "ok")
 
     # -- inline per-row ping (#3) -----------------------------------------
     def _ping_row(self, row: int):

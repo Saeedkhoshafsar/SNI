@@ -274,6 +274,8 @@ class ProfileRow(QFrame):
     edit = Signal()
     ping = Signal()       # inline "ping this server" button clicked
     activate = Signal()   # inline "use this server" button clicked
+    share = Signal()      # inline "copy this config as a share link" clicked
+    scan = Signal()       # inline "scan clean Cloudflare IPs for this config"
 
     def __init__(self, profile, *, active: bool = False,
                  parent: QWidget | None = None):
@@ -374,6 +376,26 @@ class ProfileRow(QFrame):
         self.btn_use.clicked.connect(self.activate.emit)
         self.btn_use.setVisible(not active)
         lay.addWidget(self.btn_use, 0, Qt.AlignVCenter)
+
+        # inline "scan clean Cloudflare IPs" button — runs the scanner using
+        # THIS config as the reference test (issue #3).
+        self.btn_scan = QPushButton("\U0001f50d")
+        self.btn_scan.setObjectName("RowScan")
+        self.btn_scan.setCursor(Qt.PointingHandCursor)
+        self.btn_scan.setFixedSize(28, 28)
+        self.btn_scan.setToolTip(tr("اسکن IP تمیز کلودفلر با این کانفیگ"))
+        self.btn_scan.clicked.connect(self.scan.emit)
+        lay.addWidget(self.btn_scan, 0, Qt.AlignVCenter)
+
+        # inline "share / copy link" button — re-serialise this profile back to
+        # a share link and copy it to the clipboard (issue #2).
+        self.btn_share = QPushButton("\U0001f517")
+        self.btn_share.setObjectName("RowShare")
+        self.btn_share.setCursor(Qt.PointingHandCursor)
+        self.btn_share.setFixedSize(28, 28)
+        self.btn_share.setToolTip(tr("کپی لینک اشتراک‌گذاری این کانفیگ"))
+        self.btn_share.clicked.connect(self.share.emit)
+        lay.addWidget(self.btn_share, 0, Qt.AlignVCenter)
 
         # inline edit button
         self.btn_edit = QPushButton("\u270e")

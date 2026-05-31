@@ -37,6 +37,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "system_proxy": True,         # set the Windows OS-wide proxy → local HTTP port on start (ON by default)
     "self_test": True,            # after Start, probe xray→spoofer→CDN via the local HTTP port
     "bypass_method": "wrong_seq",
+    "force_spoof": False,         # route even ordinary (routable) configs through the SNI spoofer (issue #1)
     "gaming_mode": False,
     "verbose_conn_log": False,    # log every per-connection lifecycle line (#5: off = readable log)
     "auto_prober": False,

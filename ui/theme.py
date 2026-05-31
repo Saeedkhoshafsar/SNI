@@ -436,7 +436,8 @@ def build_qss(p: Palette) -> str:
         padding: 1px 7px; font-size: 10.5px; font-weight: 600;
         letter-spacing: 0.4px;
     }}
-    QPushButton#RowEdit, QPushButton#RowPing, QPushButton#RowUse {{
+    QPushButton#RowEdit, QPushButton#RowPing, QPushButton#RowUse,
+    QPushButton#RowShare, QPushButton#RowScan {{
         background: transparent; border: 1px solid {p.border};
         border-radius: 7px; color: {p.text_muted}; font-size: 13px;
     }}
@@ -444,6 +445,8 @@ def build_qss(p: Palette) -> str:
     QPushButton#RowPing:hover {{ background: {p.warning}; color: {p.on_accent}; border-color: {p.warning}; }}
     QPushButton#RowPing:disabled {{ color: {p.text_faint}; }}
     QPushButton#RowUse:hover {{ background: {p.success}; color: {p.on_accent}; border-color: {p.success}; }}
+    QPushButton#RowShare:hover {{ background: {p.accent}; color: {p.on_accent}; border-color: {p.accent}; }}
+    QPushButton#RowScan:hover {{ background: {p.accent_hover}; color: {p.on_accent}; border-color: {p.accent_hover}; }}
 
     /* ---- Profile editor dialog ---- */
     QDialog#ProfileDialog {{
