@@ -317,16 +317,60 @@ def test_spoof_config_xray_dials_local_spoofer_with_real_sni():
     assert ss["xhttpSettings"]["path"] == "/vless-xhttp"
 
 
-def test_parse_stats_json_sums_inbound_counters():
-    """parse_stats_json sums per-inbound uplink/downlink → (up, down) (#3)."""
+def test_parse_stats_json_prefers_outbound_proxy_counters():
+    """When outbound proxy counters exist, live usage uses them, not inbound (#7).
+
+    The inbound counters tick up from the local app handshake even when the
+    remote server is unreachable, so the honest live-usage signal is the
+    outbound proxy traffic that actually reached the server.
+    """
+    from core.xray_manager import parse_stats_json
+    payload = json.dumps({"stat": [
+        # inbound (local app side) — must be ignored when outbound is present
+        {"name": "inbound>>>socks-in>>>traffic>>>uplink", "value": 100},
+        {"name": "inbound>>>socks-in>>>traffic>>>downlink", "value": 900},
+        # real proxy traffic that reached the server
+        {"name": "outbound>>>proxy>>>traffic>>>uplink", "value": 4096},
+        {"name": "outbound>>>proxy>>>traffic>>>downlink", "value": 8192},
+        # non-proxy outbounds must be excluded entirely
+        {"name": "outbound>>>direct>>>traffic>>>uplink", "value": 5000},
+        {"name": "outbound>>>direct>>>traffic>>>downlink", "value": 6000},
+        {"name": "outbound>>>block>>>traffic>>>downlink", "value": 999},
+        {"name": "outbound>>>dns>>>traffic>>>downlink", "value": 333},
+        {"name": "outbound>>>api>>>traffic>>>downlink", "value": 222},
+    ]})
+    assert parse_stats_json(payload) == (4096, 8192)
+
+
+def test_parse_stats_json_broken_config_reads_zero_downlink():
+    """A broken config: inbound handshake ticks up but proxy downlink stays 0 (#7).
+
+    This is exactly the false-live-usage bug — the user must see 0 down for a
+    config that never actually carried traffic to/from the server.
+    """
+    from core.xray_manager import parse_stats_json
+    payload = json.dumps({"stat": [
+        # local handshake produced a few bytes of inbound activity …
+        {"name": "inbound>>>socks-in>>>traffic>>>uplink", "value": 320},
+        {"name": "inbound>>>socks-in>>>traffic>>>downlink", "value": 64},
+        # … but the proxy outbound got nothing back from the (dead) server
+        {"name": "outbound>>>proxy>>>traffic>>>uplink", "value": 280},
+        {"name": "outbound>>>proxy>>>traffic>>>downlink", "value": 0},
+    ]})
+    up, down = parse_stats_json(payload)
+    assert down == 0  # honest: no data ever returned from the server
+
+
+def test_parse_stats_json_falls_back_to_inbound_when_no_outbound():
+    """No outbound proxy counters → fall back to summing inbound counters (#7)."""
     from core.xray_manager import parse_stats_json
     payload = json.dumps({"stat": [
         {"name": "inbound>>>socks-in>>>traffic>>>uplink", "value": 100},
         {"name": "inbound>>>socks-in>>>traffic>>>downlink", "value": 900},
         {"name": "inbound>>>http-in>>>traffic>>>uplink", "value": 50},
         {"name": "inbound>>>http-in>>>traffic>>>downlink", "value": 200},
-        # outbound counters must NOT be summed into the inbound totals
-        {"name": "outbound>>>proxy>>>traffic>>>uplink", "value": 7777},
+        # only non-proxy outbounds present → still treated as "no outbound"
+        {"name": "outbound>>>direct>>>traffic>>>uplink", "value": 7777},
     ]})
     assert parse_stats_json(payload) == (150, 1100)
 
