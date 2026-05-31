@@ -59,13 +59,28 @@ def lan_ip_address() -> str:
             pass
 
 
+# Outbound tags that do NOT represent traffic that actually flowed to the
+# user's remote proxy server (loopback / dropped / DNS / control-plane). We
+# must exclude these so live-usage only reflects real proxied traffic.
+_NON_PROXY_OUTBOUNDS = ("direct", "block", "dns", "dns-out", "api")
+
+
 def parse_stats_json(text: str) -> tuple[int, int] | None:
     """Parse ``xray api statsquery`` JSON → ``(uplink_bytes, downlink_bytes)``.
 
-    Sums every per-inbound uplink/downlink counter (names look like
-    ``inbound>>>socks-in>>>traffic>>>uplink``). Returns ``None`` for empty /
+    Live usage must reflect *real traffic that reached the user's server*, so
+    we sum the **outbound proxy** counters (names look like
+    ``outbound>>>proxy>>>traffic>>>downlink``) and *exclude* the
+    direct/block/dns/api outbounds. This fixes the bug where a **broken**
+    config still showed a few bytes/KB of "live usage": the inbound counters
+    tick up from the local app's handshake even when the upstream server is
+    unreachable, whereas the outbound *downlink* (bytes received back from the
+    server through the proxy) stays a true 0 for a dead config.
+
+    Falls back to the inbound counters when no outbound proxy counters are
+    present (e.g. older configs / policies). Returns ``None`` for empty /
     invalid output so the poller can skip the tick. Pure & side-effect-free so
-    it's unit-testable without spawning xray (issue #3).
+    it's unit-testable without spawning xray (issue #7).
     """
     if not text or not text.strip():
         return None
@@ -73,18 +88,33 @@ def parse_stats_json(text: str) -> tuple[int, int] | None:
         data = json.loads(text)
     except (ValueError, json.JSONDecodeError):
         return None
-    up = down = 0
+    out_up = out_down = 0
+    in_up = in_down = 0
+    saw_outbound = False
     for stat in (data.get("stat") or []):
         name = str(stat.get("name", ""))
         try:
             val = int(stat.get("value", 0) or 0)
         except (TypeError, ValueError):
             val = 0
-        if name.endswith(">>>uplink") and "inbound>>>" in name:
-            up += val
-        elif name.endswith(">>>downlink") and "inbound>>>" in name:
-            down += val
-    return up, down
+        if name.startswith("outbound>>>"):
+            parts = name.split(">>>")
+            tag = parts[1] if len(parts) > 1 else ""
+            if tag in _NON_PROXY_OUTBOUNDS:
+                continue
+            saw_outbound = True
+            if name.endswith(">>>uplink"):
+                out_up += val
+            elif name.endswith(">>>downlink"):
+                out_down += val
+        elif name.startswith("inbound>>>"):
+            if name.endswith(">>>uplink"):
+                in_up += val
+            elif name.endswith(">>>downlink"):
+                in_down += val
+    if saw_outbound:
+        return out_up, out_down
+    return in_up, in_down
 
 
 class XrayManager:

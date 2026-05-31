@@ -157,6 +157,12 @@ def build_qss(p: Palette) -> str:
         border: 1px solid {p.border};
         border-radius: 14px;
     }}
+    /* #4: while maximized, fill the screen edge-to-edge — no rounded corners
+       or hairline border (which left ugly gaps at the screen edges). */
+    QWidget#RootBackdrop[maximized="1"] {{
+        border: none;
+        border-radius: 0px;
+    }}
 
     /* ---- Cards / panels ---- */
     QFrame.Card, QFrame#Card {{
@@ -448,6 +454,35 @@ def build_qss(p: Palette) -> str:
     QPushButton#RowShare:hover {{ background: {p.accent}; color: {p.on_accent}; border-color: {p.accent}; }}
     QPushButton#RowScan:hover {{ background: {p.accent_hover}; color: {p.on_accent}; border-color: {p.accent_hover}; }}
 
+    /* ---- Dialogs / popups (apply to EVERY dialog so none pops up white) #5 -- */
+    /* The QSS is set on the QApplication, so all top-level dialogs (scanner,
+       confirms, message boxes) inherit the theme instead of the blinding
+       OS-default white that clashed with dark/light mode. */
+    QDialog {{
+        background: {p.base};
+        color: {p.text};
+    }}
+    QDialog QLabel {{ color: {p.text}; }}
+    QMessageBox {{
+        background: {p.base};
+        color: {p.text};
+    }}
+    QMessageBox QLabel {{ color: {p.text}; }}
+    /* message-box buttons read as themed Ghost buttons */
+    QMessageBox QPushButton {{
+        background: transparent;
+        color: {p.text};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+        padding: 7px 18px;
+        min-width: 76px;
+    }}
+    QMessageBox QPushButton:hover {{ background: {p.surface_alt}; }}
+    QMessageBox QPushButton:default {{
+        background: {p.accent}; color: {p.on_accent}; border-color: {p.accent};
+    }}
+    QMessageBox QPushButton:default:hover {{ background: {p.accent_hover}; }}
+
     /* ---- Profile editor dialog ---- */
     QDialog#ProfileDialog {{
         background: {p.base};
@@ -457,6 +492,36 @@ def build_qss(p: Palette) -> str:
     QDialog#ProfileDialog QLabel {{ color: {p.text}; }}
     QScrollArea#DialogScroll {{ border: none; background: transparent; }}
     QScrollArea#DialogScroll > QWidget > QWidget {{ background: transparent; }}
+
+    /* ---- Clean-IP scanner dialog (#5/#6) ---- */
+    QDialog#ScannerDialog {{
+        background: {p.base};
+    }}
+    QListWidget#ScanList {{
+        background: {p.surface_alt};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+        padding: 4px;
+        color: {p.text};
+        font-family: "Cascadia Code", "Consolas", monospace;
+        font-size: 12.5px;
+    }}
+    QListWidget#ScanList::item {{
+        padding: 6px 8px; border-radius: 6px; color: {p.text};
+    }}
+    QListWidget#ScanList::item:hover {{ background: {p.surface}; }}
+    QListWidget#ScanList::item:selected {{
+        background: {p.surface}; color: {p.text};
+    }}
+    QPlainTextEdit#ScanLog {{
+        background: {p.elevated};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+        color: {p.text_muted};
+        font-family: "Cascadia Code", "Consolas", monospace;
+        font-size: 12px;
+        padding: 8px;
+    }}
 
     /* ---- Text views (log + diagnostics table) ---- */
     /* base rule: NO text edit is ever the default white Windows control */

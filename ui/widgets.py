@@ -310,8 +310,16 @@ class ProfileRow(QFrame):
         self.setObjectName("ProfileRow")
         self.setProperty("active", "1" if active else "0")
         # a guaranteed height so the name + active pill + badges always fit on
-        # two lines without clipping (the "active label clips the fields" bug)
+        # two lines without clipping (the "active label clips the fields" bug),
+        # but ALSO a hard ceiling + Fixed vertical policy so a row never grows
+        # tall and spills out of its QListWidget cell when the window enlarges
+        # ("از کادر زده بیرون که برش خورده" feedback). The row only ever needs
+        # ~two text lines of height; extra width goes to the elastic name/detail
+        # columns, never to row height.
         self.setMinimumHeight(56)
+        self.setMaximumHeight(64)
+        from PySide6.QtWidgets import QSizePolicy
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 8, 10, 8)
         lay.setSpacing(10)
@@ -345,8 +353,13 @@ class ProfileRow(QFrame):
         name = QLabel(profile.display_name)
         name.setObjectName("RowName")
         # let the name shrink gracefully so the pill/badges never push it out
-        # of the row and clip it (RTL elide is unreliable)
+        # of the row and clip it; the full name is elided on resize (#3) so a
+        # very long config name can't spill past the row edge when the window
+        # enlarges, and the untruncated text stays available as a tooltip.
         name.setMinimumWidth(0)
+        self._name = name
+        self._name_full = profile.display_name
+        name.setToolTip(profile.display_name)
         top.addWidget(name, 1)
         if active:
             pill = QLabel(tr("\u25cf فعال"))
@@ -466,9 +479,10 @@ class ProfileRow(QFrame):
         lbl.style().polish(lbl)
 
     def resizeEvent(self, event):
-        """Elide the address line so long hosts never overflow the box (#1)."""
+        """Elide name + address so long text never overflows the box (#1/#3)."""
         super().resizeEvent(event)
         self._elide_detail()
+        self._elide_name()
 
     def _elide_detail(self) -> None:
         d = getattr(self, "_detail", None)
@@ -481,6 +495,18 @@ class ProfileRow(QFrame):
         elided = fm.elidedText(full, Qt.ElideMiddle, avail)
         if elided != d.text():
             d.setText(elided)
+
+    def _elide_name(self) -> None:
+        n = getattr(self, "_name", None)
+        full = getattr(self, "_name_full", None)
+        if n is None or full is None:
+            return
+        from PySide6.QtGui import QFontMetrics
+        fm = QFontMetrics(n.font())
+        avail = max(40, n.width() - 2)
+        elided = fm.elidedText(full, Qt.ElideRight, avail)
+        if elided != n.text():
+            n.setText(elided)
 
     def set_pinging(self) -> None:
         self.btn_ping.setEnabled(False)

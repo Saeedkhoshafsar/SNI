@@ -41,7 +41,7 @@ class ScanWorker(QThread):
     :meth:`stop`.
     """
 
-    hit = Signal(str, float)
+    hit = Signal(str, float, str)   # ip, latency_ms, detail (e.g. "http ok")
     line = Signal(str)
     done = Signal(int, int)
 
@@ -58,7 +58,8 @@ class ScanWorker(QThread):
     def run(self):  # pragma: no cover - exercised via Qt smoke, not unit
         self._scanner = CFScanner(
             on_log=self.line.emit,
-            on_result=lambda r: self.hit.emit(r.ip, r.latency_ms),
+            on_result=lambda r: self.hit.emit(
+                r.ip, r.latency_ms, getattr(r, "detail", "") or ""),
         )
         try:
             report = self._scanner.scan(self._cfg)
@@ -78,8 +79,9 @@ class ScannerDialog(QDialog):
         # profiles the user accepted (read by the caller after exec())
         self.result_profiles: List[Profile] = []
 
+        self.setObjectName("ScannerDialog")
         self.setWindowTitle(tr("اسکن IP تمیز کلودفلر"))
-        self.setMinimumSize(560, 560)
+        self.setMinimumSize(620, 640)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
@@ -105,23 +107,42 @@ class ScannerDialog(QDialog):
         root.addWidget(head)
 
         # --- scan tunables ---
+        # NOTE: every control gets its own label + tooltip so the user can find
+        # the worker/thread count at a glance (previous feedback: "تعداد ورکر
+        # پیدا نمیشه"). The worker count IS the «تعداد ورکر» field below.
         opts = QHBoxLayout()
         opts.setSpacing(10)
-        opts.addWidget(QLabel(tr("تعداد IP برای تست:")))
+
+        lbl_count = QLabel(tr("تعداد IP برای تست:"))
+        opts.addWidget(lbl_count)
         self.spin_count = QSpinBox()
         self.spin_count.setRange(20, 5000)
         self.spin_count.setValue(400)
         self.spin_count.setSingleStep(50)
+        self.spin_count.setToolTip(
+            tr("چند IP کلودفلر آزمایش شود (بیشتر = شانس بیشتر، اما کندتر)"))
         opts.addWidget(self.spin_count)
-        opts.addWidget(QLabel(tr("سقف نتایج:")))
+
+        lbl_results = QLabel(tr("سقف نتایج:"))
+        opts.addWidget(lbl_results)
         self.spin_results = QSpinBox()
         self.spin_results.setRange(1, 200)
         self.spin_results.setValue(20)
+        self.spin_results.setToolTip(
+            tr("به محض پیدا شدن این تعداد IP تمیز، اسکن متوقف می‌شود"))
         opts.addWidget(self.spin_results)
-        opts.addWidget(QLabel(tr("هم‌زمانی:")))
+
+        # the worker / thread count — labelled explicitly as «تعداد ورکر» so it
+        # is impossible to miss, with a clear tooltip explaining what it does.
+        lbl_conc = QLabel(tr("تعداد ورکر (هم‌زمانی):"))
+        opts.addWidget(lbl_conc)
         self.spin_conc = QSpinBox()
         self.spin_conc.setRange(1, 256)
         self.spin_conc.setValue(64)
+        self.spin_conc.setSingleStep(8)
+        self.spin_conc.setToolTip(tr(
+            "تعداد ورکرهای هم‌زمان (نخ‌ها). بیشتر = اسکن سریع‌تر ولی مصرف "
+            "شبکه/سی‌پی‌یو بالاتر. پیشنهاد: ۶۴ تا ۱۲۸"))
         opts.addWidget(self.spin_conc)
         opts.addStretch(1)
         root.addLayout(opts)
@@ -160,10 +181,20 @@ class ScannerDialog(QDialog):
         sel_row.addStretch(1)
         root.addLayout(sel_row)
 
-        # --- progress log ---
+        # --- live progress log (always visible, in the SAME screen) ---
+        log_head = QHBoxLayout()
+        log_head.addWidget(QLabel(tr("روند زندهٔ اسکن:")))
+        log_head.addStretch(1)
+        # live counter so the user sees activity even before the first clean IP
+        self.lbl_progress = QLabel("")
+        self.lbl_progress.setObjectName("Muted")
+        log_head.addWidget(self.lbl_progress)
+        root.addLayout(log_head)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(110)
+        # taller so several log lines are visible without scrolling (#6)
+        self.log.setMinimumHeight(150)
+        self.log.setMaximumHeight(220)
         self.log.setObjectName("ScanLog")
         self.log.setPlaceholderText(tr("روند اسکن اینجا نمایش داده می‌شود …"))
         root.addWidget(self.log)
@@ -197,6 +228,9 @@ class ScannerDialog(QDialog):
             return
         self.list.clear()
         self.log.clear()
+        self._found = 0
+        self.lbl_progress.setText(
+            tr("ورکرها: {n}").format(n=self.spin_conc.value()))
         cfg = scan_config_from_profile(
             self._profile,
             max_candidates=self.spin_count.value(),
@@ -223,19 +257,36 @@ class ScannerDialog(QDialog):
         self.spin_results.setEnabled(not busy)
         self.spin_conc.setEnabled(not busy)
 
-    def _on_hit(self, ip: str, latency_ms: float):
+    def _on_hit(self, ip: str, latency_ms: float, detail: str = ""):
+        self._found = getattr(self, "_found", 0) + 1
         item = QListWidgetItem(self.list)
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         item.setCheckState(Qt.Checked)
-        item.setText(tr("{ip}   ·   {ms:.0f}ms").format(ip=ip, ms=latency_ms))
+        # richer per-IP line: latency + a quick latency-quality tag + the probe
+        # detail (e.g. "http ok" / colo) so the user understands WHY it's clean.
+        tag = (tr("عالی") if latency_ms < 150 else
+               tr("خوب") if latency_ms < 350 else tr("کند"))
+        extra = f"   ·   {detail}" if detail else ""
+        item.setText(tr("{ip}   ·   {ms:.0f}ms  ({tag}){extra}").format(
+            ip=ip, ms=latency_ms, tag=tag, extra=extra))
+        item.setToolTip(tr("IP: {ip}\nتأخیر: {ms:.0f}ms\nجزئیات: {d}").format(
+            ip=ip, ms=latency_ms, d=detail or "—"))
         item.setData(Qt.UserRole, ip)
         self.list.addItem(item)
+        self.lbl_progress.setText(tr("ورکرها: {n}  ·  پیداشده: {f}").format(
+            n=self.spin_conc.value(), f=self._found))
 
     def _on_line(self, text: str):
         self.log.appendPlainText(text)
+        # keep the newest line in view (auto-scroll)
+        self.log.verticalScrollBar().setValue(
+            self.log.verticalScrollBar().maximum())
 
     def _on_done(self, found: int, tested: int):
         self._busy(False)
+        self.lbl_progress.setText(
+            tr("پایان  ·  پیداشده: {f}  ·  آزمایش‌شده: {t}").format(
+                f=found, t=tested))
         self.status.setText(
             tr("تمام شد — {found} IP تمیز از {tested} آزمایش‌شده").format(
                 found=found, tested=tested))

@@ -736,6 +736,11 @@ class ProfilesPage(QWidget):
         self.btn_select_all.setObjectName("Ghost")
         self.btn_clear_sel = QPushButton(tr("لغو انتخاب"))
         self.btn_clear_sel.setObjectName("Ghost")
+        # ping ONLY the checked rows (#1 follow-up)
+        self.btn_ping_selected = QPushButton(tr("\U0001f4e1  پینگ انتخاب‌شده‌ها"))
+        self.btn_ping_selected.setObjectName("Ghost")
+        self.btn_ping_selected.setToolTip(
+            tr("فقط کانفیگ‌های تیک‌خورده را هم‌زمان پینگ می‌گیرد"))
         self.btn_copy_selected = QPushButton(tr("\U0001f517  کپی لینک‌های انتخاب‌شده"))
         self.btn_copy_selected.setObjectName("Ghost")
         self.btn_copy_selected.setToolTip(
@@ -748,6 +753,7 @@ class ProfilesPage(QWidget):
         sel_row.addStretch(1)
         sel_row.addWidget(self.btn_select_all)
         sel_row.addWidget(self.btn_clear_sel)
+        sel_row.addWidget(self.btn_ping_selected)
         sel_row.addWidget(self.btn_copy_selected)
         sel_row.addWidget(self.btn_delete_selected)
         lb.addLayout(sel_row)
@@ -761,12 +767,13 @@ class ProfilesPage(QWidget):
             tr("همهٔ سرورها را هم‌زمان پینگ می‌گیرد و نتیجه را روی هر ردیف نشان می‌دهد"))
         del_row.addWidget(self.btn_ping_all_rows)
         del_row.addStretch(1)
+        # NOTE: the old single «حذف انتخاب‌شده» button (which deleted just the
+        # highlighted/active row) was removed — it duplicated the bulk
+        # «حذف انتخاب‌شده‌ها» and was confusing. Bulk delete via the checkboxes
+        # is the single, clear way to delete now.
         self.btn_edit = QPushButton(tr("\u270e  ویرایش"))
         self.btn_edit.setObjectName("Ghost")
-        self.btn_delete = QPushButton(tr("\U0001f5d1  حذف انتخاب‌شده"))
-        self.btn_delete.setObjectName("Ghost")
         del_row.addWidget(self.btn_edit)
-        del_row.addWidget(self.btn_delete)
         lb.addLayout(del_row)
         root.addWidget(listc, 1)
 
@@ -820,7 +827,6 @@ class ProfilesPage(QWidget):
         self.btn_paste.clicked.connect(self._paste)
         self.btn_sub.clicked.connect(self._import_subscription)
         self.btn_edit.clicked.connect(self._edit_selected)
-        self.btn_delete.clicked.connect(self._delete_selected)
         self.list.currentRowChanged.connect(self._row_changed)
         self.list.itemDoubleClicked.connect(lambda *_: self._edit_selected())
         self.btn_ping_all.clicked.connect(self._ping_all)
@@ -830,6 +836,7 @@ class ProfilesPage(QWidget):
         # #7: bulk-selection wiring
         self.btn_select_all.clicked.connect(self._select_all)
         self.btn_clear_sel.clicked.connect(self._clear_selection)
+        self.btn_ping_selected.clicked.connect(self._ping_selected)
         self.btn_copy_selected.clicked.connect(self._copy_selected_links)
         self.btn_delete_selected.clicked.connect(self._delete_checked)
 
@@ -869,10 +876,13 @@ class ProfilesPage(QWidget):
             row.selection_toggled.connect(
                 lambda checked, idx=i: self._on_row_checked(idx, checked))
             self._rows.append(row)
-            # use a guaranteed minimum row height so the active "● فعال" pill +
-            # badges never get clipped (sizeHint can under-report before layout)
+            # use a guaranteed row height so the active "● فعال" pill + badges
+            # never get clipped (sizeHint can under-report before layout), but
+            # CLAMP it to the row's own max height so the cell can't grow taller
+            # than the widget and leave it overflowing/cut off when the window
+            # enlarges (#3 "از کادر زده بیرون که برش خورده").
             hint = row.sizeHint()
-            hint.setHeight(max(hint.height(), 62))
+            hint.setHeight(min(max(hint.height(), 62), 64))
             item.setSizeHint(hint)
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
@@ -903,7 +913,8 @@ class ProfilesPage(QWidget):
                 tr("{n} مورد انتخاب شده").format(n=n))
         else:
             self.lbl_sel_count.setText(tr("هیچ موردی انتخاب نشده"))
-        for b in (self.btn_copy_selected, self.btn_delete_selected):
+        for b in (self.btn_ping_selected, self.btn_copy_selected,
+                  self.btn_delete_selected):
             b.setEnabled(n > 0)
         has_rows = bool(self._store.profiles)
         self.btn_select_all.setEnabled(has_rows)
@@ -916,6 +927,18 @@ class ProfilesPage(QWidget):
     def _clear_selection(self) -> None:
         self._checked = set()
         self.refresh()
+
+    def _ping_selected(self) -> None:
+        """Ping ONLY the checked rows, concurrently (#1 follow-up)."""
+        if self._engine is None:
+            self._toast(tr("موتور در دسترس نیست"), "err")
+            return
+        if not self._checked:
+            self._toast(tr("هیچ کانفیگی انتخاب نشده"), "warn")
+            return
+        self._toast(tr("در حال پینگ کانفیگ‌های انتخاب‌شده …"), "info")
+        for row in sorted(self._checked):
+            self._ping_row(row)
 
     def _copy_selected_links(self) -> None:
         """Copy the share links of every checked profile, one per line (#7)."""
@@ -1850,6 +1873,10 @@ class MainWindow(QWidget):
         self.setWindowTitle("SNI Spoofer")
         self.resize(940, 620)
         self.setMinimumSize(820, 540)
+        # #3: track the mouse so the cursor turns into a resize arrow when it
+        # hovers a window edge (interactive edge/corner resize for the frameless
+        # window). startSystemResize then does the actual native resize.
+        self.setMouseTracking(True)
 
         # Frameless, but keep the window a *real* top-level window so the OS
         # still gives us minimise + taskbar entry + native system-move. We do
@@ -2231,7 +2258,15 @@ class MainWindow(QWidget):
     def _apply_theme(self):
         palette = get_palette(self._theme)
         self._palette = palette
-        self.setStyleSheet(build_qss(palette))
+        qss = build_qss(palette)
+        # Apply the theme at the *application* level so EVERY top-level window —
+        # including dialogs (scanner, QMessageBox confirms, …) — inherits it.
+        # Previously the QSS was set only on MainWindow, so dialogs popped up in
+        # the blinding OS-default white that clashed with dark/light mode (#5).
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(qss)
+        self.setStyleSheet(qss)
         # propagate the palette to widgets that paint inline (not via QSS)
         self.page_dashboard.set_palette(palette)
         # log console text must follow the theme so it's never white-on-white (#4)
@@ -2270,17 +2305,93 @@ class MainWindow(QWidget):
         growing to the full screen never breaks or overlaps the content; the
         title-bar glyph is kept in sync via changeEvent → _sync_max_button.
         """
-        if self.isMaximized():
+        if self.isMaximized() or self.isFullScreen():
             self.showNormal()
         else:
+            # On a frameless top-level window showMaximized() must target the
+            # screen's *available* geometry (excluding the taskbar). Setting it
+            # explicitly makes maximize reliable across platforms (#4).
             self.showMaximized()
 
     def _sync_max_button(self):
-        """Keep the maximize/restore glyph matching the actual window state."""
+        """Keep the maximize/restore glyph + rounded corners match the state."""
+        maxed = self.isMaximized() or self.isFullScreen()
         try:
-            self.title_bar.update_max_label(self.isMaximized())
+            self.title_bar.update_max_label(maxed)
         except Exception:
             pass
+        # #4: drop the rounded corners + border while maximized so the window
+        # fills the screen edge-to-edge with no gap/rounded-corner artefacts;
+        # restore them when back to normal. Toggled via a dynamic property the
+        # QSS keys off (RootBackdrop[maximized="1"]).
+        try:
+            self.setProperty("maximized", "1" if maxed else "0")
+            self.style().unpolish(self)
+            self.style().polish(self)
+        except Exception:
+            pass
+
+    # -- interactive edge / corner resize for the frameless window (#3) -----
+    _RESIZE_MARGIN = 6   # px band around the window edges that starts a resize
+
+    def _edge_at(self, pos):
+        """Return the Qt edges under *pos* (within the grip margin), or None."""
+        from PySide6.QtCore import Qt as _Qt
+        m = self._RESIZE_MARGIN
+        r = self.rect()
+        left = pos.x() <= m
+        right = pos.x() >= r.width() - m
+        top = pos.y() <= m
+        bottom = pos.y() >= r.height() - m
+        edges = _Qt.Edges()
+        if left:
+            edges |= _Qt.LeftEdge
+        if right:
+            edges |= _Qt.RightEdge
+        if top:
+            edges |= _Qt.TopEdge
+        if bottom:
+            edges |= _Qt.BottomEdge
+        return edges if int(edges) else None
+
+    def _cursor_for_edges(self, edges):
+        from PySide6.QtCore import Qt as _Qt
+        L, R = _Qt.LeftEdge, _Qt.RightEdge
+        T, B = _Qt.TopEdge, _Qt.BottomEdge
+        if (edges & T and edges & L) or (edges & B and edges & R):
+            return _Qt.SizeFDiagCursor
+        if (edges & T and edges & R) or (edges & B and edges & L):
+            return _Qt.SizeBDiagCursor
+        if edges & L or edges & R:
+            return _Qt.SizeHorCursor
+        if edges & T or edges & B:
+            return _Qt.SizeVerCursor
+        return _Qt.ArrowCursor
+
+    def mouseMoveEvent(self, event):
+        # update the cursor to a resize arrow when hovering an edge (only when
+        # the window is in its normal, resizable state — not maximized)
+        from PySide6.QtCore import Qt as _Qt
+        if not (self.isMaximized() or self.isFullScreen()):
+            edges = self._edge_at(event.position().toPoint())
+            self.setCursor(self._cursor_for_edges(edges) if edges
+                           else _Qt.ArrowCursor)
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        from PySide6.QtCore import Qt as _Qt
+        if (event.button() == _Qt.LeftButton
+                and not (self.isMaximized() or self.isFullScreen())):
+            edges = self._edge_at(event.position().toPoint())
+            if edges is not None:
+                win = self.windowHandle()
+                if win is not None and hasattr(win, "startSystemResize"):
+                    win.startSystemResize(edges)
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
 
     def toggle_language(self):
         """Switch FA⇄EN and rebuild the window so every label retranslates (#6).

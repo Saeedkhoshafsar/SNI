@@ -82,6 +82,19 @@ class ScannerDialogTest(unittest.TestCase):
         # nothing checked → no profiles, dialog stays open (not accepted)
         self.assertEqual(dlg.result_profiles, [])
 
+    def test_hit_shows_detail_and_progress(self):
+        """A hit with a probe detail renders richer text + live counter (#6)."""
+        p = parse_link(_LINK)
+        dlg = ScannerDialog(p)
+        dlg._found = 0
+        dlg._on_hit("188.114.96.10", 30.0, "http ok")
+        item = dlg.list.item(0)
+        # detail string is surfaced in the row text + tooltip
+        self.assertIn("http ok", item.text())
+        self.assertIn("http ok", item.toolTip())
+        # the live progress label reflects the found count
+        self.assertIn("1", dlg.lbl_progress.text())
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
