@@ -87,84 +87,34 @@ def _make_page(tmpdir, with_profiles=True):
 
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 / Qt platform unavailable")
-class PingUITest(unittest.TestCase):
+class ProfilesToolbarTest(unittest.TestCase):
+    """The redesigned compact icon toolbar on the profiles page (#4).
+
+    The old standalone "سنجش پیش از اتصال" ping/strategy-test panel (and its
+    PingWorker) were removed; per-server measurements now happen inline. This
+    test pins down the new toolbar so the controls don't silently disappear.
+    """
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
 
-    def test_panel_controls_exist(self):
+    def test_bulk_toolbar_buttons_exist(self):
         page, _eng, _store = _make_page(self._tmp)
-        self.assertTrue(hasattr(page, "btn_ping_all"))
-        self.assertTrue(hasattr(page, "btn_ping_one"))
-        self.assertTrue(hasattr(page, "btn_test_strategies"))
-        self.assertTrue(hasattr(page, "cmb_ping_strategy"))
-        # combo has "all" + the 3 shipped strategies
-        self.assertEqual(page.cmb_ping_strategy.count(), 4)
-        self.assertEqual(page.cmb_ping_strategy.itemData(0), "")
+        for attr in ("btn_select_all", "btn_clear_sel", "btn_ping_all_rows",
+                     "btn_ping_selected", "btn_copy_selected", "btn_edit",
+                     "btn_delete_selected"):
+            self.assertTrue(hasattr(page, attr), attr)
 
-    def test_ping_all_worker_formats_and_ranks(self):
-        from ui.window import PingWorker
-        page, engine, _store = _make_page(self._tmp)
-        lines, summary = [], []
-        w = PingWorker(engine, "ping_all", profiles=list(_store_profiles(page)))
-        w.line.connect(lines.append)
-        w.done.connect(summary.append)
-        w.run()
-        self.assertTrue(engine.ping_all_called)
-        self.assertTrue(any("Fast" in l and "12ms" in l for l in lines))
-        self.assertTrue(any("Dead" in l and "بدون پاسخ" in l for l in lines))
-        self.assertTrue(any("بهترین سرور: Fast" in s for s in summary))
+    def test_pre_connect_panel_removed(self):
+        page, _eng, _store = _make_page(self._tmp)
+        # the removed panel's widgets must no longer exist (#4)
+        for attr in ("btn_ping_all", "btn_ping_one", "btn_test_strategies",
+                     "cmb_ping_strategy", "ping_output", "ping_status"):
+            self.assertFalse(hasattr(page, attr), attr)
 
-    def test_ping_one_worker(self):
-        from ui.window import PingWorker
-        page, engine, store = _make_page(self._tmp)
-        prof = store.selected_profile
-        lines, summary = [], []
-        w = PingWorker(engine, "ping_one", profile=prof)
-        w.line.connect(lines.append)
-        w.done.connect(summary.append)
-        w.run()
-        self.assertTrue(engine.ping_one_called)
-        self.assertTrue(any("One" in l and "20ms" in l for l in lines))
-
-    def test_strategy_worker_marks_winner(self):
-        from ui.window import PingWorker
-        page, engine, store = _make_page(self._tmp)
-        prof = store.selected_profile
-        lines, summary = [], []
-        w = PingWorker(engine, "strategy", profile=prof, strategy="")
-        w.line.connect(lines.append)
-        w.done.connect(summary.append)
-        w.run()
-        # wrong_seq failed (✖), fake_disorder connected (✔)
-        self.assertTrue(any("✖" in l and "wrong_seq" in l for l in lines))
-        self.assertTrue(any("✔" in l and "fake_disorder" in l for l in lines))
-        self.assertTrue(any("بهترین استراتژی: fake_disorder" in s for s in summary))
-
-    def test_strategy_worker_pins_single(self):
-        from ui.window import PingWorker
-        page, engine, store = _make_page(self._tmp)
-        prof = store.selected_profile
-        lines, summary = [], []
-        w = PingWorker(engine, "strategy", profile=prof, strategy="multi_fake")
-        w.line.connect(lines.append)
-        w.done.connect(summary.append)
-        w.run()
-        self.assertEqual(engine.strategy_arg, "multi_fake")
-        self.assertEqual(len([l for l in lines if "multi_fake" in l]), 1)
-
-    def test_ping_buttons_guard_empty(self):
-        page, engine, store = _make_page(self._tmp, with_profiles=False)
-        # no profiles → _ping_all should not start a worker
-        page._ping_all()
-        self.assertFalse(engine.ping_all_called)
-        # no selection → _ping_one should not start a worker
-        page._ping_one()
-        self.assertFalse(engine.ping_one_called)
-
-
-def _store_profiles(page):
-    return page._store.profiles
+    def test_worker_class_removed(self):
+        import ui.window as w
+        self.assertFalse(hasattr(w, "PingWorker"))
 
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 / Qt platform unavailable")

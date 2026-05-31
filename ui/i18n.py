@@ -63,6 +63,10 @@ _EN: dict[str, str] = {
     "تاب‌آوری: —": "Resilience: —",
     "تاب‌آوری: {text}": "Resilience: {text}",
     "استراتژی فعال: —": "Active strategy: —",
+    # #6: spoof-applicability gating on the dashboard
+    "غیرفعال": "Inactive",
+    "استراتژی (کانفیگ عادی)": "Strategy (normal config)",
+    "تاب‌آوری: غیرفعال (کانفیگ عادی)": "Resilience: inactive (normal config)",
     # --- profiles page ---
     "وارد کردن لینک اشتراک‌گذاری یا سابسکریپشن (vless/vmess/trojan/ss)":
         "Import a share link or subscription (vless/vmess/trojan/ss)",
@@ -70,6 +74,14 @@ _EN: dict[str, str] = {
     "از کلیپ‌بورد": "From clipboard",
     "افزودن سابسکریپشن": "Add subscription",
     "سرورهای ذخیره‌شده": "Saved servers",
+    # #4: compact icon toolbar tooltips (profiles list)
+    "انتخاب همه": "Select all",
+    "لغو انتخاب": "Clear selection",
+    "پینگ همه (هم‌زمان روی هر ردیف)": "Ping all (concurrently, inline on each row)",
+    "پینگ کانفیگ‌های انتخاب‌شده": "Ping selected configs",
+    "کپی لینک کانفیگ‌های انتخاب‌شده": "Copy links of selected configs",
+    "ویرایش کانفیگ انتخاب‌شده": "Edit selected config",
+    "حذف کانفیگ‌های انتخاب‌شده": "Delete selected configs",
     "\u270e  ویرایش": "\u270e  Edit",
     "\U0001f5d1  حذف انتخاب‌شده": "\U0001f5d1  Delete selected",
     "سنجش پیش از اتصال": "Pre-connection check",
