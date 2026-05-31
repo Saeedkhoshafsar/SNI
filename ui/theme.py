@@ -164,6 +164,18 @@ def build_qss(p: Palette) -> str:
         border-radius: 0px;
     }}
 
+    /* #1: visible resize grip in the bottom corner so it's obvious the window
+       can be resized by dragging. Tinted with the accent so it reads as an
+       interactive handle rather than a stray dot. */
+    QSizeGrip#SizeGrip {{
+        background: transparent;
+        border-right: 2px solid {p.accent};
+        border-bottom: 2px solid {p.accent};
+        border-bottom-right-radius: 4px;
+        width: 14px;
+        height: 14px;
+    }}
+
     /* ---- Cards / panels ---- */
     QFrame.Card, QFrame#Card {{
         background: qlineargradient(
@@ -235,6 +247,28 @@ def build_qss(p: Palette) -> str:
     QPushButton#Ghost:hover {{
         background: {p.surface_alt}; color: {p.text};
     }}
+
+    /* ---- Compact icon toolbar buttons (profiles list, #4) ---- */
+    QPushButton[class="ToolBtn"] {{
+        padding: 0px;
+        font-size: 15px;
+        border-radius: {p.radius_sm}px;
+    }}
+    QPushButton#Ghost[class="ToolBtn"]:hover {{
+        background: {p.accent}; color: {p.on_accent}; border-color: {p.accent};
+    }}
+    QPushButton#Danger {{
+        background: transparent;
+        color: {p.danger};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+        padding: 8px 14px;
+    }}
+    QPushButton#Danger:hover {{
+        background: {p.danger}; color: #fff; border-color: {p.danger};
+    }}
+    QPushButton#Danger:disabled {{ color: {p.text_faint}; }}
+    QFrame#ToolSep {{ background: {p.border}; max-width: 1px; margin: 4px 2px; }}
 
     /* ---- Window control buttons (title bar) ---- */
     /* #3: WinClose must share WinBtn's transparent base style — without it the

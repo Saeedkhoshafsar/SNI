@@ -20,8 +20,8 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit,
-    QProgressBar, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
-    QTextEdit, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QScrollArea, QSizeGrip, QSpinBox,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 
@@ -98,107 +98,6 @@ STRATEGIES = [
 
 
 # ---------------------------------------------------------------------------
-#  Ping worker — runs latency / strategy-test off the GUI thread (step 18)
-# ---------------------------------------------------------------------------
-
-class PingWorker(QThread):
-    """Run a blocking ping / strategy-test via the engine on a worker thread.
-
-    Emits ``line(str)`` for each result row and ``done(str)`` with a final
-    summary. Three kinds:
-      * ``"ping_all"``  — ping every profile, ranked lowest-latency first.
-      * ``"ping_one"``  — ping a single profile.
-      * ``"strategy"``  — test bypass strategies against one profile (which
-                          connects / wins); ``strategy`` pins a single one.
-    """
-
-    line = Signal(str)
-    done = Signal(str)
-
-    def __init__(self, engine, kind: str, *, profile=None, profiles=None,
-                 strategy: str = "", parent=None):
-        super().__init__(parent)
-        self._engine = engine
-        self._kind = kind
-        self._profile = profile
-        self._profiles = list(profiles) if profiles else []
-        self._strategy = strategy
-
-    def run(self):  # pragma: no cover - exercised via Qt smoke, not unit
-        try:
-            if self._kind == "ping_all":
-                self._do_ping_all()
-            elif self._kind == "ping_one":
-                self._do_ping_one()
-            elif self._kind == "strategy":
-                self._do_strategy()
-            else:
-                self.done.emit(tr("نوع سنجش ناشناخته"))
-        except Exception as exc:
-            self.line.emit(tr("خطا: {exc}").format(exc=exc))
-            self.done.emit(tr("سنجش با خطا متوقف شد"))
-
-    # -- helpers ----------------------------------------------------------
-    @staticmethod
-    def fmt_ping(res, *, rank=None) -> str:
-        prefix = f"#{rank} " if rank is not None else ""
-        if not res.reachable:
-            return f"{prefix}✖ {res.label} — " + tr("بدون پاسخ")
-        parts = [f"{res.best_ms:.0f}ms", f"avg {res.avg_ms:.0f}",
-                 f"jitter {res.jitter_ms:.0f}"]
-        if res.loss > 0:
-            parts.append(f"loss {res.loss*100:.0f}%")
-        if res.download_kbps is not None:
-            parts.append(f"dl≈{res.download_kbps:.0f}KB/s")
-        return f"{prefix}✔ {res.label} — " + " · ".join(parts)
-
-    def _do_ping_all(self):
-        from core.ping import PingTester
-        results = self._engine.ping_profiles(self._profiles)
-        if not results:
-            self.done.emit(tr("هیچ نتیجه‌ای — پروفایلی نیست یا خطا رخ داد"))
-            return
-        for i, res in enumerate(results, 1):
-            self.line.emit(self.fmt_ping(res, rank=i))
-        best = PingTester.best(results)
-        if best is None:
-            self.done.emit(tr("هیچ سروری پاسخ نداد"))
-        else:
-            self.done.emit(tr("بهترین سرور: {label} ({ms:.0f}ms)").format(
-                label=best.label, ms=best.best_ms))
-
-    def _do_ping_one(self):
-        res = self._engine.ping_profile(self._profile)
-        if res is None:
-            self.done.emit(tr("نتیجه‌ای دریافت نشد"))
-            return
-        self.line.emit(self.fmt_ping(res))
-        if res.reachable:
-            self.done.emit(f"{res.label}: {res.best_ms:.0f}ms")
-        else:
-            self.done.emit(f"{res.label}: " + tr("بدون پاسخ"))
-
-    def _do_strategy(self):
-        report = self._engine.probe_strategies_for(
-            self._profile, strategy=(self._strategy or None))
-        if not report.results:
-            self.done.emit(tr("استراتژی‌ای تست نشد (آدرس/کاندیدا نامعتبر)"))
-            return
-        for r in report.results:
-            mark = "✔" if r.ok else "✖"
-            extra = (f"{r.latency_ms:.0f}ms · score={r.score:.2f}"
-                     if r.ok else r.outcome)
-            self.line.emit(f"{mark} {r.strategy:14} — {extra}")
-        best = report.best
-        if best is None:
-            self.done.emit(tr("هیچ استراتژی‌ای وصل نشد"))
-        else:
-            self.done.emit(
-                tr("بهترین استراتژی: {s} ({ms:.0f}ms)").format(
-                    s=best.strategy, ms=best.latency_ms))
-
-
-# ---------------------------------------------------------------------------
 #  Page builders
 # ---------------------------------------------------------------------------
 
@@ -260,7 +159,8 @@ def _stat_card(value: str, label: str, accent_color: str | None = None) -> Card:
     cap.setObjectName("Muted")
     b.addWidget(v)
     b.addWidget(cap)
-    c.value_label = v   # exposed so callers can animate it (CountUp)
+    c.value_label = v       # exposed so callers can animate it (CountUp)
+    c.caption_label = cap   # exposed so the caption can be retitled (#6)
     return c
 
 
@@ -278,6 +178,14 @@ class DashboardPage(QWidget):
         self._palette = palette
         # host window assigns this; called with "start" / "stop"
         self.power_handler = None
+        # #6: whether the selected config actually runs the SNI spoofer (and so
+        # a bypass *strategy* is meaningful). For ordinary/direct configs the
+        # spoofer + strategy are NOT in the path, so the dashboard must not claim
+        # a strategy is "فعال". Updated by set_spoof_active() from the host.
+        self._spoof_active = True
+        # remember the last real strategy key so we can restore it when the user
+        # switches back to a spoof config.
+        self._strategy_key = "wrong_seq"
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
         root.setSpacing(16)
@@ -399,10 +307,47 @@ class DashboardPage(QWidget):
 
     def set_resilience(self, text: str):
         """Slot for the live resilience/fallback summary line."""
+        # #6: resilience/fallback only exists when the spoofer is in the path
+        if not self._spoof_active:
+            self.lbl_resilience.setText(tr("تاب‌آوری: غیرفعال (کانفیگ عادی)"))
+            return
         self.lbl_resilience.setText(tr("تاب‌آوری: {text}").format(text=text))
 
     def set_active_strategy(self, key: str):
-        self.stat_strategy.value_label.setText(key)
+        # keep the real key so we can show it again on a spoof config (#6)
+        if key:
+            self._strategy_key = key
+        self._render_strategy()
+
+    def set_spoof_active(self, active: bool):
+        """#6: tell the dashboard whether the active config uses the spoofer.
+
+        For ordinary configs the bypass strategy + resilience layer are not
+        engaged, so the dashboard shows «غیرفعال» instead of falsely claiming a
+        strategy is running. The strategy stat-card caption also switches to
+        make the meaning explicit.
+        """
+        active = bool(active)
+        if active == self._spoof_active:
+            self._render_strategy()
+            return
+        self._spoof_active = active
+        self._render_strategy()
+        # reset the resilience strip when spoofing isn't applicable
+        if not active:
+            self.lbl_resilience.setText(tr("تاب‌آوری: غیرفعال (کانفیگ عادی)"))
+        else:
+            self.lbl_resilience.setText(tr("تاب‌آوری: —"))
+
+    def _render_strategy(self):
+        """Paint the strategy stat-card according to spoof applicability (#6)."""
+        if self._spoof_active:
+            self.stat_strategy.value_label.setText(self._strategy_key)
+            self.stat_strategy.caption_label.setText(tr("استراتژی فعال"))
+        else:
+            # ordinary config: no spoofing/strategy in the path
+            self.stat_strategy.value_label.setText(tr("غیرفعال"))
+            self.stat_strategy.caption_label.setText(tr("استراتژی (کانفیگ عادی)"))
 
     def set_mode(self, mode: str):
         self.stat_mode.value_label.setText(mode)
@@ -661,7 +606,6 @@ class ProfilesPage(QWidget):
         super().__init__(parent)
         self._store = store
         self._engine = engine          # EngineBridge — used for ping (optional)
-        self._ping_worker = None       # live PingWorker (kept to avoid GC)
         # per-row inline ping workers, keyed by row index — allows several rows
         # to be pinged concurrently / all at once (#4).
         self._inline_workers: dict[int, "InlinePingWorker"] = {}
@@ -711,116 +655,75 @@ class ProfilesPage(QWidget):
         # --- profiles list card ---
         listc = Card()
         lb = listc.body()
-        lb.addWidget(self._field_label("سرورهای ذخیره‌شده"))
+
+        # header row: title (left) + live selection-count (right)
+        head_row = QHBoxLayout()
+        head_row.setSpacing(8)
+        head_row.addWidget(self._field_label("سرورهای ذخیره‌شده"))
+        head_row.addStretch(1)
+        self.lbl_sel_count = QLabel("")
+        self.lbl_sel_count.setObjectName("Muted")
+        head_row.addWidget(self.lbl_sel_count)
+        lb.addLayout(head_row)
+
+        # #4: compact ICON toolbar ABOVE the list (was a stack of wide text
+        # buttons below it). Each action is a single tinted icon button with a
+        # tooltip, so the toolbar stays on one line at any width and the list
+        # itself gets all the remaining vertical space.
+        tools = QHBoxLayout()
+        tools.setSpacing(7)
+
+        def _tool(glyph: str, obj: str, tip: str) -> QPushButton:
+            b = QPushButton(glyph)
+            b.setObjectName(obj)
+            b.setProperty("class", "ToolBtn")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedSize(34, 30)
+            b.setToolTip(tr(tip))
+            return b
+
+        # bulk-selection actions (operate on the checkboxes — never activate)
+        self.btn_select_all = _tool("\u2611", "Ghost", "انتخاب همه")
+        self.btn_clear_sel = _tool("\u2610", "Ghost", "لغو انتخاب")
+        self.btn_ping_all_rows = _tool("\U0001f4e1", "Ghost",
+                                       "پینگ همه (هم‌زمان روی هر ردیف)")
+        self.btn_ping_selected = _tool("\U0001f4f6", "Ghost",
+                                       "پینگ کانفیگ‌های انتخاب‌شده")
+        self.btn_copy_selected = _tool("\U0001f517", "Ghost",
+                                       "کپی لینک کانفیگ‌های انتخاب‌شده")
+        self.btn_edit = _tool("\u270e", "Ghost", "ویرایش کانفیگ انتخاب‌شده")
+        self.btn_delete_selected = _tool("\U0001f5d1", "Danger",
+                                         "حذف کانفیگ‌های انتخاب‌شده")
+
+        for b in (self.btn_select_all, self.btn_clear_sel):
+            tools.addWidget(b)
+        sep = QFrame(); sep.setObjectName("ToolSep"); sep.setFixedWidth(1)
+        tools.addWidget(sep)
+        for b in (self.btn_ping_all_rows, self.btn_ping_selected,
+                  self.btn_copy_selected, self.btn_edit):
+            tools.addWidget(b)
+        tools.addStretch(1)
+        tools.addWidget(self.btn_delete_selected)
+        lb.addLayout(tools)
+
         self.list = QListWidget()
         self.list.setObjectName("ProfileList")
         # give the list real breathing room so several servers are visible and
-        # rows never get vertically squeezed (the "cramped / clipped" feedback)
-        self.list.setMinimumHeight(200)
+        # rows never get vertically squeezed (the "cramped / clipped" feedback).
+        # With the pre-connect panel removed (#4) the list now owns all the free
+        # vertical space (stretch=1 below) so many configs are visible at once.
+        self.list.setMinimumHeight(260)
         self.list.setSpacing(6)
-        from PySide6.QtWidgets import QAbstractItemView
+        from PySide6.QtWidgets import QAbstractItemView, QSizePolicy
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.list.setUniformItemSizes(False)
-        lb.addWidget(self.list)
+        self.list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lb.addWidget(self.list, 1)
 
-        # #7: bulk-selection toolbar. The checkboxes on each row mark servers
-        # for batch actions WITHOUT activating them. This row lets the user
-        # select/clear all and act on the marked rows (copy links / delete).
-        sel_row = QHBoxLayout()
-        sel_row.setSpacing(8)
-        self.lbl_sel_count = QLabel("")
-        self.lbl_sel_count.setObjectName("Muted")
-        self.btn_select_all = QPushButton(tr("انتخاب همه"))
-        self.btn_select_all.setObjectName("Ghost")
-        self.btn_clear_sel = QPushButton(tr("لغو انتخاب"))
-        self.btn_clear_sel.setObjectName("Ghost")
-        # ping ONLY the checked rows (#1 follow-up)
-        self.btn_ping_selected = QPushButton(tr("\U0001f4e1  پینگ انتخاب‌شده‌ها"))
-        self.btn_ping_selected.setObjectName("Ghost")
-        self.btn_ping_selected.setToolTip(
-            tr("فقط کانفیگ‌های تیک‌خورده را هم‌زمان پینگ می‌گیرد"))
-        self.btn_copy_selected = QPushButton(tr("\U0001f517  کپی لینک‌های انتخاب‌شده"))
-        self.btn_copy_selected.setObjectName("Ghost")
-        self.btn_copy_selected.setToolTip(
-            tr("لینک اشتراک‌گذاری همهٔ کانفیگ‌های تیک‌خورده را یک‌جا کپی می‌کند"))
-        self.btn_delete_selected = QPushButton(tr("\U0001f5d1  حذف انتخاب‌شده‌ها"))
-        self.btn_delete_selected.setObjectName("Ghost")
-        self.btn_delete_selected.setToolTip(
-            tr("همهٔ کانفیگ‌های تیک‌خورده را با هم حذف می‌کند"))
-        sel_row.addWidget(self.lbl_sel_count)
-        sel_row.addStretch(1)
-        sel_row.addWidget(self.btn_select_all)
-        sel_row.addWidget(self.btn_clear_sel)
-        sel_row.addWidget(self.btn_ping_selected)
-        sel_row.addWidget(self.btn_copy_selected)
-        sel_row.addWidget(self.btn_delete_selected)
-        lb.addLayout(sel_row)
-
-        del_row = QHBoxLayout()
-        # inline "ping all rows" — pings every server concurrently and shows the
-        # result on each row, instead of waiting one-by-one (#4).
-        self.btn_ping_all_rows = QPushButton(tr("\U0001f4e1  پینگ همه (سریع)"))
-        self.btn_ping_all_rows.setObjectName("Ghost")
-        self.btn_ping_all_rows.setToolTip(
-            tr("همهٔ سرورها را هم‌زمان پینگ می‌گیرد و نتیجه را روی هر ردیف نشان می‌دهد"))
-        del_row.addWidget(self.btn_ping_all_rows)
-        del_row.addStretch(1)
-        # NOTE: the old single «حذف انتخاب‌شده» button (which deleted just the
-        # highlighted/active row) was removed — it duplicated the bulk
-        # «حذف انتخاب‌شده‌ها» and was confusing. Bulk delete via the checkboxes
-        # is the single, clear way to delete now.
-        self.btn_edit = QPushButton(tr("\u270e  ویرایش"))
-        self.btn_edit.setObjectName("Ghost")
-        del_row.addWidget(self.btn_edit)
-        lb.addLayout(del_row)
+        # let the list card take all the remaining height of the page
         root.addWidget(listc, 1)
-
-        # --- ping / strategy-test card (feedback 9) ---
-        pingc = Card()
-        pb = pingc.body()
-        pb.addWidget(_section_title(
-            "سنجش پیش از اتصال",
-            "ببین کدوم سرور پینگ پایین‌تر/دانلود بهتری دارد و کدوم استراتژی وصل می‌شود"))
-
-        ping_btns = QHBoxLayout()
-        ping_btns.setSpacing(10)
-        self.btn_ping_all = QPushButton(tr("\U0001f4e1  پینگ همه"))
-        self.btn_ping_all.setObjectName("Primary")
-        self.btn_ping_one = QPushButton(tr("\U0001f4e1  پینگ این سرور"))
-        self.btn_ping_one.setObjectName("Ghost")
-        ping_btns.addWidget(self.btn_ping_all)
-        ping_btns.addWidget(self.btn_ping_one)
-        ping_btns.addStretch(1)
-        pb.addLayout(ping_btns)
-
-        # strategy-ping row: choose a strategy (or "all") to test connectivity with
-        strat_row = QHBoxLayout()
-        strat_row.setSpacing(10)
-        strat_lbl = QLabel(tr("استراتژی برای تست:"))
-        strat_lbl.setObjectName("Muted")
-        self.cmb_ping_strategy = NoScrollComboBox()
-        self.cmb_ping_strategy.addItem(tr("همه‌ی استراتژی‌ها"), "")
-        for key, title, _desc in STRATEGIES:
-            self.cmb_ping_strategy.addItem(tr(title), key)
-        self.btn_test_strategies = QPushButton(tr("\U0001f9ea  تست استراتژی‌ها"))
-        self.btn_test_strategies.setObjectName("Ghost")
-        strat_row.addWidget(strat_lbl)
-        strat_row.addWidget(self.cmb_ping_strategy, 1)
-        strat_row.addWidget(self.btn_test_strategies)
-        pb.addLayout(strat_row)
-
-        self.ping_status = QLabel("")
-        self.ping_status.setObjectName("Muted")
-        pb.addWidget(self.ping_status)
-        self.ping_output = QPlainTextEdit()
-        self.ping_output.setObjectName("PingOutput")
-        self.ping_output.setReadOnly(True)
-        self.ping_output.setMaximumHeight(150)
-        self.ping_output.setPlaceholderText(tr("نتیجه‌ی پینگ/تست استراتژی اینجا نمایش داده می‌شود …"))
-        pb.addWidget(self.ping_output)
-        root.addWidget(pingc)
 
         # wiring
         self.btn_import.clicked.connect(self._import_link)
@@ -829,9 +732,6 @@ class ProfilesPage(QWidget):
         self.btn_edit.clicked.connect(self._edit_selected)
         self.list.currentRowChanged.connect(self._row_changed)
         self.list.itemDoubleClicked.connect(lambda *_: self._edit_selected())
-        self.btn_ping_all.clicked.connect(self._ping_all)
-        self.btn_ping_one.clicked.connect(self._ping_one)
-        self.btn_test_strategies.clicked.connect(self._test_strategies)
         self.btn_ping_all_rows.clicked.connect(self._ping_all_inline)
         # #7: bulk-selection wiring
         self.btn_select_all.clicked.connect(self._select_all)
@@ -1262,59 +1162,11 @@ class ProfilesPage(QWidget):
         if self.on_selection_changed:
             self.on_selection_changed(self._store.selected_profile)
 
-    # -- ping / strategy-test (feedback 9) ---------------------------------
-    def _ping_busy(self, busy: bool):
-        for b in (self.btn_ping_all, self.btn_ping_one, self.btn_test_strategies):
-            b.setEnabled(not busy)
-
-    def _start_ping_job(self, kind: str, *, profile=None, strategy: str = ""):
-        """Run a ping/strategy-test job on a background thread (GUI stays live)."""
-        if self._engine is None:
-            self._toast(tr("موتور در دسترس نیست"), "err")
-            return
-        if self._ping_worker is not None and self._ping_worker.isRunning():
-            self._toast(tr("یک سنجش در حال اجراست …"), "warn")
-            return
-        # push freshest ping config into the engine before measuring
-        self._engine.update_config(self._store.config)
-        self.ping_output.clear()
-        self.ping_status.setText(tr("در حال سنجش …"))
-        self._ping_busy(True)
-        worker = PingWorker(self._engine, kind, profile=profile,
-                            profiles=list(self._store.profiles),
-                            strategy=strategy)
-        worker.line.connect(self._ping_line)
-        worker.done.connect(self._ping_done)
-        self._ping_worker = worker
-        worker.start()
-
-    def _ping_line(self, text: str):
-        self.ping_output.appendPlainText(text)
-
-    def _ping_done(self, summary: str):
-        self.ping_status.setText(summary)
-        self._ping_busy(False)
-
-    def _ping_all(self):
-        if not self._store.profiles:
-            self._toast(tr("هیچ پروفایلی برای پینگ نیست"), "warn")
-            return
-        self._start_ping_job("ping_all")
-
-    def _ping_one(self):
-        prof = self._store.selected_profile
-        if prof is None:
-            self._toast(tr("ابتدا یک سرور را انتخاب کنید"), "warn")
-            return
-        self._start_ping_job("ping_one", profile=prof)
-
-    def _test_strategies(self):
-        prof = self._store.selected_profile
-        if prof is None:
-            self._toast(tr("ابتدا یک سرور را انتخاب کنید"), "warn")
-            return
-        strategy = self.cmb_ping_strategy.currentData() or ""
-        self._start_ping_job("strategy", profile=prof, strategy=strategy)
+    # NOTE: the standalone "سنجش پیش از اتصال" panel (batch ping / strategy-test
+    # with its own output box) was removed (#4): it no longer served a purpose,
+    # took space away from the server list, and duplicated the per-row inline
+    # 📡 ping. Per-server and "ping all" measurements now happen inline on each
+    # row via _ping_row / _ping_all_inline (InlinePingWorker below).
 
 
 class InlinePingWorker(QThread):
@@ -1872,7 +1724,13 @@ class MainWindow(QWidget):
         self.setObjectName("RootBackdrop")
         self.setWindowTitle("SNI Spoofer")
         self.resize(940, 620)
-        self.setMinimumSize(820, 540)
+        self.setMinimumSize(760, 520)
+        # #2: explicit maximized-state bookkeeping. On a frameless window the
+        # platform's own normal-geometry restore is unreliable (minimising a
+        # window and re-opening it from the taskbar could leave it stuck
+        # maximized), so we track the state + last normal geometry ourselves.
+        self._is_maximized = False
+        self._normal_geometry = None
         # #3: track the mouse so the cursor turns into a resize arrow when it
         # hovers a window edge (interactive edge/corner resize for the frameless
         # window). startSystemResize then does the actual native resize.
@@ -1897,6 +1755,17 @@ class MainWindow(QWidget):
         # the z-order, so the layout/content sit on top unchanged.
         self.wave_bg = WaveBackdrop(self)
         self.wave_bg.lower()
+
+        # #1: a visible grab handle in the bottom corner so users immediately
+        # see that the window is resizable (the invisible edge band alone was
+        # not discoverable — "فلش تنظیم ابعاد نداره"). The edge/corner band
+        # still works too (mousePressEvent → startSystemResize) for grabbing any
+        # side. The grip follows the layout-direction corner (bottom-left for
+        # RTL Persian, bottom-right for LTR English).
+        self.size_grip = QSizeGrip(self)
+        self.size_grip.setObjectName("SizeGrip")
+        self.size_grip.setFixedSize(18, 18)
+        self.size_grip.raise_()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1930,8 +1799,10 @@ class MainWindow(QWidget):
         self.page_strategy = StrategyPage(self.store)
         self.page_strategy.auto_prober_changed.connect(self._on_auto_prober_changed)
         self.page_strategy.strategy_selected.connect(self._on_strategy_selected)
-        self.page_diagnostics = DiagnosticsPage()
-        self.page_diagnostics.set_provider(self.engine.diagnostics)
+        # #5: the standalone "تشخیص" (Diagnostics) page was removed at the user's
+        # request — its live resilience numbers already surface on the dashboard
+        # strip via _pump_resilience(self.engine.diagnostics), so the dedicated
+        # tab was redundant. The engine's diagnostics provider stays wired.
         self.page_log = LogPage()
         # wrap every page in a scroll area so tall content scrolls instead of
         # overlapping/clipping when the window is short (the layout bug on the
@@ -1939,7 +1810,7 @@ class MainWindow(QWidget):
         # page-change / nav logic can still reason about which page is shown.
         self._scroll: dict[QWidget, QScrollArea] = {}
         for p in (self.page_dashboard, self.page_profiles, self.page_settings,
-                  self.page_strategy, self.page_diagnostics, self.page_log):
+                  self.page_strategy, self.page_log):
             wrap = _scrollable(p)
             self._scroll[p] = wrap
             self.stack.addWidget(wrap)
@@ -2124,6 +1995,14 @@ class MainWindow(QWidget):
                 self.page_settings.set_mode_applicable(is_spoof)
             except Exception:
                 pass
+        # #6: reflect spoof-applicability on the dashboard so the "استراتژی فعال"
+        # card / resilience strip don't falsely claim a strategy runs for an
+        # ordinary (direct) config where the spoofer isn't in the path.
+        if hasattr(self, "page_dashboard"):
+            try:
+                self.page_dashboard.set_spoof_active(is_spoof)
+            except Exception:
+                pass
 
     def _restart_when_idle(self):
         """Start the engine once it has fully stopped (feedback #2).
@@ -2214,11 +2093,6 @@ class MainWindow(QWidget):
         # replay the dashboard intro when navigating back to it
         if current is self._scroll.get(self.page_dashboard):
             self.page_dashboard.play_intro()
-        # only poll diagnostics while its page is visible (saves cycles)
-        if current is self._scroll.get(self.page_diagnostics):
-            self.page_diagnostics.start_polling()
-        else:
-            self.page_diagnostics.stop_polling()
 
     # --- navigation -------------------------------------------------------
     def _build_nav(self) -> QWidget:
@@ -2232,12 +2106,13 @@ class MainWindow(QWidget):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
 
+        # #5: the "تشخیص" (Diagnostics) entry was removed — the page no longer
+        # exists. Nav indexes still map 1:1 onto the stack order above.
         items = [
             ("داشبورد", "\u25c9"),    # fisheye
             ("پروفایل‌ها", "\u2630"),  # trigram (list)
             ("تنظیمات", "\u2699"),     # gear
             ("استراتژی", "\u29bf"),    # circled bullet
-            ("تشخیص", "\u2295"),       # circled plus (diagnostics)
             ("لاگ", "\u2261"),         # identical-to (log lines)
         ]
         for idx, (text, icon) in enumerate(items):
@@ -2304,18 +2179,36 @@ class MainWindow(QWidget):
         The layout is fully responsive (scroll areas + stretch factors), so
         growing to the full screen never breaks or overlaps the content; the
         title-bar glyph is kept in sync via changeEvent → _sync_max_button.
+
+        We remember the *normal* geometry before maximizing and restore it
+        explicitly. This is the fix for the bug where minimising a maximized
+        (or even a normal) window and then re-opening it from the taskbar left
+        the window stuck at full size: on a frameless window Qt's own
+        normal-geometry bookkeeping is unreliable, so we drive it ourselves.
         """
         if self.isMaximized() or self.isFullScreen():
-            self.showNormal()
+            self._restore_normal()
         else:
-            # On a frameless top-level window showMaximized() must target the
-            # screen's *available* geometry (excluding the taskbar). Setting it
-            # explicitly makes maximize reliable across platforms (#4).
+            # remember where we were so restore puts the window back exactly
+            self._normal_geometry = self.geometry()
+            self._is_maximized = True
             self.showMaximized()
+
+    def _restore_normal(self):
+        """Return the window to its remembered normal size/position."""
+        self._is_maximized = False
+        self.showNormal()
+        geo = getattr(self, "_normal_geometry", None)
+        if geo is not None and geo.isValid():
+            self.setGeometry(geo)
 
     def _sync_max_button(self):
         """Keep the maximize/restore glyph + rounded corners match the state."""
-        maxed = self.isMaximized() or self.isFullScreen()
+        # while minimised, keep whatever state we had so the glyph doesn't flap
+        if self.isMinimized():
+            maxed = self._is_maximized
+        else:
+            maxed = self.isMaximized() or self.isFullScreen()
         try:
             self.title_bar.update_max_label(maxed)
         except Exception:
@@ -2330,9 +2223,11 @@ class MainWindow(QWidget):
             self.style().polish(self)
         except Exception:
             pass
+        # keep the resize grip hidden while maximized, visible otherwise (#1)
+        self._position_size_grip()
 
     # -- interactive edge / corner resize for the frameless window (#3) -----
-    _RESIZE_MARGIN = 6   # px band around the window edges that starts a resize
+    _RESIZE_MARGIN = 9   # px band around the window edges that starts a resize
 
     def _edge_at(self, pos):
         """Return the Qt edges under *pos* (within the grip margin), or None."""
@@ -2352,7 +2247,13 @@ class MainWindow(QWidget):
             edges |= _Qt.TopEdge
         if bottom:
             edges |= _Qt.BottomEdge
-        return edges if int(edges) else None
+        # NB: in newer PySide6 ``int(edges)`` raises on the flag enum, so test
+        # the value via ``.value`` (with a plain-int fallback for older Qt).
+        try:
+            truthy = bool(edges.value)
+        except AttributeError:
+            truthy = bool(int(edges))
+        return edges if truthy else None
 
     def _cursor_for_edges(self, edges):
         from PySide6.QtCore import Qt as _Qt
@@ -2436,7 +2337,28 @@ class MainWindow(QWidget):
             self.wave_bg.lower()
         except Exception:
             pass
+        # #1: pin the size grip to the trailing bottom corner (mirrors for RTL)
+        self._position_size_grip()
         super().resizeEvent(event)
+
+    def _position_size_grip(self):
+        """Keep the resize grip in the bottom corner; hide it when maximized."""
+        try:
+            grip = self.size_grip
+        except AttributeError:
+            return
+        maxed = self.isMaximized() or self.isFullScreen()
+        grip.setVisible(not maxed)
+        if maxed:
+            return
+        m = 3
+        gw, gh = grip.width(), grip.height()
+        if self.layoutDirection() == Qt.RightToLeft:
+            x = m                                   # bottom-left for RTL
+        else:
+            x = self.width() - gw - m               # bottom-right for LTR
+        grip.move(x, self.height() - gh - m)
+        grip.raise_()
 
     def showEvent(self, event):
         # resume the animation when visible
@@ -2460,9 +2382,21 @@ class MainWindow(QWidget):
         try:
             from PySide6.QtCore import QEvent
             if event.type() == QEvent.WindowStateChange:
-                self.wave_bg.set_enabled(not self.isMinimized())
+                minimized = self.isMinimized()
+                self.wave_bg.set_enabled(not minimized)
+                if not minimized:
+                    # #2: the window just left the minimised state (restored from
+                    # the taskbar). Re-assert the size the user actually had:
+                    # if they were *not* maximized before minimising, force the
+                    # window back to its normal geometry — otherwise some
+                    # platforms restore it stuck at the previous maximized size.
+                    if not self._is_maximized and (
+                            self.isMaximized() or self.isFullScreen()):
+                        QTimer.singleShot(0, self._restore_normal)
                 # #6: keep the maximize/restore button glyph in sync whether the
                 # state changed via our button, double-click, or the OS itself.
+                if not minimized:
+                    self._is_maximized = self.isMaximized() or self.isFullScreen()
                 self._sync_max_button()
         except Exception:
             pass
