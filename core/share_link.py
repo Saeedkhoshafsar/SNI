@@ -20,7 +20,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from core.profile import Profile
 
@@ -214,6 +214,147 @@ def _split_hostport(hp: str) -> tuple[str, int]:
     if not host:  # no port present
         return port_s, 443
     return host, int(port_s or 443)
+
+
+# ---------------------------------------------------------------------------
+#  Profile → share link (export / re-share — issue #2)
+# ---------------------------------------------------------------------------
+
+def _b64encode_str(s: str) -> str:
+    """Standard base64 (no newlines) — what v2rayN emits for vmess links."""
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+
+def _build_query(pairs: list[tuple[str, str]]) -> str:
+    """Join key=value pairs into a query string, URL-encoding each value.
+
+    Values are percent-encoded with ``safe=""`` so anything funky in a ``path``
+    (the example link's ``/stars/http://user:pass@host:port`` carries ``:``,
+    ``/`` and ``@``) round-trips exactly back to what the parser expects. Empty
+    values are dropped so we don't emit ``&host=`` noise.
+    """
+    parts = []
+    for k, v in pairs:
+        if v is None or v == "":
+            continue
+        parts.append(f"{k}={quote(str(v), safe='')}")
+    return "&".join(parts)
+
+
+def profile_to_link(p: Profile) -> str:
+    """Serialise a :class:`Profile` back into a shareable URI (issue #2).
+
+    Produces the same link formats the parsers accept, so a config the user
+    imported (or built/edited) can be copied back out and shared. Round-trips
+    cleanly for vless / trojan / vmess / shadowsocks across all transports and
+    security layers. Raises :class:`ShareLinkError` for unknown protocols.
+    """
+    proto = (p.protocol or "").lower()
+    if proto == "vless":
+        return _vless_to_link(p)
+    if proto == "trojan":
+        return _trojan_to_link(p)
+    if proto == "vmess":
+        return _vmess_to_link(p)
+    if proto == "shadowsocks":
+        return _ss_to_link(p)
+    raise ShareLinkError(f"خروجی لینک برای پروتکل پشتیبانی نمی‌شود: {proto or '?'}")
+
+
+def _common_vless_trojan_params(p: Profile) -> list[tuple[str, str]]:
+    """Shared query params for vless/trojan links (transport + security)."""
+    params: list[tuple[str, str]] = [
+        ("type", p.transport or "tcp"),
+        ("security", p.security or "none"),
+    ]
+    if p.is_tls:
+        params.append(("sni", p.sni))
+        if p.fingerprint:
+            params.append(("fp", p.fingerprint))
+        if p.alpn:
+            params.append(("alpn", p.alpn))
+        if p.allow_insecure:
+            params.append(("allowInsecure", "1"))
+    if p.security == "reality":
+        params.append(("pbk", p.public_key))
+        params.append(("sid", p.short_id))
+        if p.spider_x:
+            params.append(("spx", p.spider_x))
+    # transport specifics
+    tr = (p.transport or "tcp").lower()
+    if tr in ("ws", "httpupgrade"):
+        params.append(("host", p.host))
+        params.append(("path", p.path or "/"))
+    elif tr in ("http", "h2"):
+        params.append(("host", p.host))
+        params.append(("path", p.path or "/"))
+    elif tr == "grpc":
+        params.append(("serviceName", p.service_name or p.path.strip("/")))
+    elif tr in ("xhttp", "splithttp"):
+        params.append(("host", p.host))
+        params.append(("path", p.path or "/"))
+        if p.mode:
+            params.append(("mode", p.mode))
+    elif tr == "tcp" and p.header_type == "http":
+        params.append(("headerType", "http"))
+        params.append(("host", p.host))
+        params.append(("path", p.path or "/"))
+    return params
+
+
+def _hostport(p: Profile) -> str:
+    addr = p.address or ""
+    if ":" in addr and not addr.startswith("["):  # bare IPv6 literal
+        addr = f"[{addr}]"
+    return f"{addr}:{p.port}"
+
+
+def _frag(remark: str) -> str:
+    return f"#{quote(remark, safe='')}" if remark else ""
+
+
+def _vless_to_link(p: Profile) -> str:
+    params = [("encryption", "none")]
+    if p.flow:
+        params.append(("flow", p.flow))
+    params += _common_vless_trojan_params(p)
+    q = _build_query(params)
+    user = quote(p.uuid, safe="")
+    return f"vless://{user}@{_hostport(p)}?{q}{_frag(p.remark)}"
+
+
+def _trojan_to_link(p: Profile) -> str:
+    q = _build_query(_common_vless_trojan_params(p))
+    pw = quote(p.password, safe="")
+    return f"trojan://{pw}@{_hostport(p)}?{q}{_frag(p.remark)}"
+
+
+def _vmess_to_link(p: Profile) -> str:
+    net = (p.transport or "tcp").lower()
+    data = {
+        "v": "2",
+        "ps": p.remark or "",
+        "add": p.address or "",
+        "port": str(p.port),
+        "id": p.uuid or "",
+        "aid": str(p.alter_id or 0),
+        "scy": "auto",
+        "net": net,
+        "type": p.header_type or "none",
+        "host": p.host or "",
+        "path": p.path or "",
+        "tls": "tls" if p.is_tls else "",
+        "sni": p.sni or "",
+        "alpn": p.alpn or "",
+        "fp": p.fingerprint or "",
+    }
+    return "vmess://" + _b64encode_str(json.dumps(data, ensure_ascii=False))
+
+
+def _ss_to_link(p: Profile) -> str:
+    # SIP002: ss://base64(method:password)@host:port#remark
+    creds = _b64encode_str(f"{p.method}:{p.password}")
+    return f"ss://{creds}@{_hostport(p)}{_frag(p.remark)}"
 
 
 # ---------------------------------------------------------------------------

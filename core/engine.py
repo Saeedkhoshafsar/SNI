@@ -215,12 +215,22 @@ class EngineController:
         """
         if not self.uses_core:
             return False
-        # Ordinary configs: always direct, regardless of mode (#6).
-        if not getattr(self.profile, "is_spoof_config", False):
-            return False
-        # Spoof configs: the spoofer is always in the path (Tunnel chains xray
-        # under it; SNI Only runs it as the bypass forwarder under xray).
-        return True
+        # Spoof configs (loopback share links): the spoofer is always in the
+        # path (Tunnel chains xray under it; SNI Only runs it as the bypass
+        # forwarder under xray).
+        if getattr(self.profile, "is_spoof_config", False):
+            return True
+        # Ordinary, routable configs are normally direct (#6). BUT the user can
+        # explicitly opt in to routing an ordinary config *through* the SNI
+        # spoofer (issue #1): some clean Cloudflare IPs connect fine in
+        # V2RayTun but get their real ClientHello (SNI) dropped by DPI when we
+        # dial them directly. Forcing the spoofer makes xray → spoofer → the
+        # config's own IP while injecting a decoy ClientHello, so DPI sees the
+        # fake SNI exactly like the working spoof-config path. Opt-in via the
+        # ``force_spoof`` config flag (set per-run from the UI).
+        if bool(self.config.get("force_spoof", False)):
+            return True
+        return False
 
     def diagnostics(self):
         """Return a :class:`core.diagnostics.DiagnosticsSnapshot` of live state.
@@ -531,16 +541,23 @@ class EngineController:
                     f" (SNI جعلی: {fake_sni}، SNI واقعی: "
                     f"{prof.sni or prof.host})")
             else:
+                # ordinary, routable config routed through the spoofer because
+                # the user enabled ``force_spoof`` (issue #1). The spoofer dials
+                # the config's OWN real IP/port and injects a decoy ClientHello
+                # so DPI sees the fake SNI instead of the real one — the same
+                # bypass the working spoof-config path uses.
                 self._spoof_port = find_free_port(
                     int(self.config.get("LISTEN_PORT", 40443)))
                 connect_ip = (str(self.config.get("CONNECT_IP", "")).strip()
                               or prof.address)
                 connect_port = (int(self.config.get("CONNECT_PORT", 0))
                                 or prof.port)
-                fake_sni = str(self.config.get("FAKE_SNI", "www.speedtest.net"))
+                fake_sni = (str(self.config.get("FAKE_SNI", "")).strip()
+                            or prof.spoof_fake_sni)
                 self._log(
-                    f"حالت v2rayN: spoofer روی 127.0.0.1:{self._spoof_port} "
-                    f"→ {connect_ip}:{connect_port}")
+                    f"حالت SNI-spoof اجباری: xray → 127.0.0.1:{self._spoof_port}"
+                    f" → spoofer → {connect_ip}:{connect_port} (SNI جعلی: "
+                    f"{fake_sni}، SNI واقعی: {prof.sni or prof.host})")
         else:
             self._spoof_port = int(self.config.get("LISTEN_PORT", 40443))
             connect_ip = str(self.config.get("CONNECT_IP", ""))

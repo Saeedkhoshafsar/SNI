@@ -78,6 +78,76 @@ def tcp_latency(host: str, port: int, timeout: float) -> Optional[float]:
             pass
 
 
+def tls_latency(host: str, port: int, timeout: float, *,
+                server_name: str = "") -> Optional[float]:  # pragma: no cover - net
+    """Single-sample latency that drives a **real TLS handshake** (stdlib only).
+
+    Why this exists (issue #1 — *"ordinary configs: ping isn't right and they
+    don't connect"*): a bare :func:`tcp_latency` only proves the *transport* is
+    reachable. For a Cloudflare front IP the TCP three-way handshake almost
+    always completes — even when DPI silently drops / resets the connection the
+    moment it sees the TLS ``ClientHello`` (the real SNI). That produced a
+    misleading green ping for a config that can never actually connect.
+
+    Here we connect **and** complete a genuine TLS handshake carrying
+    *server_name* as SNI, then return the elapsed time. Certificate validation
+    is intentionally disabled (we only care that the peer spoke TLS back, so a
+    self-signed / mismatched cert still counts as "the protocol got through").
+
+    Returns ``None`` on any failure (connect/handshake timeout, reset, route),
+    so the result honestly reflects whether a real session could be set up —
+    matching what the user sees when V2RayTun pings the same server.
+    """
+    import ssl
+
+    sni = (server_name or host or "").strip().strip("[]")
+    start = time.monotonic()
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(timeout)
+    try:
+        raw.connect((host, port))
+    except OSError:
+        try:
+            raw.close()
+        except OSError:
+            pass
+        return None
+    if not sni:
+        latency = (time.monotonic() - start) * 1000.0
+        try:
+            raw.close()
+        except OSError:
+            pass
+        return latency
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        tls = ctx.wrap_socket(raw, server_hostname=sni)
+        latency = (time.monotonic() - start) * 1000.0
+        try:
+            tls.close()
+        except OSError:
+            pass
+        return latency
+    except ssl.SSLError:
+        # peer answered *in TLS* (even an alert) → the protocol passed the DPI
+        # box, which is exactly what we're validating. Count it as reachable.
+        latency = (time.monotonic() - start) * 1000.0
+        try:
+            raw.close()
+        except OSError:
+            pass
+        return latency
+    except OSError:
+        # connection-level reset / drop during the handshake → not reachable.
+        try:
+            raw.close()
+        except OSError:
+            pass
+        return None
+
+
 def tcp_throughput(host: str, port: int,
                    timeout: float) -> Optional[float]:  # pragma: no cover - net
     """Very rough download-quality estimate (KB/s) via a short read burst.
@@ -294,10 +364,23 @@ class PingTester:
         if not target.host or not (0 < target.port < 65536):
             res.error = "آدرس/پورت نامعتبر"
             return res
+        # #1: for a TLS-bearing target we DON'T trust a bare TCP connect — DPI
+        # lets the TCP handshake through and only drops/resets the TLS
+        # ClientHello (the real SNI). Validate a genuine TLS handshake so the
+        # reported latency reflects whether a real session can actually be set
+        # up (the "green ping but never connects" bug). A caller that injects a
+        # custom ``latency_fn`` (tests) always wins so the suite stays
+        # deterministic and offline.
+        use_tls = (getattr(target, "tls", False)
+                   and self.latency_fn is tcp_latency)
         for _ in range(self.samples):
             res.samples_sent += 1
             try:
-                ms = self.latency_fn(target.host, target.port, self.timeout)
+                if use_tls:
+                    ms = tls_latency(target.host, target.port, self.timeout,
+                                     server_name=getattr(target, "server_name", ""))
+                else:
+                    ms = self.latency_fn(target.host, target.port, self.timeout)
             except Exception as exc:  # never let one bad sample kill the run
                 res.error = repr(exc)
                 ms = None
