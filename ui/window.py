@@ -210,10 +210,14 @@ def _section_title(text: str, sub: str = "") -> QWidget:
     lay.setSpacing(2)
     h = QLabel(tr(text))
     h.setObjectName("H1")
+    h.setWordWrap(True)
     lay.addWidget(h)
     if sub:
         s = QLabel(tr(sub))
         s.setObjectName("Muted")
+        # #5: wrap the subtitle so a long bilingual heading can never force the
+        # page wider than the scroll viewport (which clipped the settings page).
+        s.setWordWrap(True)
         lay.addWidget(s)
     return w
 
@@ -468,9 +472,12 @@ class SettingsPage(QWidget):
         form.addWidget(self.connect_ip)
 
         # --- LAN sharing (use the proxy from a phone on the same Wi-Fi) ---
+        # #5: keep the checkbox LABEL short (QCheckBox never word-wraps, so a
+        # long label forced the whole page wider than the scroll viewport and
+        # the right side got clipped). The full explanation lives in the
+        # wrapping hint label right below each checkbox.
         form.addSpacing(8)
-        self.chk_lan = QCheckBox(
-            tr("اشتراک LAN — پروکسی روی شبکه‌ی محلی باز شود (برای گوشی)"))
+        self.chk_lan = QCheckBox(tr("اشتراک LAN (برای گوشی)"))
         form.addWidget(self.chk_lan)
         self.lan_hint = QLabel("")
         self.lan_hint.setObjectName("Muted")
@@ -480,8 +487,7 @@ class SettingsPage(QWidget):
 
         # --- system proxy vs. tunnel (feedback 7) ---
         form.addSpacing(8)
-        self.chk_system_proxy = QCheckBox(
-            tr("پروکسی سیستم — همه‌ی برنامه‌های ویندوز خودکار از تونل رد شوند"))
+        self.chk_system_proxy = QCheckBox(tr("پروکسی سیستم"))
         form.addWidget(self.chk_system_proxy)
         self.proxy_hint = QLabel("")
         self.proxy_hint.setObjectName("Muted")
@@ -491,9 +497,7 @@ class SettingsPage(QWidget):
 
         # --- force SNI-spoof for ordinary configs (issue #1) ---
         form.addSpacing(8)
-        self.chk_force_spoof = QCheckBox(
-            tr("اسپوف SNI اجباری برای کانفیگ‌های معمولی — حتی کانفیگ‌هایی که "
-               "آدرس سرورشان IP/دامنه‌ی واقعی است، از طریق اسپوفر رد شوند"))
+        self.chk_force_spoof = QCheckBox(tr("اسپوف SNI اجباری"))
         form.addWidget(self.chk_force_spoof)
         self.force_spoof_hint = QLabel("")
         self.force_spoof_hint.setObjectName("Muted")
@@ -658,6 +662,13 @@ class ProfilesPage(QWidget):
         self._store = store
         self._engine = engine          # EngineBridge — used for ping (optional)
         self._ping_worker = None       # live PingWorker (kept to avoid GC)
+        # per-row inline ping workers, keyed by row index — allows several rows
+        # to be pinged concurrently / all at once (#4).
+        self._inline_workers: dict[int, "InlinePingWorker"] = {}
+        # #7: indexes that are *checked* for bulk actions (delete / copy links).
+        # This is independent of the active profile — checking a row never
+        # activates it. Stored as a set so order doesn't matter.
+        self._checked: set[int] = set()
         # host window assigns this; called when the selected profile changes
         self.on_selection_changed = None
 
@@ -714,7 +725,41 @@ class ProfilesPage(QWidget):
         self.list.setUniformItemSizes(False)
         lb.addWidget(self.list)
 
+        # #7: bulk-selection toolbar. The checkboxes on each row mark servers
+        # for batch actions WITHOUT activating them. This row lets the user
+        # select/clear all and act on the marked rows (copy links / delete).
+        sel_row = QHBoxLayout()
+        sel_row.setSpacing(8)
+        self.lbl_sel_count = QLabel("")
+        self.lbl_sel_count.setObjectName("Muted")
+        self.btn_select_all = QPushButton(tr("انتخاب همه"))
+        self.btn_select_all.setObjectName("Ghost")
+        self.btn_clear_sel = QPushButton(tr("لغو انتخاب"))
+        self.btn_clear_sel.setObjectName("Ghost")
+        self.btn_copy_selected = QPushButton(tr("\U0001f517  کپی لینک‌های انتخاب‌شده"))
+        self.btn_copy_selected.setObjectName("Ghost")
+        self.btn_copy_selected.setToolTip(
+            tr("لینک اشتراک‌گذاری همهٔ کانفیگ‌های تیک‌خورده را یک‌جا کپی می‌کند"))
+        self.btn_delete_selected = QPushButton(tr("\U0001f5d1  حذف انتخاب‌شده‌ها"))
+        self.btn_delete_selected.setObjectName("Ghost")
+        self.btn_delete_selected.setToolTip(
+            tr("همهٔ کانفیگ‌های تیک‌خورده را با هم حذف می‌کند"))
+        sel_row.addWidget(self.lbl_sel_count)
+        sel_row.addStretch(1)
+        sel_row.addWidget(self.btn_select_all)
+        sel_row.addWidget(self.btn_clear_sel)
+        sel_row.addWidget(self.btn_copy_selected)
+        sel_row.addWidget(self.btn_delete_selected)
+        lb.addLayout(sel_row)
+
         del_row = QHBoxLayout()
+        # inline "ping all rows" — pings every server concurrently and shows the
+        # result on each row, instead of waiting one-by-one (#4).
+        self.btn_ping_all_rows = QPushButton(tr("\U0001f4e1  پینگ همه (سریع)"))
+        self.btn_ping_all_rows.setObjectName("Ghost")
+        self.btn_ping_all_rows.setToolTip(
+            tr("همهٔ سرورها را هم‌زمان پینگ می‌گیرد و نتیجه را روی هر ردیف نشان می‌دهد"))
+        del_row.addWidget(self.btn_ping_all_rows)
         del_row.addStretch(1)
         self.btn_edit = QPushButton(tr("\u270e  ویرایش"))
         self.btn_edit.setObjectName("Ghost")
@@ -781,6 +826,12 @@ class ProfilesPage(QWidget):
         self.btn_ping_all.clicked.connect(self._ping_all)
         self.btn_ping_one.clicked.connect(self._ping_one)
         self.btn_test_strategies.clicked.connect(self._test_strategies)
+        self.btn_ping_all_rows.clicked.connect(self._ping_all_inline)
+        # #7: bulk-selection wiring
+        self.btn_select_all.clicked.connect(self._select_all)
+        self.btn_clear_sel.clicked.connect(self._clear_selection)
+        self.btn_copy_selected.clicked.connect(self._copy_selected_links)
+        self.btn_delete_selected.clicked.connect(self._delete_checked)
 
         self.refresh()
 
@@ -791,13 +842,20 @@ class ProfilesPage(QWidget):
 
     # -- list rendering ----------------------------------------------------
     def refresh(self) -> None:
+        # rows are about to be rebuilt — any in-flight inline-ping workers point
+        # at the old row widgets (their result handler already swallows the
+        # RuntimeError when a widget is gone), so just forget the keys (#4).
+        self._inline_workers = {}
         self.list.blockSignals(True)
         self.list.clear()
         sel = self._store.selected_index
+        # #7: drop any checked indexes that no longer exist (list shrank)
+        self._checked = {i for i in self._checked
+                         if 0 <= i < len(self._store.profiles)}
         self._rows = []
         for i, p in enumerate(self._store.profiles):
             item = QListWidgetItem(self.list)
-            row = ProfileRow(p, active=(i == sel))
+            row = ProfileRow(p, active=(i == sel), checked=(i in self._checked))
             row.edit.connect(lambda _=False, idx=i: self._edit_index(idx))
             # one-click activation straight from the row (#8)
             row.activate.connect(lambda _=False, idx=i: self._activate_index(idx))
@@ -807,6 +865,9 @@ class ProfilesPage(QWidget):
             row.share.connect(lambda _=False, idx=i: self._share_index(idx))
             # scan clean Cloudflare IPs using this config as reference (issue #3)
             row.scan.connect(lambda _=False, idx=i: self._scan_index(idx))
+            # #7: multi-select checkbox toggled — track for bulk actions
+            row.selection_toggled.connect(
+                lambda checked, idx=i: self._on_row_checked(idx, checked))
             self._rows.append(row)
             # use a guaranteed minimum row height so the active "● فعال" pill +
             # badges never get clipped (sizeHint can under-report before layout)
@@ -823,6 +884,86 @@ class ProfilesPage(QWidget):
             ph.setFlags(Qt.NoItemFlags)
             self.list.addItem(ph)
         self.list.blockSignals(False)
+        self._update_selection_ui()
+
+    # -- multi-select / bulk actions (#7) ---------------------------------
+    def _on_row_checked(self, index: int, checked: bool) -> None:
+        """Track a row's multi-select checkbox without activating it (#7)."""
+        if checked:
+            self._checked.add(index)
+        else:
+            self._checked.discard(index)
+        self._update_selection_ui()
+
+    def _update_selection_ui(self) -> None:
+        """Refresh the selection count label + enable/disable bulk buttons."""
+        n = len(self._checked)
+        if n:
+            self.lbl_sel_count.setText(
+                tr("{n} مورد انتخاب شده").format(n=n))
+        else:
+            self.lbl_sel_count.setText(tr("هیچ موردی انتخاب نشده"))
+        for b in (self.btn_copy_selected, self.btn_delete_selected):
+            b.setEnabled(n > 0)
+        has_rows = bool(self._store.profiles)
+        self.btn_select_all.setEnabled(has_rows)
+        self.btn_clear_sel.setEnabled(n > 0)
+
+    def _select_all(self) -> None:
+        self._checked = set(range(len(self._store.profiles)))
+        self.refresh()
+
+    def _clear_selection(self) -> None:
+        self._checked = set()
+        self.refresh()
+
+    def _copy_selected_links(self) -> None:
+        """Copy the share links of every checked profile, one per line (#7)."""
+        if not self._checked:
+            self._toast(tr("هیچ کانفیگی انتخاب نشده"), "warn")
+            return
+        from core.share_link import profile_to_link
+        links: list[str] = []
+        failed = 0
+        for i in sorted(self._checked):
+            if not (0 <= i < len(self._store.profiles)):
+                continue
+            try:
+                links.append(profile_to_link(self._store.profiles[i]))
+            except Exception:
+                failed += 1
+        if not links:
+            self._toast(tr("ساخت لینک برای موارد انتخاب‌شده ناموفق بود"), "err")
+            return
+        QGuiApplication.clipboard().setText("\n".join(links))
+        if failed:
+            self._toast(
+                tr("{n} لینک کپی شد ({f} مورد ناموفق)").format(
+                    n=len(links), f=failed), "warn")
+        else:
+            self._toast(
+                tr("{n} لینک کپی شد").format(n=len(links)), "ok")
+
+    def _delete_checked(self) -> None:
+        """Delete every checked profile in one batch (#7 bulk delete)."""
+        if not self._checked:
+            self._toast(tr("هیچ کانفیگی انتخاب نشده"), "warn")
+            return
+        from PySide6.QtWidgets import QMessageBox
+        n = len(self._checked)
+        resp = QMessageBox.question(
+            self.window(),
+            tr("حذف دسته‌ای"),
+            tr("آیا {n} کانفیگ انتخاب‌شده حذف شود؟").format(n=n),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return
+        removed = self._store.remove_profiles(self._checked)
+        self._checked = set()
+        self.refresh()
+        self._emit_selection()
+        self._toast(tr("{n} کانفیگ حذف شد").format(n=removed), "warn")
 
     # -- actions -----------------------------------------------------------
     def _toast(self, text: str, kind: str = "info"):
@@ -1038,16 +1179,24 @@ class ProfilesPage(QWidget):
 
     # -- inline per-row ping (#3) -----------------------------------------
     def _ping_row(self, row: int):
-        """Ping a single profile and show the result inline on its row."""
+        """Ping a single profile and show the result inline on its row.
+
+        #4: per-row pings now run **concurrently** — each row gets its own
+        worker tracked in ``self._inline_workers`` keyed by row, so the user can
+        fire several at once (or "ping all") without waiting for the previous
+        one to finish. A row that's already pinging is simply skipped.
+        """
         if not (0 <= row < len(self._store.profiles)):
             return
         if self._engine is None:
             self._toast(tr("موتور در دسترس نیست"), "err")
             return
-        if getattr(self, "_inline_worker", None) is not None \
-                and self._inline_worker.isRunning():
-            self._toast(tr("یک پینگ در حال اجراست …"), "warn")
-            return
+        workers = getattr(self, "_inline_workers", None)
+        if workers is None:
+            workers = self._inline_workers = {}
+        existing = workers.get(row)
+        if existing is not None and existing.isRunning():
+            return  # this row is already being pinged — don't double-fire
         rows = getattr(self, "_rows", [])
         if row >= len(rows):
             return
@@ -1057,17 +1206,34 @@ class ProfilesPage(QWidget):
         prof = self._store.profiles[row]
         worker = InlinePingWorker(self._engine, prof)
         worker.result.connect(
-            lambda text, kind, w=widget: self._inline_ping_done(w, text, kind))
-        self._inline_worker = worker
+            lambda text, kind, w=widget, r=row:
+                self._inline_ping_done(w, text, kind, r))
+        workers[row] = worker
         worker.start()
 
-    def _inline_ping_done(self, widget, text: str, kind: str):
+    def _ping_all_inline(self):
+        """Fire an inline ping on **every** row at once (#4 — "ping all")."""
+        if self._engine is None:
+            self._toast(tr("موتور در دسترس نیست"), "err")
+            return
+        if not self._store.profiles:
+            self._toast(tr("هیچ پروفایلی برای پینگ نیست"), "warn")
+            return
+        self._toast(tr("در حال پینگ همهٔ سرورها …"), "info")
+        for row in range(len(self._store.profiles)):
+            self._ping_row(row)
+
+    def _inline_ping_done(self, widget, text: str, kind: str, row: int = -1):
         try:
             widget.set_ping_state(text, kind)
             widget.set_ping_idle()
         except RuntimeError:
             # the row widget may have been recreated by a refresh() — ignore
             pass
+        # drop the finished worker so the row can be pinged again
+        workers = getattr(self, "_inline_workers", None)
+        if workers is not None and row in workers:
+            workers.pop(row, None)
 
     def _emit_selection(self):
         if self.on_selection_changed:
@@ -1694,6 +1860,7 @@ class MainWindow(QWidget):
             Qt.Window
             | Qt.FramelessWindowHint
             | Qt.WindowMinimizeButtonHint
+            | Qt.WindowMaximizeButtonHint
             | Qt.WindowSystemMenuHint
         )
 
@@ -1711,6 +1878,7 @@ class MainWindow(QWidget):
         # --- title bar ---
         self.title_bar = TitleBar(self)
         self.title_bar.minimize_clicked.connect(self.showMinimized)
+        self.title_bar.maximize_clicked.connect(self.toggle_maximize)
         self.title_bar.close_clicked.connect(self.close)
         self.title_bar.theme_toggled.connect(self.toggle_theme)
         self.title_bar.language_toggled.connect(self.toggle_language)
@@ -2095,6 +2263,25 @@ class MainWindow(QWidget):
         self.store.set("theme", self._theme)
         self.store.save_config()
 
+    def toggle_maximize(self):
+        """Maximize the window, or restore it if already maximized (#6).
+
+        The layout is fully responsive (scroll areas + stretch factors), so
+        growing to the full screen never breaks or overlaps the content; the
+        title-bar glyph is kept in sync via changeEvent → _sync_max_button.
+        """
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _sync_max_button(self):
+        """Keep the maximize/restore glyph matching the actual window state."""
+        try:
+            self.title_bar.update_max_label(self.isMaximized())
+        except Exception:
+            pass
+
     def toggle_language(self):
         """Switch FA⇄EN and rebuild the window so every label retranslates (#6).
 
@@ -2163,6 +2350,9 @@ class MainWindow(QWidget):
             from PySide6.QtCore import QEvent
             if event.type() == QEvent.WindowStateChange:
                 self.wave_bg.set_enabled(not self.isMinimized())
+                # #6: keep the maximize/restore button glyph in sync whether the
+                # state changed via our button, double-click, or the OS itself.
+                self._sync_max_button()
         except Exception:
             pass
         super().changeEvent(event)

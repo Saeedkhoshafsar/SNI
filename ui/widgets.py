@@ -9,7 +9,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QPoint, QPointF, QTimer, Signal
 from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QFrame, QGraphicsDropShadowEffect,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect, QHBoxLayout, QLabel, QPushButton, QSpinBox,
     QVBoxLayout, QWidget,
 )
@@ -143,9 +143,10 @@ def _qcolor_from_rgba(s: str) -> QColor:
 # ---------------------------------------------------------------------------
 
 class TitleBar(QFrame):
-    """Draggable title bar with min / theme-toggle / close controls."""
+    """Draggable title bar with min / max / theme-toggle / close controls."""
 
     minimize_clicked = Signal()
+    maximize_clicked = Signal()
     close_clicked = Signal()
     theme_toggled = Signal()
     language_toggled = Signal()
@@ -178,20 +179,37 @@ class TitleBar(QFrame):
         self.btn_lang.setToolTip("Language / زبان")
         self.btn_theme = self._win_btn("\u25d1", "WinBtn")   # half-moon
         self.btn_min = self._win_btn("\u2013", "WinBtn")     # en-dash
+        # #6: maximize / restore toggle. Glyph swaps between an empty square
+        # (maximize) and two overlapping squares (restore) via update_max_label.
+        self.btn_max = self._win_btn("\u25a1", "WinBtn")     # white square
+        self.btn_max.setToolTip(tr("بزرگ‌نمایی / بازگردانی"))
         self.btn_close = self._win_btn("\u2715", "WinClose") # multiply
 
         self.btn_lang.clicked.connect(self.language_toggled.emit)
         self.btn_theme.clicked.connect(self.theme_toggled.emit)
         self.btn_min.clicked.connect(self.minimize_clicked.emit)
+        self.btn_max.clicked.connect(self.maximize_clicked.emit)
         self.btn_close.clicked.connect(self.close_clicked.emit)
 
-        for b in (self.btn_lang, self.btn_theme, self.btn_min, self.btn_close):
+        for b in (self.btn_lang, self.btn_theme, self.btn_min,
+                  self.btn_max, self.btn_close):
             lay.addWidget(b)
 
     def update_lang_label(self) -> None:
         """Refresh the FA/EN button to show the *other* language."""
         from ui.i18n import language
         self.btn_lang.setText("EN" if language() == "fa" else "FA")
+
+    def update_max_label(self, maximized: bool) -> None:
+        """Swap the maximize button glyph to reflect the window state (#6).
+
+        Shows the *action* the button performs next: two overlapping squares
+        ("restore") when the window is maximized, an empty square ("maximize")
+        when it is in its normal size.
+        """
+        self.btn_max.setText("\u2750" if maximized else "\u25a1")
+        self.btn_max.setToolTip(
+            tr("بازگردانی") if maximized else tr("بزرگ‌نمایی"))
 
     def _win_btn(self, glyph: str, obj: str) -> QPushButton:
         b = QPushButton(glyph)
@@ -233,6 +251,14 @@ class TitleBar(QFrame):
 
     def mouseReleaseEvent(self, e):
         self._drag_pos = None
+
+    def mouseDoubleClickEvent(self, e):
+        # #6: double-clicking the title bar toggles maximize/restore, matching
+        # the standard desktop behaviour users expect.
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = None
+            self.maximize_clicked.emit()
+            e.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -276,9 +302,10 @@ class ProfileRow(QFrame):
     activate = Signal()   # inline "use this server" button clicked
     share = Signal()      # inline "copy this config as a share link" clicked
     scan = Signal()       # inline "scan clean Cloudflare IPs for this config"
+    selection_toggled = Signal(bool)  # the multi-select checkbox changed (#7)
 
     def __init__(self, profile, *, active: bool = False,
-                 parent: QWidget | None = None):
+                 checked: bool = False, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("ProfileRow")
         self.setProperty("active", "1" if active else "0")
@@ -288,6 +315,18 @@ class ProfileRow(QFrame):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 8, 10, 8)
         lay.setSpacing(10)
+
+        # #7: a multi-SELECT checkbox that is independent of activation. Ticking
+        # it only marks the row for bulk actions (delete / copy links); it does
+        # NOT activate the server (that's still the explicit ✔ button). This
+        # lets the user pick one or many rows and act on them together.
+        self.chk_select = QCheckBox()
+        self.chk_select.setObjectName("RowSelect")
+        self.chk_select.setChecked(checked)
+        self.chk_select.setCursor(Qt.PointingHandCursor)
+        self.chk_select.setToolTip(tr("انتخاب برای عملیات دسته‌ای"))
+        self.chk_select.toggled.connect(self.selection_toggled.emit)
+        lay.addWidget(self.chk_select, 0, Qt.AlignVCenter)
 
         # protocol glyph (vertically centred so it lines up with the two-row text)
         glyph = QLabel(_PROTO_ICON.get(profile.protocol, "\u25c9"))

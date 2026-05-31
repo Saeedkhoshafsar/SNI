@@ -57,13 +57,15 @@ class FakeXray:
     last_instance = None
 
     def __init__(self, profile, socks_port=10808, http_port=10809,
-                 spoof_port=None, gaming_mode=False, listen="127.0.0.1"):
+                 spoof_port=None, gaming_mode=False, listen="127.0.0.1",
+                 api_port=None):
         self.profile = profile
         self.socks_port = socks_port
         self.http_port = http_port
         self.spoof_port = spoof_port
         self.gaming_mode = gaming_mode
         self.listen = listen
+        self.api_port = api_port
         self.on_log = None
         self.started = False
         self.stopped = False
@@ -72,6 +74,15 @@ class FakeXray:
     @property
     def is_available(self):
         return True
+
+    @property
+    def is_running(self):
+        return self.started and not self.stopped
+
+    def query_stats(self):
+        # the live-usage poller (#3) calls this; under fakes there is no real
+        # xray, so report no stats (the poller then simply skips the tick).
+        return None
 
     def start(self):
         self.started = True

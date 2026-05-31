@@ -79,73 +79,48 @@ def tcp_latency(host: str, port: int, timeout: float) -> Optional[float]:
 
 
 def tls_latency(host: str, port: int, timeout: float, *,
-                server_name: str = "") -> Optional[float]:  # pragma: no cover - net
-    """Single-sample latency that drives a **real TLS handshake** (stdlib only).
+                server_name: str = "", host_header: str = "",
+                path: str = "/", is_ws: bool = False
+                ) -> Optional[float]:  # pragma: no cover - net
+    """Single-sample latency with **real, config-accurate** validation (stdlib).
 
-    Why this exists (issue #1 — *"ordinary configs: ping isn't right and they
-    don't connect"*): a bare :func:`tcp_latency` only proves the *transport* is
-    reachable. For a Cloudflare front IP the TCP three-way handshake almost
-    always completes — even when DPI silently drops / resets the connection the
-    moment it sees the TLS ``ClientHello`` (the real SNI). That produced a
-    misleading green ping for a config that can never actually connect.
+    Why this exists (issues #1/#2 — *"ordinary configs: ping shows green but
+    they don't actually connect"*): neither a bare :func:`tcp_latency` nor even
+    a bare TLS handshake honestly tells you whether a config works behind a CDN.
 
-    Here we connect **and** complete a genuine TLS handshake carrying
-    *server_name* as SNI, then return the elapsed time. Certificate validation
-    is intentionally disabled (we only care that the peer spoke TLS back, so a
-    self-signed / mismatched cert still counts as "the protocol got through").
+    * A TCP three-way handshake to a Cloudflare front IP almost always succeeds.
+    * A TLS handshake (with cert validation off) *also* almost always succeeds —
+      every Cloudflare anycast IP answers TLS for **any** SNI. That is exactly
+      why the old TLS ping went green for IPs that could never carry the config
+      (the bug the user reported: clean-looking IPs that didn't work still
+      pinged green).
 
-    Returns ``None`` on any failure (connect/handshake timeout, reset, route),
-    so the result honestly reflects whether a real session could be set up —
-    matching what the user sees when V2RayTun pings the same server.
+    So we now validate what actually matters, mirroring ``core.cf_scanner`` /
+    ``MatinSenPai/SenPaiScanner``: connect, (optionally) wrap TLS with the real
+    SNI, then send a real **HTTP request to the Cloudflare edge**
+    (``/cdn-cgi/trace``) carrying the config's Host header, and require a
+    genuine edge response. For WebSocket configs we additionally require a WS
+    **upgrade** on the config's path/Host. Only then do we report a latency;
+    otherwise we return ``None`` so the ping is honestly red.
+
+    Returns elapsed-ms on success, ``None`` on any failure — so a green ping
+    now means "this endpoint really answers for this config", matching the
+    behaviour the user expects from V2RayTun.
     """
-    import ssl
+    from .cf_scanner import cf_ip_probe, ProbeSpec, OK
 
-    sni = (server_name or host or "").strip().strip("[]")
-    start = time.monotonic()
-    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    raw.settimeout(timeout)
-    try:
-        raw.connect((host, port))
-    except OSError:
-        try:
-            raw.close()
-        except OSError:
-            pass
-        return None
-    if not sni:
-        latency = (time.monotonic() - start) * 1000.0
-        try:
-            raw.close()
-        except OSError:
-            pass
-        return latency
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        tls = ctx.wrap_socket(raw, server_hostname=sni)
-        latency = (time.monotonic() - start) * 1000.0
-        try:
-            tls.close()
-        except OSError:
-            pass
-        return latency
-    except ssl.SSLError:
-        # peer answered *in TLS* (even an alert) → the protocol passed the DPI
-        # box, which is exactly what we're validating. Count it as reachable.
-        latency = (time.monotonic() - start) * 1000.0
-        try:
-            raw.close()
-        except OSError:
-            pass
-        return latency
-    except OSError:
-        # connection-level reset / drop during the handshake → not reachable.
-        try:
-            raw.close()
-        except OSError:
-            pass
-        return None
+    spec = ProbeSpec(
+        port=int(port),
+        server_name=(server_name or host or "").strip().strip("[]"),
+        host=(host_header or server_name or host or "").strip(),
+        path=path or "/",
+        is_ws=bool(is_ws),
+        is_tls=True,
+    )
+    res = cf_ip_probe(host, spec, timeout)
+    if res.outcome == OK:
+        return float(res.latency_ms)
+    return None
 
 
 def tcp_throughput(host: str, port: int,
@@ -271,6 +246,11 @@ class Target:
     real CDN SNI the spoofer fronts; for direct configs it's the host itself.
     ``tls`` marks the target as TLS-bearing so the prober knows to validate a
     real ServerHello instead of trusting a bare TCP connect (#1).
+
+    ``host_header`` / ``path`` / ``is_ws`` describe the transport so the honest
+    edge ping (#2) can send the config's real HTTP Host + (for ws) drive a real
+    WebSocket upgrade — the only way to tell a *working* edge from an anycast IP
+    that merely answers TLS.
     """
 
     label: str
@@ -278,6 +258,9 @@ class Target:
     port: int
     server_name: str = ""
     tls: bool = False
+    host_header: str = ""
+    path: str = "/"
+    is_ws: bool = False
 
 
 def target_from_profile(profile) -> Target:
@@ -298,6 +281,12 @@ def target_from_profile(profile) -> Target:
     # default SNI to validate: the explicit server name → host header → host.
     server_name = (getattr(profile, "sni", "") or getattr(profile, "host", "")
                    or host)
+    # transport details for the honest edge ping (#2): real HTTP Host header +
+    # ws path so a WebSocket config is validated with a real upgrade.
+    host_header = (getattr(profile, "host", "") or server_name or host)
+    path = (getattr(profile, "path", "") or "/")
+    transport = (getattr(profile, "transport", "") or "tcp").lower()
+    is_ws = transport in ("ws", "websocket", "httpupgrade")
     if getattr(profile, "is_spoof_config", False):
         # Spoof configs dial *our* loopback spoofer, which forwards to a fixed
         # CDN IP while injecting a **decoy** SNI to beat DPI. The honest offline
@@ -311,8 +300,15 @@ def target_from_profile(profile) -> Target:
         host = connect_ip
         port = int(connect_port)
         server_name = fake_sni
+        # the decoy SNI is also the Host the spoofer presents to DPI; a ws
+        # upgrade check would target the wrong (decoy) host, so skip it here —
+        # the edge HTTP check on the decoy SNI is the honest spoof-path test.
+        host_header = fake_sni
+        is_ws = False
     return Target(label=str(label), host=host, port=port,
-                  server_name=str(server_name or ""), tls=is_tls)
+                  server_name=str(server_name or ""), tls=is_tls,
+                  host_header=str(host_header or ""), path=str(path or "/"),
+                  is_ws=bool(is_ws))
 
 
 # ---------------------------------------------------------------------------
@@ -377,8 +373,12 @@ class PingTester:
             res.samples_sent += 1
             try:
                 if use_tls:
-                    ms = tls_latency(target.host, target.port, self.timeout,
-                                     server_name=getattr(target, "server_name", ""))
+                    ms = tls_latency(
+                        target.host, target.port, self.timeout,
+                        server_name=getattr(target, "server_name", ""),
+                        host_header=getattr(target, "host_header", ""),
+                        path=getattr(target, "path", "/"),
+                        is_ws=bool(getattr(target, "is_ws", False)))
                 else:
                     ms = self.latency_fn(target.host, target.port, self.timeout)
             except Exception as exc:  # never let one bad sample kill the run

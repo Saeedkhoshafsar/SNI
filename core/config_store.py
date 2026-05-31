@@ -185,6 +185,45 @@ class ConfigStore:
             self.selected_index -= 1
         self.save_profiles()
 
+    def remove_profiles(self, indexes) -> int:
+        """Delete several profiles at once by index (#7 bulk delete).
+
+        Accepts any iterable of indexes (duplicates / out-of-range entries are
+        ignored). The active selection is kept pointing at the *same* profile
+        when possible; if the active profile itself is deleted, the selection
+        clamps to a sane neighbour (or -1 when the list becomes empty). The
+        store is persisted once, not once per removal. Returns the number of
+        profiles actually removed.
+        """
+        valid = sorted(
+            {i for i in indexes if 0 <= i < len(self.profiles)})
+        if not valid:
+            return 0
+        # remember which underlying profile object was active so we can find it
+        # again after the list is rebuilt (its index will shift).
+        active_obj = (self.profiles[self.selected_index]
+                      if 0 <= self.selected_index < len(self.profiles)
+                      else None)
+        active_removed = self.selected_index in valid
+        # remove from the back so earlier indexes stay valid while popping
+        for i in reversed(valid):
+            self.profiles.pop(i)
+        if not self.profiles:
+            self.selected_index = -1
+        elif active_removed or active_obj is None:
+            # the previously-active profile is gone — clamp to a valid neighbour
+            self.selected_index = min(max(valid[0] - 1, 0),
+                                      len(self.profiles) - 1)
+        else:
+            # keep the same active profile selected at its new index
+            try:
+                self.selected_index = self.profiles.index(active_obj)
+            except ValueError:
+                self.selected_index = min(self.selected_index,
+                                          len(self.profiles) - 1)
+        self.save_profiles()
+        return len(valid)
+
     def select(self, index: int) -> None:
         if 0 <= index < len(self.profiles):
             self.selected_index = index

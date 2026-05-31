@@ -214,6 +214,76 @@ class BulkImportTest(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 / Qt platform unavailable")
+class MultiSelectTest(unittest.TestCase):
+    """ProfilesPage multi-select + bulk delete / copy-links (#7)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def _page_with_three(self):
+        from ui.window import ProfilesPage
+        store = ConfigStore(runtime_dir=self._tmp)
+        store.profiles = [
+            Profile(protocol="vless", address="h1.example", port=443,
+                    remark="A", uuid="11111111-1111-1111-1111-111111111111"),
+            Profile(protocol="vless", address="h2.example", port=443,
+                    remark="B", uuid="22222222-2222-2222-2222-222222222222"),
+            Profile(protocol="vless", address="h3.example", port=443,
+                    remark="C", uuid="33333333-3333-3333-3333-333333333333"),
+        ]
+        store.selected_index = 0
+        return ProfilesPage(store, engine=FakeEngine()), store
+
+    def test_row_has_independent_select_checkbox(self):
+        page, _store = self._page_with_three()
+        self.assertTrue(hasattr(page._rows[0], "chk_select"))
+        # checking the box must NOT change the active profile
+        page._rows[1].chk_select.setChecked(True)
+        self.assertEqual(page._store.selected_index, 0)
+        self.assertIn(1, page._checked)
+
+    def test_checkbox_does_not_activate(self):
+        page, store = self._page_with_three()
+        page._rows[2].chk_select.setChecked(True)
+        # selection (active server) stays put — checking is selection only
+        self.assertEqual(store.selected_index, 0)
+
+    def test_select_all_and_clear(self):
+        page, _store = self._page_with_three()
+        page._select_all()
+        self.assertEqual(page._checked, {0, 1, 2})
+        page._clear_selection()
+        self.assertEqual(page._checked, set())
+
+    def test_bulk_delete_checked(self):
+        page, store = self._page_with_three()
+        page._checked = {0, 2}
+        # bypass the confirmation dialog by calling the store method the
+        # handler delegates to, then mirror the handler's post-steps
+        removed = store.remove_profiles(page._checked)
+        page._checked = set()
+        page.refresh()
+        self.assertEqual(removed, 2)
+        self.assertEqual([p.remark for p in store.profiles], ["B"])
+        self.assertEqual(page._checked, set())
+
+    def test_bulk_copy_links_joins_with_newline(self):
+        page, store = self._page_with_three()
+        page._checked = {0, 2}
+        page._copy_selected_links()
+        from PySide6.QtGui import QGuiApplication
+        text = QGuiApplication.clipboard().text()
+        self.assertEqual(len(text.splitlines()), 2)
+
+    def test_checked_indexes_cleaned_after_external_shrink(self):
+        page, store = self._page_with_three()
+        page._checked = {0, 1, 2}
+        store.remove_profile(2)   # list now has 2 entries
+        page.refresh()            # refresh prunes stale checked indexes
+        self.assertTrue(page._checked.issubset({0, 1}))
+
+
+@unittest.skipUnless(_HAVE_QT, "PySide6 / Qt platform unavailable")
 class LanSettingsTest(unittest.TestCase):
     """SettingsPage LAN-sharing toggle (share proxy to a phone)."""
 

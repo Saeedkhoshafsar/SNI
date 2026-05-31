@@ -88,6 +88,38 @@ class TitleBarDragTest(unittest.TestCase):
         result = tb._begin_native_move()
         self.assertIsInstance(result, bool)
 
+    def test_has_maximize_button_and_signal(self):
+        """#6: the title bar exposes a maximize button + maximize_clicked."""
+        from PySide6.QtWidgets import QWidget
+        from ui.widgets import TitleBar
+        win = QWidget()
+        tb = TitleBar(win)
+        self.assertTrue(hasattr(tb, "btn_max"))
+        self.assertTrue(hasattr(tb, "maximize_clicked"))
+
+    def test_maximize_button_click_emits_signal(self):
+        """Clicking the maximize button emits maximize_clicked."""
+        from PySide6.QtWidgets import QWidget
+        from ui.widgets import TitleBar
+        win = QWidget()
+        tb = TitleBar(win)
+        fired = []
+        tb.maximize_clicked.connect(lambda: fired.append(True))
+        tb.btn_max.click()
+        self.assertEqual(fired, [True])
+
+    def test_update_max_label_swaps_glyph(self):
+        """The glyph reflects the next action (maximize vs restore)."""
+        from PySide6.QtWidgets import QWidget
+        from ui.widgets import TitleBar
+        win = QWidget()
+        tb = TitleBar(win)
+        tb.update_max_label(False)
+        normal = tb.btn_max.text()
+        tb.update_max_label(True)
+        maximized = tb.btn_max.text()
+        self.assertNotEqual(normal, maximized)
+
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 not available")
 class CardShadowTest(unittest.TestCase):

@@ -200,38 +200,53 @@ def build_config(p: Profile, *, socks_port: int = 10808,
                  http_port: int = 10809, dest_address: str | None = None,
                  dest_port: int | None = None, gaming: bool = False,
                  listen: str = "127.0.0.1",
+                 api_port: int | None = None,
                  loglevel: str = "warning") -> dict[str, Any]:
     """Assemble the full Xray config (inbounds + outbound + routing).
 
     ``listen`` is the inbound bind address: ``127.0.0.1`` (default, local only)
     or ``0.0.0.0`` to share the proxy with other devices on the LAN (e.g. a
     phone). LAN sharing is opt-in because it exposes the proxy to the network.
+
+    ``api_port`` (issue #3): when given, the config enables xray's built-in
+    **StatsService** and exposes it on a local API inbound at
+    ``127.0.0.1:<api_port>``. The engine then polls cumulative uplink/downlink
+    byte counters from there so the dashboard's *live usage* works for plain
+    (non-spoof) configs too — those run xray directly with no spoofer in the
+    path, so there was previously no traffic source and the usage card sat at
+    zero (the bug the user reported).
     """
     outbound = build_outbound(
         p, dest_address=dest_address, dest_port=dest_port, gaming=gaming)
 
-    return {
+    inbounds: list[dict[str, Any]] = [
+        {
+            "tag": "socks-in",
+            "port": socks_port,
+            "listen": listen,
+            "protocol": "socks",
+            "settings": {"auth": "noauth", "udp": True},
+            "sniffing": {
+                "enabled": not gaming,
+                "destOverride": ["http", "tls"],
+            },
+        },
+        {
+            "tag": "http-in",
+            "port": http_port,
+            "listen": listen,
+            "protocol": "http",
+            "settings": {},
+        },
+    ]
+
+    routing_rules: list[dict[str, Any]] = [
+        {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+    ]
+
+    cfg: dict[str, Any] = {
         "log": {"loglevel": loglevel},
-        "inbounds": [
-            {
-                "tag": "socks-in",
-                "port": socks_port,
-                "listen": listen,
-                "protocol": "socks",
-                "settings": {"auth": "noauth", "udp": True},
-                "sniffing": {
-                    "enabled": not gaming,
-                    "destOverride": ["http", "tls"],
-                },
-            },
-            {
-                "tag": "http-in",
-                "port": http_port,
-                "listen": listen,
-                "protocol": "http",
-                "settings": {},
-            },
-        ],
+        "inbounds": inbounds,
         "outbounds": [
             outbound,
             {"tag": "direct", "protocol": "freedom"},
@@ -239,9 +254,37 @@ def build_config(p: Profile, *, socks_port: int = 10808,
         ],
         "routing": {
             "domainStrategy": "AsIs",
-            "rules": [
-                {"type": "field", "ip": ["geoip:private"],
-                 "outboundTag": "direct"},
-            ],
+            "rules": routing_rules,
         },
     }
+
+    # --- live-usage stats API (issue #3) ---
+    # Enabling StatsService + per-inbound uplink/downlink counters lets the
+    # engine read real cumulative byte totals via ``xray api statsquery``. The
+    # API rides a dedicated dokodemo-door inbound bound to loopback only.
+    if api_port is not None and 0 < int(api_port) < 65536:
+        inbounds.append({
+            "tag": "api-in",
+            "port": int(api_port),
+            "listen": "127.0.0.1",
+            "protocol": "dokodemo-door",
+            "settings": {"address": "127.0.0.1"},
+        })
+        cfg["api"] = {"tag": "api", "services": ["StatsService"]}
+        cfg["stats"] = {}
+        cfg["policy"] = {
+            "system": {
+                "statsInboundUplink": True,
+                "statsInboundDownlink": True,
+                "statsOutboundUplink": True,
+                "statsOutboundDownlink": True,
+            }
+        }
+        # route the API inbound to the api outbound (handled internally by xray)
+        routing_rules.insert(0, {
+            "type": "field",
+            "inboundTag": ["api-in"],
+            "outboundTag": "api",
+        })
+
+    return cfg
