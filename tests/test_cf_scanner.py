@@ -47,8 +47,13 @@ def test_pool_count_capped_to_available():
 #  scanning
 # ---------------------------------------------------------------------------
 
-def _even_clean(ip, port, sni, timeout):
-    """Fake probe: even last octet → clean (latency = last octet)."""
+def _even_clean(ip, spec, timeout):
+    """Fake probe (new ``(ip, spec, timeout)`` signature): even octet → clean.
+
+    Mirrors the real :func:`cf_ip_probe` interface — it receives a
+    :class:`ProbeSpec` rather than a bare ``(port, sni)`` pair — so the tests
+    exercise exactly the contract the scanner now uses.
+    """
     last = int(ip.split(".")[-1])
     if last % 2 == 0:
         return IPResult(ip, OK, latency_ms=float(last))
@@ -92,10 +97,10 @@ def test_scan_on_result_streams_hits():
 
 
 def test_scan_bad_probe_never_aborts():
-    def boom(ip, port, sni, timeout):
+    def boom(ip, spec, timeout):
         if ip.endswith(".3"):
             raise RuntimeError("kaboom")
-        return _even_clean(ip, port, sni, timeout)
+        return _even_clean(ip, spec, timeout)
     sc = CFScanner(probe_fn=boom)
     rep = sc.scan(ScanConfig(port=443, server_name="x"),
                   ips=["1.1.1.2", "1.1.1.3", "1.1.1.4"])
@@ -129,6 +134,30 @@ def test_scan_config_from_profile_uses_port_and_sni():
     assert cfg.server_name == "my.sni.dev"
     assert cfg.timeout == 2.0
     assert cfg.concurrency == 10
+
+
+def test_scan_config_from_profile_detects_ws_and_path():
+    """A ws config must produce a WS-validating, path-carrying ScanConfig (#1)."""
+    p = Profile(protocol="vless", address="1.2.3.4", port=8443,
+                security="tls", sni="my.sni.dev", host="h.dev",
+                transport="ws", path="/stars/abc")
+    cfg = scan_config_from_profile(p)
+    assert cfg.is_ws is True
+    assert cfg.is_tls is True
+    assert cfg.host == "h.dev"
+    assert cfg.path == "/stars/abc"
+    spec = cfg.to_spec()
+    assert spec.is_ws is True
+    assert spec.path == "/stars/abc"
+    assert spec.host == "h.dev"
+
+
+def test_scan_config_non_ws_transport_is_not_ws():
+    p = Profile(protocol="trojan", address="1.2.3.4", port=443,
+                security="tls", sni="x.dev", transport="grpc",
+                service_name="gsvc")
+    cfg = scan_config_from_profile(p)
+    assert cfg.is_ws is False
 
 
 def test_profile_with_ip_swaps_only_address_and_roundtrips():

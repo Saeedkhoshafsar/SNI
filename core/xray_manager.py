@@ -59,6 +59,34 @@ def lan_ip_address() -> str:
             pass
 
 
+def parse_stats_json(text: str) -> tuple[int, int] | None:
+    """Parse ``xray api statsquery`` JSON → ``(uplink_bytes, downlink_bytes)``.
+
+    Sums every per-inbound uplink/downlink counter (names look like
+    ``inbound>>>socks-in>>>traffic>>>uplink``). Returns ``None`` for empty /
+    invalid output so the poller can skip the tick. Pure & side-effect-free so
+    it's unit-testable without spawning xray (issue #3).
+    """
+    if not text or not text.strip():
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    up = down = 0
+    for stat in (data.get("stat") or []):
+        name = str(stat.get("name", ""))
+        try:
+            val = int(stat.get("value", 0) or 0)
+        except (TypeError, ValueError):
+            val = 0
+        if name.endswith(">>>uplink") and "inbound>>>" in name:
+            up += val
+        elif name.endswith(">>>downlink") and "inbound>>>" in name:
+            down += val
+    return up, down
+
+
 class XrayManager:
     """Runs Xray-core for a given profile, optionally chained behind a spoofer."""
 
@@ -70,6 +98,7 @@ class XrayManager:
         spoof_port: int | None = None,
         gaming_mode: bool = False,
         listen: str = "127.0.0.1",
+        api_port: int | None = None,
     ):
         self.profile = profile
         self.socks_port = socks_port
@@ -79,6 +108,9 @@ class XrayManager:
         self.gaming_mode = gaming_mode
         # inbound bind address: 0.0.0.0 shares the proxy with LAN devices
         self.listen = listen
+        # local StatsService API port for live-usage polling (issue #3); when
+        # None the stats API is not enabled.
+        self.api_port = api_port
 
         self.xray_exe = os.path.join(get_bin_dir(), "xray.exe")
         self.config_path = os.path.join(get_runtime_dir(), "xray_config.json")
@@ -129,6 +161,7 @@ class XrayManager:
             dest_port=dest_port,
             gaming=self.gaming_mode,
             listen=self.listen,
+            api_port=self.api_port,
         )
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         with open(self.config_path, "w", encoding="utf-8") as fp:
@@ -223,6 +256,38 @@ class XrayManager:
                     self._log(f"[xray] {line}")
         except Exception:
             pass
+
+    def query_stats(self) -> tuple[int, int] | None:
+        """Return cumulative ``(uplink_bytes, downlink_bytes)`` from xray (#3).
+
+        Sums the per-inbound uplink/downlink counters exposed by xray's
+        StatsService via ``xray api statsquery``. Returns ``None`` when the
+        stats API isn't enabled, xray isn't running, or the query fails — the
+        caller then simply skips that poll tick (fail-soft).
+
+        We deliberately use the bundled ``xray.exe api`` sub-command (a thin
+        gRPC client) instead of pulling in a gRPC dependency: it needs nothing
+        beyond the binary we already ship.
+        """
+        if self.api_port is None or not self.is_running or not self.is_available:
+            return None
+        try:
+            kwargs: dict = {}
+            if sys.platform == "win32":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = subprocess.SW_HIDE
+                kwargs["startupinfo"] = si
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            out = subprocess.run(
+                [self.xray_exe, "api", "statsquery",
+                 f"--server=127.0.0.1:{self.api_port}", ""],
+                capture_output=True, timeout=4, **kwargs,
+            )
+            text = out.stdout.decode("utf-8", "replace") if out.stdout else ""
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return None
+        return parse_stats_json(text)
 
     def stop(self):
         if self._process:

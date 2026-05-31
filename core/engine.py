@@ -26,6 +26,7 @@ the tool remains useful without a share link.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Callable, Optional
 
 from core.profile import Profile
@@ -74,6 +75,9 @@ class EngineController:
         # in diagnostics even when the resilience baseline isn't built yet (#4)
         self._live_up_bps = 0.0
         self._live_down_bps = 0.0
+        # live-usage poller for plain (xray-direct) configs (#3)
+        self._stats_thread: Optional[threading.Thread] = None
+        self._stats_stop = threading.Event()
 
         # Injectable factory so the OS-proxy lifecycle is testable without
         # touching the real Windows registry. Tests swap this for a fake;
@@ -461,13 +465,18 @@ class EngineController:
         portal is unnecessary now that we ship a full xray core).
         """
         assert self.profile is not None
-        from core.xray_manager import XrayManager
+        from core.xray_manager import XrayManager, find_free_port
 
         # the configured strategy is what the UI shows even though no spoofer
         # is mangling packets (direct tunnel = no DPI bypass on the outer conn)
         self._emit_strategy(str(self.config.get("bypass_method", "wrong_seq")))
 
         allow_lan = bool(self.config.get("allow_lan", False))
+        # allocate a loopback API port so xray's StatsService can report live
+        # uplink/downlink — this is what makes the dashboard's "live usage" work
+        # for plain configs (issue #3); without a spoofer in the path there was
+        # no traffic source before and the usage card stayed at zero.
+        api_port = find_free_port()
         self._xray = XrayManager(
             self.profile,
             socks_port=int(self.config.get("socks_port", 10808)),
@@ -475,6 +484,7 @@ class EngineController:
             spoof_port=None,                 # direct — no spoofer chaining
             gaming_mode=bool(self.config.get("gaming_mode", False)),
             listen="0.0.0.0" if allow_lan else "127.0.0.1",
+            api_port=api_port,
         )
         self._xray.on_log = self._log
         self._log(
@@ -490,6 +500,54 @@ class EngineController:
         self._maybe_enable_system_proxy(True)
         self._set_status(STATUS_ACTIVE)
         self._log("✓ اتصال برقرار شد")
+        # spin up the live-usage poller (issue #3): reads xray's cumulative
+        # byte counters and turns them into the dashboard's traffic graph.
+        self._start_stats_poller()
+
+    def _start_stats_poller(self) -> None:
+        """Poll xray's StatsService and emit live traffic for plain configs (#3).
+
+        Runs on a daemon thread. Each tick reads cumulative uplink/downlink byte
+        totals from xray, derives the instantaneous rate (Δbytes / Δt) and fires
+        :meth:`_emit_traffic` — exactly the signal the dashboard's live-usage
+        card and the status-bar rate already consume from the spoofer path. This
+        closes the gap where direct (non-spoof) configs showed zero usage.
+        """
+        if self._xray is None or getattr(self._xray, "api_port", None) is None:
+            return
+        self._stats_stop.clear()
+
+        def _run():
+            prev_up = prev_down = 0
+            prev_t = time.monotonic()
+            first = True
+            while not self._stats_stop.wait(1.0):
+                xray = self._xray
+                if xray is None or not getattr(xray, "is_running", False):
+                    break
+                stats = None
+                try:
+                    stats = xray.query_stats()
+                except Exception:
+                    stats = None
+                if stats is None:
+                    continue
+                up, down = stats
+                now = time.monotonic()
+                dt = max(now - prev_t, 1e-3)
+                if first:
+                    # first reading establishes the baseline; no rate yet
+                    prev_up, prev_down, prev_t = up, down, now
+                    first = False
+                    self._emit_traffic(up, down, 0.0, 0.0)
+                    continue
+                up_bps = max(0.0, (up - prev_up) / dt)
+                down_bps = max(0.0, (down - prev_down) / dt)
+                prev_up, prev_down, prev_t = up, down, now
+                self._emit_traffic(up, down, up_bps, down_bps)
+
+        self._stats_thread = threading.Thread(target=_run, daemon=True)
+        self._stats_thread.start()
 
     def _do_start(self) -> None:
         use_core = self.uses_core
@@ -760,6 +818,8 @@ class EngineController:
 
     def stop(self) -> None:
         """Stop xray then the spoofer; safe to call when already stopped."""
+        # signal the live-usage poller to exit before we drop the xray handle
+        self._stats_stop.set()
         with self._lock:
             xray, proxy = self._xray, self._proxy
             sysproxy = self._system_proxy

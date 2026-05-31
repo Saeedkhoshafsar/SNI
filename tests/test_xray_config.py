@@ -317,6 +317,57 @@ def test_spoof_config_xray_dials_local_spoofer_with_real_sni():
     assert ss["xhttpSettings"]["path"] == "/vless-xhttp"
 
 
+def test_parse_stats_json_sums_inbound_counters():
+    """parse_stats_json sums per-inbound uplink/downlink → (up, down) (#3)."""
+    from core.xray_manager import parse_stats_json
+    payload = json.dumps({"stat": [
+        {"name": "inbound>>>socks-in>>>traffic>>>uplink", "value": 100},
+        {"name": "inbound>>>socks-in>>>traffic>>>downlink", "value": 900},
+        {"name": "inbound>>>http-in>>>traffic>>>uplink", "value": 50},
+        {"name": "inbound>>>http-in>>>traffic>>>downlink", "value": 200},
+        # outbound counters must NOT be summed into the inbound totals
+        {"name": "outbound>>>proxy>>>traffic>>>uplink", "value": 7777},
+    ]})
+    assert parse_stats_json(payload) == (150, 1100)
+
+
+def test_parse_stats_json_handles_empty_and_garbage():
+    from core.xray_manager import parse_stats_json
+    assert parse_stats_json("") is None
+    assert parse_stats_json("   ") is None
+    assert parse_stats_json("not json{") is None
+    # a valid-but-empty stat block → zero totals
+    assert parse_stats_json('{"stat": []}') == (0, 0)
+
+
+def test_no_stats_api_by_default():
+    """Without an api_port the config has no stats/api blocks (unchanged path)."""
+    p = _vless_ws_tls()
+    cfg = build_config(p, socks_port=10808, http_port=10809)
+    assert "api" not in cfg
+    assert "stats" not in cfg
+    assert all(ib.get("tag") != "api-in" for ib in cfg["inbounds"])
+
+
+def test_stats_api_enabled_with_api_port():
+    """An api_port wires StatsService + a loopback API inbound (#3 live usage)."""
+    p = _vless_ws_tls()
+    cfg = build_config(p, socks_port=10808, http_port=10809, api_port=10810)
+    assert cfg["api"]["services"] == ["StatsService"]
+    assert cfg["stats"] == {}
+    assert cfg["policy"]["system"]["statsInboundUplink"] is True
+    assert cfg["policy"]["system"]["statsInboundDownlink"] is True
+    api_in = [ib for ib in cfg["inbounds"] if ib.get("tag") == "api-in"]
+    assert len(api_in) == 1
+    assert api_in[0]["port"] == 10810
+    assert api_in[0]["listen"] == "127.0.0.1"
+    assert api_in[0]["protocol"] == "dokodemo-door"
+    # the api inbound is routed to the api outbound
+    rules = cfg["routing"]["rules"]
+    assert any(r.get("inboundTag") == ["api-in"]
+               and r.get("outboundTag") == "api" for r in rules)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

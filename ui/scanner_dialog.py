@@ -1,9 +1,12 @@
 """Cloudflare clean-IP scanner dialog (issue #3).
 
 Opened from a profile row's 🔍 button. It takes that profile as the *reference*
-config, sweeps a pool of Cloudflare edge IPs (validating a real TLS handshake
-with the config's SNI on the config's port), and streams the clean IPs into a
-checkable list. The user then:
+config, sweeps a pool of Cloudflare edge IPs and — mirroring
+``MatinSenPai/SenPaiScanner`` — validates each one with a **real HTTP edge
+check** (``/cdn-cgi/trace``) plus, for WebSocket configs, a **WS upgrade** on
+the config's Host + path. Only IPs that pass these honest checks are streamed
+into the checkable list (a bare TLS handshake is *not* enough — that produced
+the dozens of bogus "clean" IPs the user saw appear in seconds). The user then:
 
   * picks one / several / all clean IPs, and
   * clicks **افزودن** → the dialog builds new profiles identical to the
@@ -86,11 +89,17 @@ class ScannerDialog(QDialog):
         sni = (getattr(profile, "sni", "") or getattr(profile, "host", "")
                or getattr(profile, "address", ""))
         port = int(getattr(profile, "port", 443) or 443)
+        transport = (getattr(profile, "transport", "") or "tcp").lower()
+        is_ws = transport in ("ws", "websocket", "httpupgrade")
+        ws_note = (tr("  ·  بررسی WebSocket روی مسیر کانفیگ فعال است")
+                   if is_ws else "")
         head = QLabel(tr(
             "اسکن IPهای تمیز کلودفلر با کانفیگ مرجع: «{name}»\n"
-            "IPهایی که با این کانفیگ (SNI: {sni}، پورت: {port}) دست‌دادن TLS "
-            "موفق بدهند، تمیز شمرده می‌شوند.").format(
-                name=name, sni=sni or "—", port=port))
+            "هر IP با یک درخواست واقعی HTTP به لبهٔ کلودفلر (و برای کانفیگ‌های "
+            "WebSocket، یک upgrade واقعی) اعتبارسنجی می‌شود — فقط IPهایی که "
+            "واقعاً برای این کانفیگ (SNI: {sni}، پورت: {port}) کار می‌کنند "
+            "تمیز شمرده می‌شوند.{ws}").format(
+                name=name, sni=sni or "—", port=port, ws=ws_note))
         head.setObjectName("Muted")
         head.setWordWrap(True)
         root.addWidget(head)

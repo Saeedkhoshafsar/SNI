@@ -89,6 +89,48 @@ class ConfigStoreTest(unittest.TestCase):
         self.assertEqual(n, 2)
         self.assertEqual(self.store.add_profiles([]), 0)
 
+    # -- bulk delete (#7) ----------------------------------------------
+
+    def test_remove_profiles_bulk(self):
+        self.store.add_profiles(
+            [_profile("a"), _profile("b"), _profile("c"), _profile("d")])
+        removed = self.store.remove_profiles([0, 2])  # drop "a" and "c"
+        self.assertEqual(removed, 2)
+        self.assertEqual([p.remark for p in self.store.profiles], ["b", "d"])
+
+    def test_remove_profiles_keeps_active_profile(self):
+        self.store.add_profiles(
+            [_profile("a"), _profile("b"), _profile("c"), _profile("d")])
+        self.store.select(3)            # "d" is active
+        self.store.remove_profiles([0, 1])  # drop "a","b" → "d" shifts to 1
+        self.assertEqual(self.store.selected_profile.remark, "d")
+        self.assertEqual(self.store.selected_index, 1)
+
+    def test_remove_profiles_active_removed_clamps(self):
+        self.store.add_profiles([_profile("a"), _profile("b"), _profile("c")])
+        self.store.select(2)            # "c" is active
+        self.store.remove_profiles([2])  # delete the active one
+        self.assertEqual(self.store.selected_index, 1)
+        self.assertEqual(self.store.selected_profile.remark, "b")
+
+    def test_remove_profiles_ignores_bad_indexes(self):
+        self.store.add_profiles([_profile("a"), _profile("b")])
+        # out-of-range and duplicate indexes are ignored
+        removed = self.store.remove_profiles([5, 5, -1, 0, 0])
+        self.assertEqual(removed, 1)
+        self.assertEqual([p.remark for p in self.store.profiles], ["b"])
+
+    def test_remove_profiles_empty(self):
+        self.store.add_profile(_profile("a"))
+        self.assertEqual(self.store.remove_profiles([]), 0)
+        self.assertEqual(len(self.store.profiles), 1)
+
+    def test_remove_profiles_all(self):
+        self.store.add_profiles([_profile("a"), _profile("b")])
+        self.store.remove_profiles([0, 1])
+        self.assertEqual(self.store.selected_index, -1)
+        self.assertIsNone(self.store.selected_profile)
+
 
 if __name__ == "__main__":
     unittest.main()
