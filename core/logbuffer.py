@@ -21,6 +21,45 @@ from typing import Iterable, Optional
 # the four levels, ordered by severity (used for the filter dropdown)
 LEVELS = ("info", "ok", "warn", "err")
 
+# log SOURCES (issue #4) — which subsystem produced a line. The engine tags
+# each line with a leading ``[tag]`` (see core.engine), so a line about
+# WinDivert / "run as Administrator" is attributed to the SNI spoofer and never
+# confused with an ordinary xray-core config line.
+SOURCES = ("engine", "spoof", "core")
+
+# map the Persian leading tags produced by core.engine onto a source key.
+_SOURCE_ALIASES = {
+    "موتور": "engine",
+    "engine": "engine",
+    "اسپوف sni": "spoof",
+    "اسپوف": "spoof",
+    "spoof": "spoof",
+    "sni spoof": "spoof",
+    "هسته xray": "core",
+    "هسته": "core",
+    "xray": "core",
+    "core": "core",
+    "xray core": "core",
+}
+
+
+def classify_source(message: str) -> str:
+    """Infer the log source from a leading ``[tag]`` prefix (pure, issue #4).
+
+    Lines look like ``[اسپوف SNI] …`` / ``[هسته xray] …`` / ``[موتور] …``.
+    Anything without a recognised tag defaults to ``"engine"``.
+    """
+    if not message:
+        return "engine"
+    msg = message.lstrip()
+    if not msg.startswith("["):
+        return "engine"
+    end = msg.find("]")
+    if end <= 1:
+        return "engine"
+    tag = msg[1:end].strip().lower()
+    return _SOURCE_ALIASES.get(tag, "engine")
+
 # Persian/English keyword hints used to colour a plain log line.
 _ERR_HINTS = ("خطا", "ناموفق", "شکست", "نامعتبر", "error", "failed", "fail",
               "exception", "✗", "❌")
@@ -52,6 +91,7 @@ def classify(message: str) -> str:
 class LogEntry:
     message: str
     level: str = "info"
+    source: str = "engine"
     ts: float = field(default_factory=time.time)
 
     @property
@@ -64,13 +104,17 @@ class LogEntry:
         return f"[{self.stamp}] {self.level.upper():<4} {self.message}"
 
 
-def matches(entry: LogEntry, *, level: str = "all", query: str = "") -> bool:
-    """Return True if *entry* passes the level filter and text query (pure).
+def matches(entry: LogEntry, *, level: str = "all", query: str = "",
+            source: str = "all") -> bool:
+    """Return True if *entry* passes the level + source filters and query (pure).
 
     *level* — ``"all"`` or one of :data:`LEVELS`.
+    *source* — ``"all"`` or one of :data:`SOURCES` (issue #4).
     *query* — case-insensitive substring; empty matches everything.
     """
     if level and level != "all" and entry.level != level:
+        return False
+    if source and source != "all" and entry.source != source:
         return False
     q = (query or "").strip().lower()
     if q and q not in entry.message.lower():
@@ -100,7 +144,8 @@ class LogBuffer:
 
     def add(self, message: str, level: Optional[str] = None) -> LogEntry:
         lv = level if level in LEVELS else classify(message)
-        entry = LogEntry(message=message, level=lv)
+        src = classify_source(message)
+        entry = LogEntry(message=message, level=lv, source=src)
         self._entries.append(entry)
         self.counts[lv] = self.counts.get(lv, 0) + 1
         # evict oldest while over capacity, decrementing its counter
@@ -113,10 +158,11 @@ class LogBuffer:
         self._entries.clear()
         self.counts = {lv: 0 for lv in LEVELS}
 
-    def filtered(self, *, level: str = "all", query: str = "") -> list[LogEntry]:
-        """Entries passing the level filter + text query, in order (pure)."""
+    def filtered(self, *, level: str = "all", query: str = "",
+                 source: str = "all") -> list[LogEntry]:
+        """Entries passing the level + source filters + text query (pure)."""
         return [e for e in self._entries
-                if matches(e, level=level, query=query)]
+                if matches(e, level=level, query=query, source=source)]
 
     def counts_summary(self) -> str:
         """Compact counter string, e.g. ``info 12 · ok 3 · warn 1 · err 0``."""

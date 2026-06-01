@@ -31,6 +31,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "CONNECT_IP": "104.19.229.21",
     "CONNECT_PORT": 443,
     "FAKE_SNI": "www.hcaptcha.com",
+    # SNI ↔ connect-IP pairs (issue #3): when the user picks a fake SNI that has
+    # a saved pairing, the matching connect IP auto-fills. Seeded with a couple
+    # of known-good Cloudflare front IPs so it works out of the box.
+    "sni_ip_pairs": [
+        {"sni": "www.hcaptcha.com", "ip": "104.19.229.21"},
+        {"sni": "www.speedtest.net", "ip": "104.19.229.21"},
+    ],
     "socks_port": 10808,
     "http_port": 10809,
     "allow_lan": False,           # bind socks/http on 0.0.0.0 so LAN devices (phone) can use it

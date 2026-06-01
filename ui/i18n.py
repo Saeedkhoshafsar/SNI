@@ -162,6 +162,19 @@ _EN: dict[str, str] = {
     "انصراف": "Cancel",
     "افزودن": "Add",
     "ذخیره": "Save",
+    # --- SNI ↔ IP pair manager (issue #3) ---
+    "افزودن جفت SNI/IP": "Add SNI/IP pair",
+    "حذف این جفت": "Remove this pair",
+    "{n} جفت ذخیره‌شده": "{n} saved pairs",
+    "هر SNI جعلی را با IP اتصالی که با آن کار می‌کند ذخیره کنید؛ "
+    "وقتی همان SNI را انتخاب کنید، IP جفت‌شده‌اش خودکار پر می‌شود.":
+        "Save each fake SNI with the connect IP that works with it; "
+        "selecting that SNI again auto-fills its paired IP.",
+    "برای افزودن جفت، هم SNI جعلی و هم IP اتصال را پر کنید.":
+        "To add a pair, fill in both the fake SNI and the connect IP.",
+    "جفت ذخیره شد: «{sni}» ← {ip}": "Pair saved: \u201c{sni}\u201d \u2190 {ip}",
+    "برای این SNI جفتی ذخیره نشده است.": "No pair saved for this SNI.",
+    "جفت «{sni}» حذف شد.": "Pair \u201c{sni}\u201d removed.",
     "localhost": "localhost",
     "محلی (127.0.0.1)": "Local (127.0.0.1)",
     "آدرس/پورت محلی پر شد": "Filled local address/port",
@@ -243,6 +256,12 @@ _EN: dict[str, str] = {
     "همه": "All",
     "پاک‌سازی": "Clear",
     "سطح": "Level",
+    # --- log source filter (issue #4) ---
+    "منبع": "Source",
+    "همه‌ی منابع": "All sources",
+    "موتور": "Engine",
+    "اسپوف SNI": "SNI Spoof",
+    "هسته xray": "xray Core",
     "SNI Spoofer UI بارگذاری شد": "SNI Spoofer UI loaded",
     # --- profile row ---
     "● فعال": "● ACTIVE",
