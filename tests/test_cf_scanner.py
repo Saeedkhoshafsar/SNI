@@ -9,6 +9,8 @@ import os
 import random
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.cf_scanner import (
@@ -366,6 +368,78 @@ def test_ws_relay_relaxed_accepts_plain_cf_edge_response():
                                      relaxed=False)
     assert relaxed_ok is True       # relay revalidation accepts a live edge
     assert strict_ok is False       # strict mode still requires 101 / cf 4xx
+
+
+def test_probe_latency_is_connect_rtt_not_cumulative_stages():
+    """Bug 2: a ws / relay config reported 2000-5000ms because the latency was
+    measured from the start of the probe through *every* validation stage
+    (TCP connect + TLS + trace + WS upgrade + relay-root retry — up to three
+    serial handshakes). The honest latency is the TCP connect RTT to the edge;
+    the later stages are pass/fail checks, not part of the network round-trip.
+
+    We drive the real :func:`cf_ip_probe` with a fake clock so the connect takes
+    40ms but the validation stages burn another ~5000ms, and assert the reported
+    ``latency_ms`` reflects the 40ms connect — not the 5000ms total.
+    """
+    import core.cf_scanner as cf
+    from core.cf_scanner import ProbeSpec, OK as _OK
+
+    # fake monotonic clock: advances a lot during the validation stages
+    ticks = iter([
+        0.000,   # start
+        0.040,   # right after TCP connect  -> connect_ms == 40ms
+        5.040,   # success return (after trace + ws + relay retry burned 5s)
+        5.041, 5.042, 5.043,  # spare reads, just in case
+    ])
+    last = {"v": 5.043}
+
+    def fake_monotonic():
+        try:
+            last["v"] = next(ticks)
+        except StopIteration:
+            pass
+        return last["v"]
+
+    class _Sock:
+        def close(self):
+            pass
+
+    class _Ctx:
+        check_hostname = True
+        verify_mode = None
+        def wrap_socket(self, sock, server_hostname=""):
+            return sock
+
+    import ssl as ssl_mod
+    real_ctx = ssl_mod.create_default_context
+    real_open = cf._open_socket
+    real_trace = cf._http_trace_ok
+    real_ws = cf._ws_upgrade_ok
+    real_mono = cf.time.monotonic
+    ssl_mod.create_default_context = lambda: _Ctx()
+    cf._open_socket = lambda ip, port, timeout: _Sock()
+    cf._http_trace_ok = lambda stream, host, timeout: (True, "cf edge ok")
+    cf._ws_upgrade_ok = lambda stream, host, path, timeout, relaxed=False: (
+        True, "ws upgrade 101")
+    cf.time.monotonic = fake_monotonic
+    try:
+        spec = ProbeSpec(
+            port=8443, server_name="hammm2.pages.dev", host="hammm2.pages.dev",
+            path="/stars/http://PQ3YjMsJql:fCfJXXbDcw@vps.webtun.xyz:2087",
+            is_ws=True, is_tls=True)
+        res = cf.cf_ip_probe("104.18.151.71", spec, 6.0)
+    finally:
+        ssl_mod.create_default_context = real_ctx
+        cf._open_socket = real_open
+        cf._http_trace_ok = real_trace
+        cf._ws_upgrade_ok = real_ws
+        cf.time.monotonic = real_mono
+
+    assert res.outcome == _OK, res.detail
+    # the reported latency is the ~40ms connect RTT, NOT the ~5040ms cumulative
+    assert res.latency_ms == pytest.approx(40.0, abs=1.0), res.latency_ms
+    assert res.latency_ms < 1000.0, (
+        "latency must reflect the connect RTT, not the multi-stage total")
 
 
 if __name__ == "__main__":  # pragma: no cover
