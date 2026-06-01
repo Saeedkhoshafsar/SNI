@@ -126,26 +126,59 @@ class LivePingTest(unittest.TestCase):
         self.assertIn("55002", captured["proxy"]["http"])
         self.assertNotIn("10809", captured["proxy"]["http"])
 
-    def test_offline_spoof_strategy_failure_does_not_force_red(self):
-        """An offline strategy probe that can't connect must NOT, by itself,
-        mark a (reachable) spoof config as dead — its real SNI is DPI-blocked
-        offline by design, so we report a tentative estimate instead of red.
+    def test_offline_spoof_config_refuses_to_fake_a_number(self):
+        """A spoof config that is NOT the active one must not be given a fake
+        latency offline — a raw connect to its Cloudflare anycast IP answers for
+        anything, which is exactly the meaningless ping the user kept seeing.
 
-        This is the inline-worker contract; we exercise the decision logic the
-        worker uses (reachable transport + failed strategy ⇒ info/tentative,
-        not err).
+        The inline worker emits an informational "activate to ping" hint instead
+        of a green/red number. We exercise the worker end-to-end with a fake
+        engine to assert that contract.
         """
-        # mimic the worker's branch logic
-        reachable = True
-        any_connected = False
-        # the rule: reachable but unproven offline → "info" (tentative), not err
-        if not reachable:
-            kind = "err"
-        elif any_connected:
-            kind = "ok"
-        else:
-            kind = "info"
-        self.assertEqual(kind, "info")
+        from ui.window import InlinePingWorker
+
+        class _SpoofProfile:
+            is_spoof_config = True
+            address = "127.0.0.1"
+            port = 40443
+
+        captured = {}
+
+        class _Eng:
+            def is_active_profile(self, *_a):
+                return False
+            def live_proxy_ping(self, *_a, **_k):
+                return (False, None, "idle")
+            def ping_profile(self, *_a):
+                raise AssertionError("must NOT raw-ping a spoof config offline")
+            def probe_strategies_for(self, *_a, **_k):
+                raise AssertionError("must NOT probe a spoof config offline")
+
+        w = InlinePingWorker(_Eng(), _SpoofProfile())
+        w.result.connect(lambda t, k: captured.update(text=t, kind=k))
+        w._run_inner()
+        self.assertEqual(captured.get("kind"), "info")
+        self.assertNotIn("ms", captured.get("text", ""))
+
+    def test_active_config_uses_live_tunnel_ping(self):
+        """When the profile IS the running config, the worker reports the live
+        tunnel latency (🛡) — the only fully trustworthy measurement."""
+        from ui.window import InlinePingWorker
+        from core.profile import Profile
+
+        captured = {}
+
+        class _Eng:
+            def is_active_profile(self, *_a):
+                return True
+            def live_proxy_ping(self, *_a, **_k):
+                return (True, 87.0, "http 204")
+
+        w = InlinePingWorker(_Eng(), Profile(address="x", port=1))
+        w.result.connect(lambda t, k: captured.update(text=t, kind=k))
+        w._run_inner()
+        self.assertEqual(captured.get("kind"), "ok")
+        self.assertIn("87", captured.get("text", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +302,178 @@ class _FakeEngine:
 
     def probe_strategies_for(self, *_a, **_k):
         return None
+
+
+# ---------------------------------------------------------------------------
+#  Round 3, Bug 1 — never get stuck on "connecting"; Stop always works
+# ---------------------------------------------------------------------------
+
+class _RestartEngine:
+    """Engine stub for restart-recovery tests; records start/stop calls."""
+
+    def __init__(self):
+        self.started = 0
+        self.stopped = 0
+        self._running = False
+        self.status_value = "idle"
+
+    @property
+    def is_running(self):
+        return self._running
+
+    def stop(self):
+        self.stopped += 1
+        self._running = False
+
+    def start(self):
+        self.started += 1
+
+
+def _bare_window():
+    """Build a MainWindow-like shell without the full Qt window.
+
+    We only need the restart-state methods, so we bind them to a lightweight
+    object that carries the same attributes. This keeps the test fast and free
+    of a real engine/event-loop while exercising the exact logic.
+    """
+    from ui.window import MainWindow
+
+    class _Page:
+        def set_status(self, *_a):
+            pass
+    obj = MainWindow.__new__(MainWindow)
+    obj.engine = _RestartEngine()
+    obj.page_dashboard = _Page()
+    obj.active_bar = _Page()
+    obj._restarting = False
+    obj._restart_gen = 0
+    obj._restart_started = False
+    obj._restart_attempts = 0
+
+    class _Log:
+        def append(self, *_a):
+            pass
+    obj.page_log = _Log()
+    return obj
+
+
+class RestartRecoveryTest(unittest.TestCase):
+    def setUp(self):
+        from PySide6.QtWidgets import QApplication
+        self.app = QApplication.instance() or QApplication([])
+
+    def test_cancel_restart_clears_mask_and_bumps_generation(self):
+        w = _bare_window()
+        w._restarting = True
+        g0 = w._restart_gen
+        w._cancel_restart()
+        self.assertFalse(w._restarting)
+        self.assertGreater(w._restart_gen, g0)
+        # a stale poll from the old generation must be a no-op (not start)
+        w.engine._running = False
+        w._restart_when_idle(g0)
+        self.assertEqual(w.engine.started, 0)
+
+    def test_watchdog_drops_mask_when_connect_never_completes(self):
+        import ui.window as win
+        w = _bare_window()
+        w._restarting = True
+        gen = w._restart_gen
+        w.engine.status_value = "idle"
+        # the watchdog pops a Toast which needs a real widget parent; stub it.
+        orig = win.Toast.show_message
+        win.Toast.show_message = staticmethod(lambda *a, **k: None)
+        try:
+            w._restart_watchdog(gen)  # engine never reached 'active'
+        finally:
+            win.Toast.show_message = orig
+        self.assertFalse(w._restarting)
+
+    def test_watchdog_noop_if_already_active(self):
+        w = _bare_window()
+        w._restarting = False  # mask already dropped (active reached)
+        w._restart_watchdog(w._restart_gen)
+        self.assertFalse(w._restarting)
+
+    def test_dispatch_status_unmasks_on_failed_start(self):
+        """Once the new start has fired, an incoming idle/error means the new
+        config failed → drop the mask so the user isn't trapped."""
+        from ui.window import MainWindow
+        w = _bare_window()
+        w._restarting = True
+        w._restart_started = True  # the new start() already fired
+
+        # call the real _dispatch_status with a stubbed _on_status
+        w._on_status = lambda *_a: None
+        MainWindow._dispatch_status(w, "idle")
+        self.assertFalse(w._restarting)
+
+    def test_dispatch_status_keeps_mask_during_teardown(self):
+        from ui.window import MainWindow
+        w = _bare_window()
+        w._restarting = True
+        w._restart_started = False  # still tearing the old session down
+        shown = {}
+
+        class _P:
+            def set_status(self, s):
+                shown["v"] = s
+        w.page_dashboard = _P()
+        w.active_bar = _P()
+        w._on_status = lambda *_a: None
+        MainWindow._dispatch_status(w, "idle")
+        self.assertTrue(w._restarting)        # mask kept
+        self.assertEqual(shown.get("v"), "connecting")
+
+
+# ---------------------------------------------------------------------------
+#  Round 3, Bug 3 — ping results persist across refresh() until re-pinged
+# ---------------------------------------------------------------------------
+
+class PingResultPersistenceTest(unittest.TestCase):
+    def setUp(self):
+        from PySide6.QtWidgets import QApplication
+        self.app = QApplication.instance() or QApplication([])
+
+    def _page(self, n=5):
+        from ui.window import ProfilesPage
+        from core.profile import Profile
+        profs = [Profile(address=f"h{i}.com", port=443, uuid=f"u{i}")
+                 for i in range(n)]
+
+        class _Store:
+            profiles = profs
+            config = {}
+            selected_index = -1
+        return ProfilesPage(_Store(), engine=_FakeEngine())
+
+    def test_result_cached_and_reapplied_after_refresh(self):
+        page = self._page()
+        prof = page._store.profiles[2]
+        key = page._profile_key(prof)
+        # simulate a completed ping result being stored
+        page._ping_results[key] = ("✔ 42ms", "ok")
+        # rebuild the rows (e.g. user did 'select all') — must NOT lose it
+        page.refresh()
+        # the cache survives and the row shows it (we assert the cache survived
+        # and the lookup still resolves the row)
+        self.assertIn(key, page._ping_results)
+        self.assertEqual(page._row_index_for_profile(prof), 2)
+
+    def test_stale_results_pruned_for_removed_profiles(self):
+        page = self._page(n=3)
+        page._ping_results["nonexistent|0|||"] = ("✔ 10ms", "ok")
+        page.refresh()
+        self.assertNotIn("nonexistent|0|||", page._ping_results)
+
+    def test_profile_key_stable_for_same_endpoint(self):
+        from core.profile import Profile
+        page = self._page(n=1)
+        a = Profile(address="x.com", port=443, uuid="u")
+        b = Profile(address="x.com", port=443, uuid="u")
+        self.assertEqual(page._profile_key(a), page._profile_key(b))
+        c = Profile(address="x.com", port=443, uuid="DIFFERENT")
+        self.assertNotEqual(page._profile_key(a), page._profile_key(c))
 
 
 if __name__ == "__main__":  # pragma: no cover
