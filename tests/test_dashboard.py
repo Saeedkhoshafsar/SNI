@@ -83,6 +83,8 @@ class DashboardPageTest(unittest.TestCase):
 
     def test_traffic_updates_rates_total_and_spark(self):
         d = self._page()
+        # live traffic only paints while the session is active
+        d.set_status("active")
         d.on_traffic(2048, 1048576, 1500.0, 320000.0)
         self.assertIn("KB/s", d.rate_down.text())
         self.assertTrue(d.rate_down.text().startswith("↓"))
@@ -90,6 +92,37 @@ class DashboardPageTest(unittest.TestCase):
         # total shows down / up
         self.assertEqual(d.stat_total.value_label.text(), "1.0 MB / 2.0 KB")
         self.assertEqual(len(d.spark._down), 1)
+
+    def test_traffic_ignored_when_not_active(self):
+        # A stray traffic sample emitted while idle / after the session ended
+        # (e.g. a stats poller flushing one last reading) must NOT repaint the
+        # live usage card — otherwise a broken / disconnected config looks like
+        # it is "still exchanging data" (user-reported Bug 3).
+        d = self._page()
+        d.on_traffic(2048, 1048576, 1500.0, 320000.0)   # _live_state == "idle"
+        self.assertEqual(d.rate_down.text(), "↓ 0 B/s")
+        self.assertEqual(d.rate_up.text(), "↑ 0 B/s")
+        self.assertEqual(d.stat_total.value_label.text(), "0 B")
+        self.assertEqual(len(d.spark._down), 0)
+
+    def test_error_resets_live_picture(self):
+        # When a config FAILS and is demoted to error (e.g. a sabotaged spoof
+        # config), the dashboard must clear the live usage picture and reject
+        # any late stray traffic — Bug 3.
+        d = self._page()
+        d.set_status("active")
+        d.on_traffic(2048, 1048576, 1500.0, 320000.0)
+        self.assertEqual(len(d.spark._down), 1)         # painted while active
+        d.set_status("error")
+        # cleared on error, not just idle
+        self.assertEqual(len(d.spark._down), 0)
+        self.assertEqual(d.rate_down.text(), "↓ 0 B/s")
+        self.assertEqual(d.rate_up.text(), "↑ 0 B/s")
+        self.assertEqual(d.stat_total.value_label.text(), "0 B / 0 B")
+        # a late stray sample after the error must be ignored
+        d.on_traffic(4096, 2097152, 3000.0, 640000.0)
+        self.assertEqual(len(d.spark._down), 0)
+        self.assertEqual(d.rate_down.text(), "↓ 0 B/s")
 
     def test_mode_badge_flips(self):
         d = self._page()
@@ -108,7 +141,9 @@ class DashboardPageTest(unittest.TestCase):
 
     def test_idle_resets_live_picture(self):
         d = self._page()
+        d.set_status("active")
         d.on_traffic(2048, 1048576, 1500.0, 320000.0)
+        self.assertEqual(len(d.spark._down), 1)
         d.set_resilience("RST 2/10")
         d.set_status("idle")
         self.assertEqual(len(d.spark._down), 0)

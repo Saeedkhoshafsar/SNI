@@ -148,6 +148,15 @@ def cf_ip_probe(ip: str, spec: "ProbeSpec",
     sock = _open_socket(ip, spec.port, timeout)
     if isinstance(sock, IPResult):
         return sock  # connect-stage failure already classified
+    # The HONEST latency number is the TCP connect RTT to the edge — NOT the sum
+    # of every validation stage. The trace + (for ws) one or two extra
+    # connect/TLS/upgrade round-trips below are PASS/FAIL checks, so folding
+    # their time into the reported latency made a ws / relay config (AYYILDIZ:
+    # connect→TLS→trace→connect→TLS→ws→connect→TLS→ws-root) report 2000-5000ms
+    # even though its real RTT is well under a second — exactly the "ویتوری زیر
+    # ۱۰۰۰ ولی ما بالای ۳۰۰۰" complaint. Capture the connect RTT here and report
+    # THAT on success; the later stages only decide ok/fail.
+    connect_ms = (time.monotonic() - start) * 1000.0
 
     stream = sock
     try:
@@ -239,10 +248,11 @@ def cf_ip_probe(ip: str, spec: "ProbeSpec",
                     _safe_close(stream)
                     return IPResult(ip, ERROR, detail=ws_detail)
 
-        latency = (time.monotonic() - start) * 1000.0
+        # report the TCP connect RTT (true network latency), not the cumulative
+        # multi-stage validation time — see the note at the connect above.
         _safe_close(stream)
         kind = "ws+edge" if spec.is_ws else "edge"
-        return IPResult(ip, OK, latency_ms=latency, detail=f"{kind} ok")
+        return IPResult(ip, OK, latency_ms=connect_ms, detail=f"{kind} ok")
     except socket.timeout:
         _safe_close(stream)
         return IPResult(ip, TIMEOUT, detail="response timeout")

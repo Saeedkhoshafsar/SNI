@@ -286,11 +286,20 @@ class DashboardPage(QWidget):
             "active": "متصل — تونل فعال",
             "error": "خطا — تلاش دوباره",
         }.get(state, "آماده — متوقف")))
-        if state == "idle":
-            # reset the live picture when the session ends
+        # track the live state so on_traffic can reject stray bytes that arrive
+        # after the session ends (see on_traffic).
+        self._live_state = state
+        # Reset the live usage picture whenever the session is NOT actively
+        # carrying traffic. Previously only "idle" cleared it, so a config that
+        # FAILED (error) — e.g. a sabotaged spoof config demoted by the self-test
+        # — left the last rate/total/sparkline frozen on screen, which the user
+        # read as "data is still flowing even though it's broken / not
+        # connected". Clearing on error/idle makes the dashboard honest.
+        if state in ("idle", "error"):
             self.spark.clear()
             self.rate_down.setText("↓ 0 B/s")
             self.rate_up.setText("↑ 0 B/s")
+            self.stat_total.value_label.setText("0 B / 0 B")
             self.lbl_resilience.setText(tr("تاب‌آوری: —"))
 
     def on_count(self, active: int, total: int):
@@ -299,7 +308,17 @@ class DashboardPage(QWidget):
 
     def on_traffic(self, up_bytes: int, down_bytes: int,
                    up_bps: float, down_bps: float):
-        """Slot for the engine's live traffic signal (step 20)."""
+        """Slot for the engine's live traffic signal (step 20).
+
+        Ignore traffic that arrives while the session is NOT active. A worker
+        thread (stats poller / spoofer) can emit one last sample just after the
+        engine demotes to error / stops, which would otherwise repaint the
+        usage card we just cleared — making a broken/disconnected config look
+        like it's "still exchanging data". Only an active session feeds the
+        live picture.
+        """
+        if getattr(self, "_live_state", "idle") != "active":
+            return
         self.spark.push(down_bps, up_bps)
         self.rate_down.setText(f"↓ {fmt_rate(down_bps)}")
         self.rate_up.setText(f"↑ {fmt_rate(up_bps)}")
