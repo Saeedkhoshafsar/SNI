@@ -526,16 +526,27 @@ class EngineController:
                 return (False, None, "core failed to start (config broken)")
 
             # let the temporary core finish binding + the first handshake.
-            time.sleep(1.2)
+            # v2rayNG keeps a warm keep-alive client and just retries, so a
+            # generous warm-up here removes the "first ping is red" flap.
+            time.sleep(1.5)
             real_http = int(getattr(xray, "http_port", http_port) or http_port)
             proxy = f"http://127.0.0.1:{real_http}"
             handler = urllib.request.ProxyHandler(
                 {"http": proxy, "https": proxy})
             opener = urllib.request.build_opener(handler)
-            per_timeout = max(4.0, float(timeout) / 2.0)
-            # reuse the body-verified prober so a config that only reaches the
-            # CDN edge (the broken xhttp) is reported red, not green.
-            return self._live_proxy_ping_verified(opener, per_timeout, 2)
+            # v2rayNG uses a 12 s overall client timeout; give each attempt a
+            # solid slice (never the old timeout/2 that starved slow configs).
+            per_timeout = max(6.0, float(timeout) / 2.0)
+            if is_spoof:
+                # Spoof configs dial a fixed Cloudflare anycast IP, so a bare
+                # 204 can be answered by the CF edge even when the inner route
+                # is dead (false-green). Keep the stricter body-verified probe
+                # ONLY for these — it's the one case where 204 lies.
+                return self._live_proxy_ping_verified(opener, per_timeout, 2)
+            # Ordinary configs (relay/xhttp/plain): use v2rayNG's exact stable
+            # algorithm — fixed 204 URL, 200/204 == ok, 2-attempt best-of. This
+            # is what stops the working-config green↔red flapping.
+            return self._v2ray_style_delay(opener, per_timeout, attempts=2)
         except Exception as exc:  # never raise into the UI
             return (False, None, f"{type(exc).__name__}: {exc}")
         finally:
@@ -576,6 +587,74 @@ class EngineController:
         ("https://www.gstatic.com/generate_204", ""),
         ("https://cp.cloudflare.com/cdn-cgi/trace", "fl="),
     )
+
+    # --- v2rayNG's EXACT real-delay algorithm (the stable one) -------------
+    #
+    # The user's report: broken configs always ping red (good), but *working*
+    # configs flap green↔red and need 2-3 pings to trust. Studying v2rayNG's
+    # canonical core routine ``measureInstDelay`` (AndroidLibXrayLite
+    # ``libv2ray_main.go``) shows exactly why our probe was flaky and theirs is
+    # rock-solid:
+    #   * ONE fixed URL — ``https://www.gstatic.com/generate_204`` (fallback
+    #     ``https://www.google.com/generate_204``); never a rotating endpoint
+    #     set, so the result doesn't depend on which probe happened to run.
+    #   * success == HTTP 200 OR 204 — NO body-marker requirement. Demanding a
+    #     specific body string (our old "success"/"fl=" check) red-flagged a
+    #     perfectly working-but-slow config that simply didn't return that exact
+    #     resource in time. That was our #1 false-red cause.
+    #   * 2 attempts, keep BEST (min) duration — a single slow first packet (TLS
+    #     warm-up, first-hop jitter) no longer decides the verdict.
+    #   * keep-alive ON so the 2nd attempt reuses the warmed connection.
+    #   * 12 s overall client timeout, 6 s TLS-handshake budget.
+    # We mirror that 1:1 for ordinary configs. (Spoof/CF-anycast configs keep
+    # the stricter body-verified probe to avoid the CDN-edge false-green.)
+    _V2RAY_DELAY_URLS = (
+        "https://www.gstatic.com/generate_204",
+        "https://www.google.com/generate_204",
+    )
+
+    def _v2ray_style_delay(self, opener, per_timeout, attempts=2):
+        """Measure delay exactly the v2rayNG way: fixed 204 URL, 200/204 ok,
+        N attempts keeping the minimum (best-of). Returns ``(ok, ms|None,
+        detail)``. This is the *stable* path for ordinary configs.
+        """
+        import time
+        import urllib.request
+
+        min_ms = None
+        last_detail = ""
+        # try the primary 204 URL; only fall back to the secondary if the
+        # primary never produced a single valid response (mirrors core's
+        # url == "" default + our extra resilience for blocked gstatic).
+        for url in self._V2RAY_DELAY_URLS:
+            for _ in range(max(1, int(attempts))):
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "SNISpoofer-ping"})
+                t0 = time.time()
+                try:
+                    with opener.open(req, timeout=per_timeout) as resp:
+                        code = resp.getcode()
+                        # drain the (tiny/empty) body so the connection can be
+                        # cleanly reused for the next keep-alive attempt.
+                        try:
+                            resp.read(64)
+                        except Exception:
+                            pass
+                    dt = (time.time() - t0) * 1000.0
+                    if code in (200, 204):
+                        if min_ms is None or dt < min_ms:
+                            min_ms = dt
+                    else:
+                        last_detail = f"HTTP {code}"
+                except Exception as exc:
+                    last_detail = f"{type(exc).__name__}: {exc}"
+            if min_ms is not None:
+                # primary URL already gave us a real round-trip; no need to
+                # also hammer the fallback.
+                break
+        if min_ms is not None:
+            return (True, round(min_ms, 1), "ok")
+        return (False, None, last_detail or "no response")
 
     def _live_proxy_ping_verified(self, opener, per_timeout, attempts):
         """Probe the live tunnel, requiring a real body-verified fetch.

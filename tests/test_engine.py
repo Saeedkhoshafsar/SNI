@@ -892,9 +892,10 @@ class EnginePingTest(unittest.TestCase):
         self.assertIsInstance(detail, str)
 
     def test_measure_profile_delay_returns_real_delay_through_core(self):
-        """When the temporary core comes up and a body-verified fetch succeeds,
+        """When the temporary core comes up and the request succeeds,
         measure_profile_delay returns the real round-trip delay — mirroring how
-        v2rayNG times a request through the config's own outbound."""
+        v2rayNG times a request through the config's own outbound. An ordinary
+        (non-spoof) config goes through the stable v2rayNG-style path."""
         import core.engine as eng_mod
         from core.xray_manager import XrayManager
 
@@ -915,10 +916,10 @@ class EnginePingTest(unittest.TestCase):
         import core.xray_manager as xm
         saved_real = xm.XrayManager
         xm.XrayManager = lambda *a, **k: _FakeXray()
-        # patch the body-verified prober to report a clean real fetch
-        saved_probe = EngineController._live_proxy_ping_verified
-        EngineController._live_proxy_ping_verified = (
-            lambda self, opener, per_timeout, attempts: (True, 64.0, "verified"))
+        # ordinary config → stable v2rayNG-style delay path is used
+        saved_probe = EngineController._v2ray_style_delay
+        EngineController._v2ray_style_delay = (
+            lambda self, opener, per_timeout, attempts=2: (True, 64.0, "ok"))
         try:
             ok, ms, detail = ctrl.measure_profile_delay(
                 self._profile("h"), timeout=2.0)
@@ -926,7 +927,73 @@ class EnginePingTest(unittest.TestCase):
             self.assertAlmostEqual(ms, 64.0)
         finally:
             xm.XrayManager = saved_real
-            EngineController._live_proxy_ping_verified = saved_probe
+            EngineController._v2ray_style_delay = saved_probe
+
+    def test_v2ray_style_delay_keeps_best_of_attempts(self):
+        """The v2rayNG algorithm fires the fixed 204 URL twice and keeps the
+        MINIMUM round-trip — so one slow warm-up packet never flaps a working
+        config to red. Success requires only HTTP 200/204 (NO body marker),
+        which is the fix for working-but-slow configs falsely going red."""
+        ctrl = EngineController({})
+
+        # fake opener that returns 204 with rising latency; best-of must win.
+        timings = iter([0.300, 0.040])  # first slow, second fast (seconds)
+
+        class _Resp:
+            def __init__(self):
+                self._code = 204
+            def getcode(self):
+                return self._code
+            def read(self, *_a):
+                return b""           # empty body — must still count as success
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        class _Opener:
+            def open(self, _req, timeout=None):
+                # simulate the elapsed time by advancing a fake clock
+                import core.engine as _m
+                _m.time.sleep(0)  # no real sleep
+                return _Resp()
+
+        # monkeypatch time.time inside the helper to feed deterministic gaps
+        import core.engine as eng_mod
+        real_time = eng_mod.time.time
+        clock = [0.0]
+        seq = [0.0, 0.300, 0.300, 0.340]  # t0,t1 (attempt1), t0,t1 (attempt2)
+        it = iter(seq)
+
+        def fake_time():
+            try:
+                return next(it)
+            except StopIteration:
+                return 0.340
+        eng_mod.time.time = fake_time
+        try:
+            ok, ms, detail = ctrl._v2ray_style_delay(
+                _Opener(), per_timeout=6.0, attempts=2)
+            self.assertTrue(ok)
+            # best-of: min(300ms, 40ms) == 40ms
+            self.assertAlmostEqual(ms, 40.0, delta=0.5)
+        finally:
+            eng_mod.time.time = real_time
+
+    def test_v2ray_style_delay_red_when_all_attempts_fail(self):
+        """If every attempt to both 204 URLs errors out, the helper reports an
+        honest red (ok=False, ms=None) — broken configs stay red."""
+        ctrl = EngineController({})
+
+        class _Opener:
+            def open(self, _req, timeout=None):
+                raise OSError("connection refused")
+
+        ok, ms, detail = ctrl._v2ray_style_delay(
+            _Opener(), per_timeout=1.0, attempts=2)
+        self.assertFalse(ok)
+        self.assertIsNone(ms)
+        self.assertIsInstance(detail, str)
 
     def test_probe_strategies_via_engine_picks_winner(self):
         import core.prober as prober_mod
