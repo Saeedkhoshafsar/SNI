@@ -86,6 +86,15 @@ class EngineBridge(QObject):
         except Exception as exc:
             return (False, None, f"{type(exc).__name__}: {exc}")
 
+    def live_proxy_download(self, *, duration: float = 8.0,
+                            max_bytes: int = 12_000_000):
+        """Download speed test through the running tunnel (active config)."""
+        try:
+            return self.controller.live_proxy_download(
+                duration=duration, max_bytes=max_bytes)
+        except Exception as exc:
+            return (False, None, f"{type(exc).__name__}: {exc}")
+
     def measure_profile_delay(self, profile, *, timeout: float = 12.0):
         """v2rayNG-style REAL delay for an inactive profile (temporary core).
 
