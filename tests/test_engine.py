@@ -85,7 +85,11 @@ class FakeXray:
         return None
 
     def start(self):
+        # mirror the real XrayManager contract: return True when the process is
+        # up and stayed up. The engine now honours this to avoid falsely
+        # reporting "connected" when xray died on a port-bind conflict.
         self.started = True
+        return True
 
     def stop(self):
         self.stopped = True
@@ -247,6 +251,69 @@ class EngineControllerTest(unittest.TestCase):
             self.assertTrue(any("WinDivert" in m for m in logs))
         finally:
             fake_main.ProxyServer = FakeProxy
+
+    def test_tunnel_reports_error_when_xray_dies_immediately(self):
+        # Bug A (the user's "healthy configs don't connect"): if xray exits
+        # right after launch (port-bind conflict on 10808/10809, bad config,
+        # missing geoip), start() returns False. The engine must report
+        # STATUS_ERROR — NOT a false "✓ اتصال برقرار شد" with the system proxy
+        # left pointing at a dead port.
+        class DyingXray(FakeXray):
+            def start(self):           # mirrors a process that crashed on bind
+                self.started = False
+                return False
+
+            @property
+            def is_running(self):
+                return False
+
+        import core.xray_manager as xm
+        saved = xm.XrayManager
+        xm.XrayManager = DyingXray
+        try:
+            ctrl = EngineController({"connection_mode": "Tunnel",
+                                     "system_proxy": True})
+            ctrl.set_profile(self._profile())
+            logs = []
+            ctrl.on_log = logs.append
+            ctrl.start()
+            self.assertTrue(_wait_status(ctrl, STATUS_ERROR))
+            self.assertNotEqual(ctrl.status, STATUS_ACTIVE)
+            # the honest failure message, and NO false success
+            self.assertTrue(any("اتصال برقرار نشد" in m or "اجرا نشد" in m
+                                for m in logs))
+            self.assertFalse(any("✓ اتصال برقرار شد" in m for m in logs))
+            ctrl.stop()
+        finally:
+            xm.XrayManager = saved
+
+    def test_spoof_reports_error_when_xray_dies_immediately(self):
+        # Same honesty guard for the spoof-chain path: even if the spoofer comes
+        # up, a dead xray means the tunnel can't carry traffic → STATUS_ERROR,
+        # not a fake success.
+        class DyingXray(FakeXray):
+            def start(self):
+                self.started = False
+                return False
+
+            @property
+            def is_running(self):
+                return False
+
+        import core.xray_manager as xm
+        saved = xm.XrayManager
+        xm.XrayManager = DyingXray
+        try:
+            ctrl = EngineController({"connection_mode": "Tunnel"})
+            ctrl.set_profile(self._spoof_profile())
+            logs = []
+            ctrl.on_log = logs.append
+            ctrl.start()
+            self.assertTrue(_wait_status(ctrl, STATUS_ERROR))
+            self.assertFalse(any("✓ اتصال برقرار شد" in m for m in logs))
+            ctrl.stop()
+        finally:
+            xm.XrayManager = saved
 
     def test_plain_tunnel_runs_xray_directly_no_spoofer(self):
         # plain "Tunnel" must behave like V2RayTun: xray connects straight to

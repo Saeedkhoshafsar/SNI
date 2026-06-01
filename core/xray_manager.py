@@ -39,6 +39,51 @@ def find_free_port(preferred: int | None = None) -> int:
         return s.getsockname()[1]
 
 
+def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """True if *port* on *host* is already bound (something is listening).
+
+    Used before launching xray to detect a stale inbound port (10808/10809)
+    still held by a previous xray/spoofer that didn't fully release it on a
+    rapid stop→start (auto-restart) — the cause of the user's
+    ``bind: Only one usage of each socket address`` crash that the engine then
+    falsely reported as a successful connection.
+    """
+    if not (0 < int(port) < 65536):
+        return False
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # if we can bind it ourselves, it's free; if bind fails it's in use.
+        s.bind((host, int(port)))
+        return False
+    except OSError:
+        return True
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def wait_port_free(port: int, host: str = "127.0.0.1",
+                   timeout: float = 4.0) -> bool:
+    """Block (briefly) until *port* is free, returning True if it became free.
+
+    Windows can keep a just-terminated listener's socket in ``TIME_WAIT`` for a
+    moment, so a fast auto-restart that re-uses the same fixed ports
+    (10808/10809) raced the OS and hit ``WSAEADDRINUSE``. Polling here lets the
+    OS release the socket before we relaunch xray. Returns False if the port is
+    still held when the timeout elapses (caller should then pick a free port).
+    """
+    import time as _t
+    deadline = _t.monotonic() + max(0.0, float(timeout))
+    while True:
+        if not port_in_use(port, host):
+            return True
+        if _t.monotonic() >= deadline:
+            return False
+        _t.sleep(0.1)
+
+
 def lan_ip_address() -> str:
     """Best-effort primary LAN IPv4 of this machine (for sharing to a phone).
 
@@ -200,18 +245,43 @@ class XrayManager:
 
     # ----------------------------------------------------------------
 
-    def start(self):
+    def start(self) -> bool:
+        """Launch xray. Returns ``True`` only when the process is up and stayed
+        up; ``False`` on any failure (missing binary, invalid profile, port
+        conflict, immediate crash). The caller MUST honour the return value and
+        not report a successful connection on ``False`` — the previous code
+        ignored it and logged "✓ اتصال برقرار شد" even when xray had already
+        died on a port-bind conflict, leaving the system proxy pointed at a dead
+        port (the user's "healthy configs don't connect" bug)."""
         if self.is_running:
             self._log("Xray already running")
-            return
+            return True
         if not self.is_available:
             self._log("ERROR: xray.exe not found (binary not bundled)")
-            return
+            return False
 
         errs = self.profile.validate()
         if errs:
             self._log("ERROR: پروفایل نامعتبر — " + "؛ ".join(errs))
-            return
+            return False
+
+        # --- free stale inbound ports before binding (#B) ----------------
+        # A rapid stop→start (the UI auto-restart on server/strategy change)
+        # could relaunch xray while the previous process still held 10808/10809
+        # for a few hundred ms → ``bind: Only one usage of each socket address``
+        # and an immediate crash. Wait briefly for the OS to release them; if
+        # they're still pinned, fall back to free ports and rewrite the config
+        # so we never crash on a stale bind.
+        host = self.listen if self.listen and self.listen != "0.0.0.0" \
+            else "127.0.0.1"
+        for attr in ("socks_port", "http_port"):
+            want = int(getattr(self, attr))
+            if want and port_in_use(want, host) and not wait_port_free(want, host):
+                alt = find_free_port()
+                self._log(
+                    f"هشدار: پورت {want} هنوز اشغال است — به پورت آزاد {alt} "
+                    f"تغییر یافت (یک نمونهٔ قبلی xray/spoofer آن را رها نکرده).")
+                setattr(self, attr, alt)
 
         self.generate_config()
         try:
@@ -256,7 +326,7 @@ class XrayManager:
                     f"لاگ‌های [xray] بالا را برای علت بررسی کنید "
                     f"(کانفیگ نامعتبر یا فایل geoip/geosite غایب).")
                 self._process = None
-                return
+                return False
             chain = (f"  (chain → spoofer 127.0.0.1:{self.spoof_port}"
                      f" → {self.profile.address}:{self.profile.port})"
                      if self.spoof_port else
@@ -272,8 +342,10 @@ class XrayManager:
                     f"اشتراک LAN روشن — از گوشی به این آدرس وصل شوید: "
                     f"SOCKS5 {lan_ip}:{self.socks_port}  |  "
                     f"HTTP {lan_ip}:{self.http_port}")
+            return True
         except Exception as exc:
             self._log(f"Failed to start Xray: {exc}")
+            return False
 
     def _pump_output(self):
         proc = self._process
@@ -321,15 +393,45 @@ class XrayManager:
 
     def stop(self):
         if self._process:
+            pid = getattr(self._process, "pid", None)
             try:
                 self._process.terminate()
                 self._process.wait(timeout=5)
             except Exception:
                 try:
                     self._process.kill()
+                    self._process.wait(timeout=3)
+                except Exception:
+                    pass
+            # On Windows ``terminate()`` may leave the process (or a child) alive
+            # for a moment, so its inbound sockets stay bound and the next start
+            # hits ``bind: Only one usage of each socket address`` → it falls
+            # back to a random port, which then breaks the system-proxy / browser
+            # wiring (the user's "ordinary configs don't connect"). Force-kill
+            # the whole process tree so the sockets release immediately.
+            if pid is not None and sys.platform == "win32":
+                try:
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    si.wShowWindow = subprocess.SW_HIDE
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        capture_output=True, timeout=5,
+                        startupinfo=si,
+                        creationflags=subprocess.CREATE_NO_WINDOW)
                 except Exception:
                     pass
             self._process = None
+            # Block until the OS actually releases our inbound ports, so an
+            # immediate auto-restart re-using the same fixed ports (10808/10809)
+            # doesn't race the teardown. A longer window (8s) avoids the
+            # needless port-switch seen in the field where 10808/10809 were
+            # still in TIME_WAIT after a busy session.
+            host = self.listen if self.listen and self.listen != "0.0.0.0" \
+                else "127.0.0.1"
+            for p in (self.socks_port, self.http_port):
+                if p:
+                    wait_port_free(int(p), host, timeout=8.0)
             self._log("Xray stopped")
 
     @property

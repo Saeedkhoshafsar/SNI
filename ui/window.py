@@ -2185,6 +2185,7 @@ class MainWindow(QWidget):
             # of the port, so xray dialed a half-dead spoofer ⇒ the new config
             # never came up and the user had to stop/start manually (#2).
             self._restart_attempts = 0
+            self._restart_started = False
             self._restart_when_idle()
             try:
                 Toast.show_message(
@@ -2229,7 +2230,14 @@ class MainWindow(QWidget):
         except Exception:
             running = False
         self._restart_attempts = getattr(self, "_restart_attempts", 0) + 1
-        if not running or self._restart_attempts > 40:
+        if not running or self._restart_attempts > 80:
+            # guard against two overlapping restart timers both firing start()
+            # (rapid profile switches) → "موتور از قبل در حال اجراست" + a half
+            # torn-down session. Only the first to see idle starts; the flag is
+            # cleared once the engine reports it left idle (or on the next stop).
+            if getattr(self, "_restart_started", False):
+                return
+            self._restart_started = True
             try:
                 self.engine.start()
             except Exception:
@@ -2283,6 +2291,7 @@ class MainWindow(QWidget):
             except Exception:
                 pass
             self._restart_attempts = 0
+            self._restart_started = False
             self._restart_when_idle()
             Toast.show_message(
                 self,
