@@ -369,6 +369,144 @@ class TlsHandshakeFallbackTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+#  Round 4 (from real logs) — CDN-fronted configs must be validated HONESTLY:
+#   * plaintext WS (security=none, port 80/8880) must NOT green on a bare TCP
+#     connect to a Cloudflare anycast IP (SIN-04 / SIN-06 "ping but no connect")
+#   * a transient edge reset/timeout must be RETRIED, not turned into instant
+#     red ("بدون پاسخ" on a config that actually connects)
+# ---------------------------------------------------------------------------
+
+class CdnPingHonestyTest(unittest.TestCase):
+    def _patch_probe(self, fn):
+        from core import cf_scanner as cf
+        orig = cf.cf_ip_probe
+        cf.cf_ip_probe = fn
+        self.addCleanup(lambda: setattr(cf, "cf_ip_probe", orig))
+
+    def test_plaintext_ws_uses_edge_probe_not_tcp(self):
+        """A security=none / port-80 WS config must go through the honest edge
+        probe (real HTTP Host) — a bare TCP connect to an anycast IP always
+        succeeds and produced the false-green the user reported."""
+        from core import cf_scanner as cf
+        from core.ping import Target, PingTester
+
+        seen = []
+
+        def fake_probe(host, spec, timeout):
+            seen.append(spec)
+            return cf.IPResult(host, cf.ERROR, detail="dead worker route")
+
+        self._patch_probe(fake_probe)
+        t = Target(label="SIN-04", host="162.159.10.110", port=80,
+                   server_name="", tls=False,
+                   host_header="broad-mountain.hammm1.workers.dev",
+                   path="/", is_ws=True)
+        res = PingTester(samples=3, timeout=2.0).ping_target(t)
+        self.assertTrue(seen, "edge probe must be invoked for plaintext WS")
+        self.assertFalse(seen[0].is_tls)        # plaintext on the wire
+        self.assertTrue(seen[0].is_ws)          # but validated as a WS route
+        self.assertFalse(res.reachable)         # dead route → honest red
+
+    def test_plaintext_ws_green_only_when_route_lives(self):
+        from core import cf_scanner as cf
+        from core.ping import Target, PingTester
+
+        def fake_probe(host, spec, timeout):
+            return cf.IPResult(host, cf.OK, latency_ms=120.0, detail="ws+edge ok")
+
+        self._patch_probe(fake_probe)
+        t = Target(label="SIN-06", host="162.159.5.108", port=80,
+                   server_name="", tls=False,
+                   host_header="broad-mountain.hammm1.workers.dev",
+                   path="/", is_ws=True)
+        res = PingTester(samples=3, timeout=2.0).ping_target(t)
+        self.assertTrue(res.reachable)
+        self.assertLessEqual(res.best_ms or 1e9, 200.0)
+
+    def test_transient_reset_is_retried_then_succeeds(self):
+        """First attempt resets, second succeeds → must report the success, not
+        the transient red (the 'بدون پاسخ while it connects' bug)."""
+        from core import cf_scanner as cf
+        from core.ping import tls_latency
+
+        calls = {"n": 0}
+
+        def fake_probe(host, spec, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return cf.IPResult(host, cf.RST, detail="reset during probe")
+            return cf.IPResult(host, cf.OK, latency_ms=88.0, detail="edge ok")
+
+        self._patch_probe(fake_probe)
+        ms = tls_latency("104.18.151.7", 8443, 3.0,
+                         server_name="young-field.hammm3.workers.dev",
+                         host_header="young-field.hammm3.workers.dev",
+                         is_ws=True, is_tls=True, retries=2)
+        self.assertEqual(ms, 88.0)
+        self.assertGreaterEqual(calls["n"], 2)  # proves it retried
+
+    def test_all_attempts_fail_is_honest_red_for_tls(self):
+        from core import cf_scanner as cf
+        from core.ping import tls_latency
+
+        # edge always fails; for a TLS config the handshake fallback also fails.
+        self._patch_probe(
+            lambda h, s, t: cf.IPResult(h, cf.TIMEOUT, detail="timeout"))
+        import core.ping as pmod
+        orig_fb = pmod._tls_handshake_latency
+        pmod._tls_handshake_latency = lambda *a, **k: None
+        self.addCleanup(lambda: setattr(pmod, "_tls_handshake_latency", orig_fb))
+        ms = tls_latency("104.18.151.71", 8443, 2.0,
+                         server_name="young-field.hammm3.workers.dev",
+                         is_ws=True, is_tls=True, retries=2)
+        self.assertIsNone(ms)
+
+    def test_plaintext_failure_does_not_fake_a_handshake(self):
+        """A plaintext (non-TLS) config that fails the edge check must NOT fall
+        back to a TLS handshake (there's nothing to validate) — stays red."""
+        from core import cf_scanner as cf
+        from core.ping import tls_latency
+        import core.ping as pmod
+
+        self._patch_probe(
+            lambda h, s, t: cf.IPResult(h, cf.ERROR, detail="dead"))
+        called = {"fb": False}
+
+        def fb(*a, **k):
+            called["fb"] = True
+            return 50.0
+        orig_fb = pmod._tls_handshake_latency
+        pmod._tls_handshake_latency = fb
+        self.addCleanup(lambda: setattr(pmod, "_tls_handshake_latency", orig_fb))
+        ms = tls_latency("162.159.10.110", 80, 2.0,
+                         host_header="broad-mountain.hammm1.workers.dev",
+                         is_ws=True, is_tls=False, retries=1)
+        self.assertIsNone(ms)
+        self.assertFalse(called["fb"], "must NOT TLS-handshake a plaintext config")
+
+    def test_edge_probe_taken_once_per_target_under_load(self):
+        """The edge probe (which retries internally) is taken ONCE per target,
+        not ``samples`` times, so a 'ping all' burst doesn't hammer the edge and
+        cause its own transient resets."""
+        from core import cf_scanner as cf
+        from core.ping import Target, PingTester
+
+        per_target = {"n": 0}
+
+        def fake_probe(host, spec, timeout):
+            per_target["n"] += 1
+            return cf.IPResult(host, cf.OK, latency_ms=100.0)
+
+        self._patch_probe(fake_probe)
+        t = Target(label="x", host="104.16.0.1", port=8443,
+                   server_name="h.workers.dev", tls=True,
+                   host_header="h.workers.dev", is_ws=True)
+        PingTester(samples=5, timeout=2.0).ping_target(t)
+        # one success short-circuits the internal retry, so exactly 1 call here
+        self.assertEqual(per_target["n"], 1)
+
+
+# ---------------------------------------------------------------------------
 #  Bug 2 — status mask during auto-restart (no "شروع" flicker, Start ignored)
 # ---------------------------------------------------------------------------
 
