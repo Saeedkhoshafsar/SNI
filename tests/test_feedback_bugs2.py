@@ -91,7 +91,11 @@ class LivePingTest(unittest.TestCase):
 
         class _Resp:
             def getcode(self):
-                return 204
+                return 200
+            def read(self, *_a):
+                # carry every marker the verifier looks for so the
+                # content-verified endpoint passes through this generic mock.
+                return b"success\nMicrosoft Connect Test\nfl=abc h=x"
             def __enter__(self):
                 return self
             def __exit__(self, *a):
@@ -223,7 +227,9 @@ class LiveProxyPingRobustnessTest(unittest.TestCase):
 
         class _Resp:
             def getcode(self):
-                return 204
+                return 200
+            def read(self, *_a):
+                return b"success\nMicrosoft Connect Test\nfl=abc"
             def __enter__(self):
                 return self
             def __exit__(self, *a):
@@ -239,7 +245,9 @@ class LiveProxyPingRobustnessTest(unittest.TestCase):
 
         class _Resp:
             def getcode(self):
-                return 204
+                return 200
+            def read(self, *_a):
+                return b"success\nMicrosoft Connect Test\nfl=abc"
             def __enter__(self):
                 return self
             def __exit__(self, *a):
@@ -266,6 +274,72 @@ class LiveProxyPingRobustnessTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNone(ms)
         self.assertTrue(detail)  # carries the last failure reason
+
+    def test_cdn_edge_only_204_is_not_a_working_tunnel(self):
+        """The "fake green ping" bug: a sabotaged spoof config still reaches the
+        Cloudflare anycast edge, so ``cp.cloudflare.com/generate_204`` answers
+        204 (and a few KB flow) — yet no real site loads because the inner Worker
+        route is dead. An empty 204 must NOT be counted as a working tunnel; only
+        a body-verified fetch (real bytes from the open internet through the
+        proxy backend) proves the path. So a 204-only world is honest RED.
+        """
+        class _Resp204:
+            def getcode(self):
+                return 204
+            def read(self, *_a):
+                return b""          # empty body — CDN-edge captive impostor
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def open_fn(req, timeout):
+            # every endpoint returns an empty 204 (edge only, no real traffic)
+            return _Resp204()
+
+        ctrl = self._ctrl_active()
+        ok, ms, detail = self._run_with_opener(ctrl, open_fn, samples=2)
+        self.assertFalse(ok)        # NOT a working tunnel
+        self.assertIsNone(ms)
+        self.assertTrue(detail)
+
+    def test_body_verified_fetch_is_a_working_tunnel(self):
+        """The flip side: when a content-verified endpoint returns its real body
+        marker through the proxy, the tunnel is genuinely carrying traffic → OK.
+        """
+        class _RespBody:
+            def getcode(self):
+                return 200
+            def read(self, *_a):
+                return b"success"   # detectportal.firefox.com/success.txt body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def open_fn(req, timeout):
+            # 204 captive endpoints answer empty; the success.txt endpoint
+            # returns the real body marker — that is what proves the tunnel.
+            url = req.full_url
+            if "success.txt" in url or "connecttest" in url or "trace" in url:
+                return _RespBody()
+
+            class _R204:
+                def getcode(self):
+                    return 204
+                def read(self, *_a):
+                    return b""
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+            return _R204()
+
+        ctrl = self._ctrl_active()
+        ok, ms, detail = self._run_with_opener(ctrl, open_fn, samples=2)
+        self.assertTrue(ok)
+        self.assertIsInstance(ms, float)
+        self.assertIn("verified", detail)
 
     def test_no_http_port_is_honest_failure(self):
         from core import engine as eng_mod

@@ -201,8 +201,42 @@ def cf_ip_probe(ip: str, spec: "ProbeSpec",
                 ws_stream, host_hdr, spec.path or "/", timeout)
             _safe_close(ws_stream)
             if not ws_ok:
-                _safe_close(stream)
-                return IPResult(ip, ERROR, detail=ws_detail)
+                # Relay / tunnel-style paths (the user's "AYYILDIZ" config:
+                # ``/stars/http://user:pass@vps.webtun.xyz:2087``) instruct the
+                # Worker to immediately open a *backend* tunnel to another VPS.
+                # A bare, unauthenticated WS probe on such a path is frequently
+                # reset or 5xx'd by the relay logic — even though the config
+                # works end-to-end with a real authenticated client. That false
+                # red is exactly the bug: a long relay path pinged red while the
+                # config connected fine.
+                #
+                # When the real path is a relay path (it embeds a nested URL),
+                # the honest thing to validate is whether the WS layer reaches a
+                # *live Cloudflare edge for this Host* at all — so we retry the
+                # upgrade on the root path ``/``. The edge answering a WS handshake
+                # (101, or a CF 4xx) on ``/`` proves the host route is live; the
+                # nested relay backend is the config's business, not ours.
+                if _is_relay_path(spec.path or "/"):
+                    ws_sock2 = _open_socket(ip, spec.port, timeout)
+                    if not isinstance(ws_sock2, IPResult):
+                        ws_stream2 = ws_sock2
+                        if spec.is_tls:
+                            ctx = ssl.create_default_context()
+                            ctx.check_hostname = False
+                            ctx.verify_mode = ssl.CERT_NONE
+                            try:
+                                ws_stream2 = ctx.wrap_socket(
+                                    ws_sock2, server_hostname=sni or ip)
+                            except OSError:
+                                ws_stream2 = None
+                                _safe_close(ws_sock2)
+                        if ws_stream2 is not None:
+                            ws_ok, ws_detail = _ws_upgrade_ok(
+                                ws_stream2, host_hdr, "/", timeout)
+                            _safe_close(ws_stream2)
+                if not ws_ok:
+                    _safe_close(stream)
+                    return IPResult(ip, ERROR, detail=ws_detail)
 
         latency = (time.monotonic() - start) * 1000.0
         _safe_close(stream)
@@ -324,6 +358,19 @@ def _ws_upgrade_ok(stream, host: str, path: str,
                   or " 426" in text[:16]):
         return True, "ws reachable (cf 4xx)"
     return False, "ws upgrade refused"
+
+
+def _is_relay_path(path: str) -> bool:
+    """True for Worker *relay* paths that embed a nested backend URL.
+
+    Configs like AYYILDIZ use a path of the form
+    ``/stars/http://user:pass@vps.webtun.xyz:2087`` — the Worker reads the
+    embedded URL and tunnels to that backend. A bare, unauthenticated WS probe
+    on such a path is often reset/refused by the relay even when the config
+    works, so the prober treats these paths leniently (re-validating on ``/``).
+    """
+    p = (path or "").lower()
+    return ("http://" in p) or ("https://" in p) or ("@" in p and ":" in p)
 
 
 def _read_response(stream, timeout: float,

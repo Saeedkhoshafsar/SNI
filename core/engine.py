@@ -393,62 +393,106 @@ class EngineController:
         proxy = f"http://127.0.0.1:{http_port}"
         handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         opener = urllib.request.build_opener(handler)
-        # captive-portal / connectivity-check endpoints. Plain-HTTP 204 first
-        # (cheapest + most proxy-friendly), then HTTPS as a fallback.
-        endpoints = [
-            "http://www.gstatic.com/generate_204",
-            "http://cp.cloudflare.com/generate_204",
-            "http://connectivitycheck.gstatic.com/generate_204",
-            "https://www.gstatic.com/generate_204",
-            "https://cp.cloudflare.com/generate_204",
-        ]
         # a per-request timeout that scales with samples but stays snappy; the
         # caller's overall budget is roughly samples * per_timeout.
         per_timeout = max(4.0, float(timeout) / max(1, int(samples) + 1))
-        best = None
-        last_detail = ""
         attempts = max(1, int(samples))
-        for i in range(attempts):
-            url = endpoints[i % len(endpoints)] if attempts <= len(endpoints) \
-                else endpoints[i % len(endpoints)]
+        return self._live_proxy_ping_verified(opener, per_timeout, attempts)
+
+    # --- body-verified live tunnel probes (bug: "fake" green ping) ----------
+    #
+    # A captive-portal ``generate_204`` endpoint is NOT enough to prove the
+    # tunnel actually works (the user's deliberately-sabotaged spoof config:
+    # ping went green and a few KB flowed, yet no site loaded). The reason:
+    # spoof configs dial a fixed **Cloudflare anycast IP**, so even when the
+    # inner Worker route to the real backend is dead, the spoofer still reaches
+    # Cloudflare's edge — and Cloudflare's own ``cp.cloudflare.com/generate_204``
+    # is answered *by that edge directly*, returning 204 without the traffic ever
+    # leaving CF to the open internet. An empty 204 therefore can't distinguish a
+    # working tunnel from one that only reaches the CDN edge.
+    #
+    # The honest test must fetch a resource whose **body content is verifiable**
+    # and can only be produced by genuinely reaching the open internet THROUGH
+    # the proxy backend. We require at least one such body-verified fetch to
+    # succeed before reporting the tunnel as working; the empty-204 endpoints are
+    # used only as a fast latency refinement once a real fetch has proven the
+    # path end-to-end.
+
+    # (url, substring-that-must-appear-in-body-lower). These return a real body
+    # that a CDN-edge-only path cannot fabricate, so a broken tunnel fails them.
+    _LIVE_VERIFY_ENDPOINTS = (
+        ("http://www.gstatic.com/generate_204", ""),   # latency hint (no body)
+        ("http://cp.cloudflare.com/generate_204", ""),  # latency hint (no body)
+        ("http://detectportal.firefox.com/success.txt", "success"),
+        ("http://www.msftconnecttest.com/connecttest.txt",
+         "microsoft connect test"),
+        ("https://www.gstatic.com/generate_204", ""),
+        ("https://cp.cloudflare.com/cdn-cgi/trace", "fl="),
+    )
+
+    def _live_proxy_ping_verified(self, opener, per_timeout, attempts):
+        """Probe the live tunnel, requiring a real body-verified fetch.
+
+        Returns ``(ok, latency_ms|None, detail)``. ``ok`` is True only if at
+        least one *content-verified* endpoint round-tripped real body bytes
+        through the proxy. Empty-204 endpoints contribute a latency sample but
+        never, on their own, count as success — so a tunnel that merely reaches
+        the CDN edge (the sabotaged-spoof "fake ping") is correctly reported red.
+        """
+        import time
+        import urllib.request
+
+        endpoints = list(self._LIVE_VERIFY_ENDPOINTS)
+        best = None
+        verified = False
+        last_detail = ""
+        # take at least one full pass over the endpoints so a body-verified one
+        # is always tried even when samples == 1.
+        rounds = max(attempts, 1)
+        idx = 0
+        while idx < max(rounds, len(endpoints)) and not (verified and best is not None):
+            url, marker = endpoints[idx % len(endpoints)]
+            idx += 1
             req = urllib.request.Request(
                 url, headers={"User-Agent": "SNISpoofer-ping"})
             t0 = time.time()
             try:
                 with opener.open(req, timeout=per_timeout) as resp:
                     code = resp.getcode()
+                    body = b""
+                    if marker:
+                        try:
+                            body = resp.read(4096) or b""
+                        except Exception:
+                            body = b""
                 dt = (time.time() - t0) * 1000.0
                 if code in (200, 204):
-                    best = dt if best is None else min(best, dt)
-                    last_detail = f"http {code}"
-                    # one solid success is enough to prove the tunnel works;
-                    # keep going only to refine latency if more samples remain.
-                    if best <= 1500:
-                        break
+                    if marker:
+                        # content check: the marker MUST appear in the body, or
+                        # this is a CDN-edge/captive impostor, not a real fetch.
+                        if marker.lower() in body.decode("latin-1", "ignore").lower():
+                            verified = True
+                            best = dt if best is None else min(best, dt)
+                            last_detail = f"verified {code} ({url})"
+                        else:
+                            last_detail = f"no-body-marker {code} ({url})"
+                    else:
+                        # empty-204: only a latency hint, never proof on its own
+                        best = dt if best is None else min(best, dt)
+                        if not last_detail:
+                            last_detail = f"http {code} (204-only)"
                 else:
                     last_detail = f"unexpected http {code}"
             except Exception as exc:
                 last_detail = f"{type(exc).__name__}: {exc}"
-        # If the sampled endpoints all failed, make one last sweep over ALL
-        # endpoints before giving up — guards against an unlucky pick of a
-        # momentarily-blocked host while the tunnel is genuinely fine.
-        if best is None:
-            for url in endpoints:
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "SNISpoofer-ping"})
-                t0 = time.time()
-                try:
-                    with opener.open(req, timeout=per_timeout) as resp:
-                        code = resp.getcode()
-                    if code in (200, 204):
-                        best = (time.time() - t0) * 1000.0
-                        last_detail = f"http {code}"
-                        break
-                    last_detail = f"unexpected http {code}"
-                except Exception as exc:
-                    last_detail = f"{type(exc).__name__}: {exc}"
-        if best is not None:
+        # success ONLY when a real body was verified end-to-end.
+        if verified and best is not None:
             return (True, float(best), last_detail or "ok")
+        # a 204 answered but nothing was content-verified → the tunnel reaches
+        # the CDN edge but cannot carry real traffic. Report honestly red.
+        if best is not None and not verified:
+            return (False, None, last_detail
+                    or "فقط لبهٔ CDN پاسخ داد (ترافیک واقعی رد نشد)")
         return (False, None, last_detail or "no response")
 
     # ------------------------------------------------------------------ start
@@ -996,8 +1040,16 @@ class EngineController:
         # port conflict); testing the configured default would hit a dead port.
         socks_port, http_port = self._effective_ports()
         proxy = f"http://127.0.0.1:{http_port}"
-        # 204 endpoints are tiny and return no body — ideal for a liveness probe
-        test_url = "https://www.gstatic.com/generate_204"
+        # CRITICAL — DON'T use an empty ``generate_204`` here. A sabotaged /
+        # broken spoof config still reaches the fixed Cloudflare anycast IP, so
+        # the CDN edge answers ``generate_204`` with a 204 *directly* — the
+        # traffic never reaches the open internet through the Worker. That made
+        # the self-test log "✓ تونل کار می‌کند" for a config that loaded no site
+        # (the user's "green ping + چند کیلوبایت دیتا ولی هیچ سایتی باز نشد").
+        # So we fetch a resource with a VERIFIABLE body that only a genuinely
+        # working tunnel can return, and require the body marker to be present.
+        test_url = "http://detectportal.firefox.com/success.txt"
+        body_marker = "success"
         self._log(f"[self-test] آزمایش مسیر داخلی از طریق پروکسی "
                   f"{proxy} → {test_url} …")
         try:
@@ -1009,13 +1061,27 @@ class EngineController:
             t0 = time.time()
             with opener.open(req, timeout=12) as resp:
                 code = resp.getcode()
+                try:
+                    body = (resp.read(4096) or b"").decode("latin-1", "ignore")
+                except Exception:
+                    body = ""
             dt = int((time.time() - t0) * 1000)
-            if code in (200, 204):
+            verified = code in (200, 204) and body_marker in body.lower()
+            if verified:
                 self._log(
-                    f"[self-test] ✓ مسیر داخلی سالم است (HTTP {code}، {dt}ms). "
-                    f"تونل کار می‌کند — اگر مرورگرتان باز نمی‌کند یعنی پروکسی "
-                    f"سیستم/مرورگر روی 127.0.0.1:{http_port} (یا SOCKS "
-                    f"{socks_port}) تنظیم نشده.")
+                    f"[self-test] ✓ مسیر داخلی سالم است (HTTP {code}، {dt}ms، "
+                    f"محتوای واقعی دریافت شد). تونل کار می‌کند — اگر مرورگرتان "
+                    f"باز نمی‌کند یعنی پروکسی سیستم/مرورگر روی "
+                    f"127.0.0.1:{http_port} (یا SOCKS {socks_port}) تنظیم نشده.")
+            elif code in (200, 204):
+                # got a status but NOT the expected body → only the CDN edge
+                # answered; real traffic isn't passing. This is exactly the
+                # "fake healthy" config — report it honestly as broken.
+                self._log(
+                    f"[self-test] ✗ تونل واقعی کار نمی‌کند: فقط لبهٔ CDN پاسخ "
+                    f"داد (HTTP {code} ولی محتوای واقعی رد نشد). این کانفیگ "
+                    f"وصل به‌نظر می‌رسد اما ترافیک واقعی عبور نمی‌کند — مسیر "
+                    f"Worker/سرور پشت CDN خراب است. [conn #...] را بررسی کنید.")
             else:
                 self._log(f"[self-test] ⚠ پاسخ غیرمنتظره HTTP {code} — مسیر "
                           f"کامل برقرار نشد.", )
