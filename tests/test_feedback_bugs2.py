@@ -933,9 +933,12 @@ class ErrorStateRestartTest(unittest.TestCase):
     """
 
     @staticmethod
-    def _should_restart(was_running, in_error, profile):
-        # mirrors the decision in _on_profile_selected
-        return was_running or (in_error and profile is not None)
+    def _should_restart(was_running, in_error, profile, same_active=False):
+        # mirrors the decision in _on_profile_selected: a restart fires when the
+        # engine was running OR is in error with a (new) profile selected — but
+        # NEVER when the chosen profile is already the live/active one.
+        return (was_running or (in_error and profile is not None)) \
+            and not same_active
 
     def test_error_plus_new_profile_triggers_restart(self):
         self.assertTrue(self._should_restart(False, True, object()))
@@ -948,6 +951,152 @@ class ErrorStateRestartTest(unittest.TestCase):
 
     def test_idle_no_profile_change_does_not_restart(self):
         self.assertFalse(self._should_restart(False, False, object()))
+
+    def test_running_but_same_active_profile_does_not_restart(self):
+        # re-selecting the already-active config must NOT tear down a live tunnel
+        self.assertFalse(self._should_restart(True, False, object(), same_active=True))
+
+
+# ---------------------------------------------------------------------------
+#  Round 4 — Stop/Start buttons + auto-restart on active-config switch
+#
+#  User report (ترجمه): «وقتی متصلم و کانفیگ فعال رو عوض می‌کنم خودش ریست
+#  می‌شه تا دوباره وصل شه؛ بعضی وقت‌ها باگ می‌خوره / کارها اجرا نمی‌شن /
+#  وصل نمی‌شه.» Two concrete UI regressions are covered here:
+#    (a) re-selecting the ALREADY-active profile must NOT trigger a restart
+#        (no needless teardown of a healthy tunnel → the surprise self-reset).
+#    (b) pressing Stop must reflect «idle» on the dashboard *immediately*, even
+#        mid-restart, so the button never looks wedged on «در حال اتصال…».
+# ---------------------------------------------------------------------------
+
+class _SwitchEngine(_RestartEngine):
+    """Restart engine stub that also models the active profile/endpoint.
+
+    ``is_active_profile`` returns True only for the profile currently set, so
+    the same-active guard in ``_on_profile_selected`` can be exercised exactly
+    as it runs in production (EngineBridge exposes the same method).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.profile = None
+        self.set_profile_calls = 0
+        self.config_updates = 0
+        self.status_value = "active"
+
+    def set_profile(self, profile):
+        self.set_profile_calls += 1
+        self.profile = profile
+
+    def update_config(self, _cfg):
+        self.config_updates += 1
+
+    def is_active_profile(self, profile):
+        return self.profile is profile and self._running
+
+
+class _Profile:
+    def __init__(self, name="srv"):
+        self.display_name = name
+
+
+class ConfigSwitchRestartTest(unittest.TestCase):
+    def setUp(self):
+        from PySide6.QtWidgets import QApplication
+        self.app = QApplication.instance() or QApplication([])
+
+    def _switch_window(self):
+        """A _bare_window wired with a _SwitchEngine and the extra collaborators
+        _on_profile_selected touches, so the real method can run end-to-end."""
+        w = _bare_window()
+        w.engine = _SwitchEngine()
+
+        class _Store:
+            def __init__(self):
+                self.config = {}
+
+            def get(self, _k, default=None):
+                # report Tunnel so the method doesn't try to flip SNI Only→Tunnel
+                return "Tunnel"
+
+            def set(self, *_a, **_k):
+                pass
+
+            def save_config(self):
+                pass
+        w.store = _Store()
+
+        class _Bar:
+            def __init__(self):
+                self.profile = None
+                self.status = None
+
+            def set_profile(self, p):
+                self.profile = p
+
+            def set_status(self, s, *_a):
+                self.status = s
+        w.active_bar = _Bar()
+        # neutralise collaborators that aren't under test
+        w._sync_mode_applicability = lambda *_a, **_k: None
+        return w
+
+    def test_reselecting_active_profile_does_not_restart(self):
+        """The core fix: clicking «فعال‌سازی» on the row that is ALREADY the
+        live endpoint must keep the tunnel untouched — no stop(), no restart."""
+        from ui.window import MainWindow
+        import ui.window as win
+        w = self._switch_window()
+        prof = _Profile("active-one")
+        # engine is up and this profile is the active endpoint
+        w.engine.start()
+        w.engine.profile = prof
+        stops_before = w.engine.stopped
+        orig_toast = win.Toast.show_message
+        win.Toast.show_message = staticmethod(lambda *a, **k: None)
+        try:
+            MainWindow._on_profile_selected(w, prof)
+        finally:
+            win.Toast.show_message = orig_toast
+        # no restart fired: mask never raised, engine never stopped
+        self.assertFalse(w._restarting)
+        self.assertEqual(w.engine.stopped, stops_before)
+
+    def test_switching_to_a_different_profile_restarts(self):
+        """Selecting a genuinely different config while running MUST restart."""
+        from ui.window import MainWindow
+        import ui.window as win
+        w = self._switch_window()
+        old = _Profile("old")
+        new = _Profile("new")
+        w.engine.start()
+        w.engine.profile = old           # active endpoint is the OLD profile
+        orig_toast = win.Toast.show_message
+        win.Toast.show_message = staticmethod(lambda *a, **k: None)
+        try:
+            MainWindow._on_profile_selected(w, new)
+        finally:
+            win.Toast.show_message = orig_toast
+        # _begin_restart() was driven: mask on + engine stop issued
+        self.assertTrue(w._restarting)
+        self.assertGreaterEqual(w.engine.stopped, 1)
+
+    def test_stop_button_reflects_idle_immediately(self):
+        """Pressing Stop forces the dashboard/active-bar to «idle» right away —
+        even if a stale «connecting» was on screen mid-restart."""
+        from ui.window import MainWindow
+        w = _bare_window()
+        # pretend a restart was in flight and the UI shows connecting
+        w._restarting = True
+        w._restart_phase = "starting"
+        w.page_dashboard.set_status("connecting")
+        w.active_bar.set_status("connecting")
+        MainWindow._on_power(w, "stop")
+        # restart cancelled, engine stopped, and UI snapped to idle synchronously
+        self.assertFalse(w._restarting)
+        self.assertEqual(w.engine.stopped, 1)
+        self.assertEqual(w.page_dashboard.status, "idle")
+        self.assertEqual(w.active_bar.status, "idle")
 
 
 # ---------------------------------------------------------------------------
