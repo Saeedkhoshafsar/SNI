@@ -187,6 +187,128 @@ def test_profile_with_ip_swaps_only_address_and_roundtrips():
     assert p3.path == p.path
 
 
+# ---------------------------------------------------------------------------
+#  relay-path detection (AYYILDIZ webtun config: long ws path with a nested URL)
+# ---------------------------------------------------------------------------
+
+def test_relay_path_detection_for_webtun_style_paths():
+    from core.cf_scanner import _is_relay_path
+    # the exact shape the user reported — a ws path that embeds a backend URL
+    assert _is_relay_path(
+        "/stars/http://PQ3YjMsJql:fCfJXXbDcw@vps.webtun.xyz:2087") is True
+    assert _is_relay_path("/relay/https://backend.example.com:8443") is True
+    assert _is_relay_path("/tunnel/user:pass@host:1234") is True
+    # ordinary ws paths are NOT relay paths → strict WS validation still applies
+    assert _is_relay_path("/") is False
+    assert _is_relay_path("/ws") is False
+    assert _is_relay_path("/stars/abc123") is False
+    assert _is_relay_path("") is False
+
+
+def test_ws_relay_path_revalidates_on_root_when_complex_path_refused():
+    """Issue: AYYILDIZ ws config (``/stars/http://...vps.webtun.xyz:2087``)
+    pinged RED even though it connects. A bare WS probe on the relay path is
+    refused by the Worker (it tries to dial the nested backend), so the prober
+    must fall back to validating the WS layer on the root path ``/``. We drive
+    the real :func:`cf_ip_probe` with monkeypatched socket/ssl/IO so no network
+    is touched, and assert it ends OK via the root-path retry.
+    """
+    import core.cf_scanner as cf
+    from core.cf_scanner import ProbeSpec, OK as _OK
+
+    state = {"ws_calls": []}
+
+    # --- stub out the socket / TLS layer (no real network) ---
+    class _Sock:
+        def close(self):
+            pass
+
+    def fake_open_socket(ip, port, timeout):
+        return _Sock()
+
+    class _Ctx:
+        check_hostname = True
+        verify_mode = None
+        def wrap_socket(self, sock, server_hostname=""):
+            return sock
+
+    import ssl as ssl_mod
+    real_ctx = ssl_mod.create_default_context
+    real_open = cf._open_socket
+    real_trace = cf._http_trace_ok
+    real_ws = cf._ws_upgrade_ok
+    ssl_mod.create_default_context = lambda: _Ctx()
+    cf._open_socket = fake_open_socket
+    # stage 1: the edge is live for this host
+    cf._http_trace_ok = lambda stream, host, timeout: (True, "cf edge ok")
+
+    # stage 2: the WS upgrade on the COMPLEX relay path is refused, but the
+    # retry on "/" succeeds (proves the host route is alive).
+    def fake_ws(stream, host, path, timeout):
+        state["ws_calls"].append(path)
+        if path == "/":
+            return (True, "ws upgrade 101")
+        return (False, "ws upgrade refused")
+
+    cf._ws_upgrade_ok = fake_ws
+    try:
+        spec = ProbeSpec(
+            port=443, server_name="hammm2.pages.dev", host="hammm2.pages.dev",
+            path="/stars/http://PQ3YjMsJql:fCfJXXbDcw@vps.webtun.xyz:2087",
+            is_ws=True, is_tls=True)
+        res = cf.cf_ip_probe("104.18.151.71", spec, 3.0)
+    finally:
+        ssl_mod.create_default_context = real_ctx
+        cf._open_socket = real_open
+        cf._http_trace_ok = real_trace
+        cf._ws_upgrade_ok = real_ws
+
+    assert res.outcome == _OK, res.detail
+    # it tried the real relay path first, then fell back to "/"
+    assert state["ws_calls"][0].startswith("/stars/http://")
+    assert "/" in state["ws_calls"]
+
+
+def test_ws_ordinary_path_does_not_get_root_fallback():
+    """A plain ws path that is genuinely refused must stay RED — the root-path
+    leniency is ONLY for relay paths, so a broken ordinary config is honest.
+    """
+    import core.cf_scanner as cf
+    from core.cf_scanner import ProbeSpec, ERROR as _ERR
+
+    class _Sock:
+        def close(self):
+            pass
+
+    class _Ctx:
+        check_hostname = True
+        verify_mode = None
+        def wrap_socket(self, sock, server_hostname=""):
+            return sock
+
+    import ssl as ssl_mod
+    real_ctx = ssl_mod.create_default_context
+    real_open = cf._open_socket
+    real_trace = cf._http_trace_ok
+    real_ws = cf._ws_upgrade_ok
+    ssl_mod.create_default_context = lambda: _Ctx()
+    cf._open_socket = lambda ip, port, timeout: _Sock()
+    cf._http_trace_ok = lambda stream, host, timeout: (True, "cf edge ok")
+    cf._ws_upgrade_ok = lambda stream, host, path, timeout: (False, "refused")
+    try:
+        spec = ProbeSpec(
+            port=443, server_name="x.pages.dev", host="x.pages.dev",
+            path="/ws", is_ws=True, is_tls=True)
+        res = cf.cf_ip_probe("104.18.151.71", spec, 3.0)
+    finally:
+        ssl_mod.create_default_context = real_ctx
+        cf._open_socket = real_open
+        cf._http_trace_ok = real_trace
+        cf._ws_upgrade_ok = real_ws
+
+    assert res.outcome == _ERR
+
+
 if __name__ == "__main__":  # pragma: no cover
     import pytest as _pt
     raise SystemExit(_pt.main([__file__, "-q"]))

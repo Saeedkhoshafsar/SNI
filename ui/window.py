@@ -1637,19 +1637,15 @@ class InlinePingWorker(QThread):
             self.result.emit(tr("✖ بدون پاسخ"), "err")
             return
 
-        # additionally require a bypass strategy to actually connect; if none
-        # does, the transport is reachable but DPI blocks the protocol → not
-        # usable, report honestly instead of a misleading latency.
+        # We DON'T run the bypass-strategy probe here. Strategies are SNI-spoof /
+        # DPI-evasion techniques that only sit in the path for *spoof* configs
+        # (handled in step 2 above). An ordinary/direct config never uses a
+        # strategy, so probing them and then declaring "✖ مسدود (هیچ استراتژی
+        # وصل نشد)" was simply wrong — it made perfectly working direct configs
+        # (the user's 电信-SIN-07) look blocked. The strict edge/TLS validation in
+        # ``ping_profile`` above is the honest test for these configs: it already
+        # passed, so report the real latency.
         best_ms = res.best_ms
-        try:
-            report = self._engine.probe_strategies_for(self._profile)
-        except Exception:
-            report = None
-        if report is not None and report.results and not report.any_connected:
-            self.result.emit(tr("✖ مسدود (هیچ استراتژی وصل نشد)"), "err")
-            return
-        if report is not None and report.best is not None and report.best.latency_ms:
-            best_ms = report.best.latency_ms
 
         parts = [f"{best_ms:.0f}ms"]
         if res.jitter_ms is not None:
