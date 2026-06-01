@@ -116,7 +116,7 @@ def _install_fakes():
     # neutralise the post-start connectivity self-test so the test suite never
     # spins up a real network probe thread (no xray/spoofer exist under fakes).
     saved_selftest = EngineController._self_test_chain
-    EngineController._self_test_chain = lambda self: None
+    EngineController._self_test_chain = lambda self, *a, **k: None
 
     def restore():
         if saved_main is not None:
@@ -501,6 +501,43 @@ class EngineControllerTest(unittest.TestCase):
         before = ctrl.status
         self.assertFalse(ctrl._commit_active(old_epoch))
         self.assertEqual(ctrl.status, before)
+        ctrl.stop()
+
+    # -- self-test enforcement (sabotaged config that fakes data flow) ----
+    #
+    # User report: a deliberately-broken spoof config still pinged "connected"
+    # and the time/usage tab showed a few KB flowing (xray retry overhead to the
+    # dead backend), yet NO site loaded. The self-test now DEMOTES such a session
+    # to ERROR so a config that only reaches the CDN edge can't masquerade as
+    # working while leaking bytes.
+
+    def test_demote_failed_selftest_flips_active_to_error(self):
+        ctrl = EngineController({"connection_mode": "SNI Only"})
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        epoch = ctrl._start_epoch
+        ctrl._demote_failed_selftest(epoch, "فقط لبهٔ CDN پاسخ داد")
+        self.assertEqual(ctrl.status, STATUS_ERROR)
+
+    def test_demote_respects_enforce_flag_off(self):
+        ctrl = EngineController({"connection_mode": "SNI Only",
+                                 "self_test_enforce": False})
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        epoch = ctrl._start_epoch
+        ctrl._demote_failed_selftest(epoch, "edge only")
+        # enforcement disabled → stays ACTIVE (log-only legacy behaviour)
+        self.assertEqual(ctrl.status, STATUS_ACTIVE)
+        ctrl.stop()
+
+    def test_demote_ignored_for_stale_epoch(self):
+        ctrl = EngineController({"connection_mode": "SNI Only"})
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        stale = ctrl._start_epoch - 1   # a superseded (older) self-test
+        ctrl._demote_failed_selftest(stale, "edge only")
+        # epoch moved on → must not touch the current ACTIVE session
+        self.assertEqual(ctrl.status, STATUS_ACTIVE)
         ctrl.stop()
 
     # -- auto-prober integration -----------------------------------------

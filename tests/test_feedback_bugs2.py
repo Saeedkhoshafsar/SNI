@@ -441,6 +441,49 @@ class TlsHandshakeFallbackTest(unittest.TestCase):
         self.assertTrue(called["fallback"])
         self.assertEqual(ms, 42.0)
 
+    def test_tls_latency_does_not_fall_back_for_cloudflare_host(self):
+        """REGRESSION (电信-SIN-07 / AYYILDIZ false-green): for a Cloudflare
+        anycast IP (or *.pages.dev / *.workers.dev SNI), a failed edge probe must
+        NOT fall back to a bare TLS handshake — every CF anycast IP completes a
+        TLS handshake for any SNI, so the fallback would falsely green a dirty
+        IP / dead route. The ping must stay honestly red.
+        """
+        import core.ping as ping_mod
+        from core import cf_scanner
+
+        class _Res:
+            outcome = cf_scanner.RST    # edge probe fails
+            latency_ms = 0.0
+
+        called = {"fallback": False}
+
+        def fake_fallback(*a, **k):
+            called["fallback"] = True
+            return 7.0
+
+        real_probe = cf_scanner.cf_ip_probe
+        orig_fallback = ping_mod._tls_handshake_latency
+        cf_scanner.cf_ip_probe = lambda *a, **k: _Res()
+        ping_mod._tls_handshake_latency = fake_fallback
+        try:
+            # a Cloudflare anycast IP with a pages.dev SNI (the AYYILDIZ shape)
+            ms_ip = ping_mod.tls_latency(
+                "104.18.151.71", 8443, 3.0,
+                server_name="hammm2.pages.dev",
+                host_header="hammm2.pages.dev", is_tls=True, retries=1)
+            # a non-CF IP but a workers.dev SNI → still CF-fronted by hostname
+            ms_host = ping_mod.tls_latency(
+                "203.0.113.9", 8443, 3.0,
+                server_name="x.workers.dev",
+                host_header="x.workers.dev", is_tls=True, retries=1)
+        finally:
+            cf_scanner.cf_ip_probe = real_probe
+            ping_mod._tls_handshake_latency = orig_fallback
+        self.assertIsNone(ms_ip)        # CF anycast IP → honest red, no fallback
+        self.assertIsNone(ms_host)      # workers.dev SNI → honest red, no fallback
+        self.assertFalse(called["fallback"],
+                         "CF-fronted config must NOT use the TLS-handshake fallback")
+
 
 # ---------------------------------------------------------------------------
 #  Round 4 (from real logs) — CDN-fronted configs must be validated HONESTLY:

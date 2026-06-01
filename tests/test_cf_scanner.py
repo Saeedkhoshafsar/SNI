@@ -244,7 +244,7 @@ def test_ws_relay_path_revalidates_on_root_when_complex_path_refused():
 
     # stage 2: the WS upgrade on the COMPLEX relay path is refused, but the
     # retry on "/" succeeds (proves the host route is alive).
-    def fake_ws(stream, host, path, timeout):
+    def fake_ws(stream, host, path, timeout, relaxed=False):
         state["ws_calls"].append(path)
         if path == "/":
             return (True, "ws upgrade 101")
@@ -294,7 +294,7 @@ def test_ws_ordinary_path_does_not_get_root_fallback():
     ssl_mod.create_default_context = lambda: _Ctx()
     cf._open_socket = lambda ip, port, timeout: _Sock()
     cf._http_trace_ok = lambda stream, host, timeout: (True, "cf edge ok")
-    cf._ws_upgrade_ok = lambda stream, host, path, timeout: (False, "refused")
+    cf._ws_upgrade_ok = lambda stream, host, path, timeout, relaxed=False: (False, "refused")
     try:
         spec = ProbeSpec(
             port=443, server_name="x.pages.dev", host="x.pages.dev",
@@ -307,6 +307,65 @@ def test_ws_ordinary_path_does_not_get_root_fallback():
         cf._ws_upgrade_ok = real_ws
 
     assert res.outcome == _ERR
+
+
+def test_is_cloudflare_host_classifies_ips_and_hostnames():
+    from core.cf_scanner import is_cloudflare_host
+
+    # IPs inside published Cloudflare ranges
+    assert is_cloudflare_host("104.18.151.71") is True   # AYYILDIZ front IP
+    assert is_cloudflare_host("104.19.229.21") is True   # spoof connect IP
+    assert is_cloudflare_host("172.64.0.1") is True
+    # IPs OUTSIDE Cloudflare → a direct VPS
+    assert is_cloudflare_host("8.8.8.8") is False
+    assert is_cloudflare_host("1.1.1.1") is False        # CF DNS, not in ranges
+    assert is_cloudflare_host("203.0.113.7") is False
+    # Cloudflare-fronted hostnames
+    assert is_cloudflare_host("hammm2.pages.dev") is True
+    assert is_cloudflare_host("myworker.workers.dev") is True
+    assert is_cloudflare_host("abc.trycloudflare.com") is True
+    # ordinary / direct hostnames
+    assert is_cloudflare_host("vps.webtun.xyz") is False
+    assert is_cloudflare_host("example.com") is False
+    assert is_cloudflare_host("") is False
+
+
+def test_ws_relay_relaxed_accepts_plain_cf_edge_response():
+    """A relay Worker often answers the bare ``/`` upgrade with a plain 2xx (its
+    landing page) rather than 101. With ``relaxed=True`` (relay revalidation)
+    that still counts as the host route being live; without it, it's refused.
+    """
+    import core.cf_scanner as cf
+
+    class _Stream:
+        def __init__(self, payload):
+            self._p = payload
+            self._sent = False
+
+        def settimeout(self, *_a):
+            pass
+
+        def sendall(self, *_a):
+            pass
+
+        def recv(self, _n):
+            if self._sent:
+                return b""
+            self._sent = True
+            return self._p
+
+        def close(self):
+            pass
+
+    # a plain 200 from a Cloudflare edge (cf-ray header present), NOT a 101
+    payload = (b"HTTP/1.1 200 OK\r\nserver: cloudflare\r\n"
+               b"cf-ray: abc123\r\n\r\nhello")
+    relaxed_ok, _ = cf._ws_upgrade_ok(_Stream(payload), "h", "/", 1.0,
+                                      relaxed=True)
+    strict_ok, _ = cf._ws_upgrade_ok(_Stream(payload), "h", "/", 1.0,
+                                     relaxed=False)
+    assert relaxed_ok is True       # relay revalidation accepts a live edge
+    assert strict_ok is False       # strict mode still requires 101 / cf 4xx
 
 
 if __name__ == "__main__":  # pragma: no cover

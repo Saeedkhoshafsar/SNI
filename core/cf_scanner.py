@@ -232,7 +232,8 @@ def cf_ip_probe(ip: str, spec: "ProbeSpec",
                                 _safe_close(ws_sock2)
                         if ws_stream2 is not None:
                             ws_ok, ws_detail = _ws_upgrade_ok(
-                                ws_stream2, host_hdr, "/", timeout)
+                                ws_stream2, host_hdr, "/", timeout,
+                                relaxed=True)
                             _safe_close(ws_stream2)
                 if not ws_ok:
                     _safe_close(stream)
@@ -319,7 +320,7 @@ def _http_trace_ok(stream, host: str,
 
 
 def _ws_upgrade_ok(stream, host: str, path: str,
-                   timeout: float):  # pragma: no cover - needs net
+                   timeout: float, relaxed: bool = False):  # pragma: no cover - needs net
     """Send a WebSocket upgrade and verify the edge accepts/routes it.
 
     Returns ``(ok, detail)``. ``101 Switching Protocols`` is a clean pass. A
@@ -327,6 +328,10 @@ def _ws_upgrade_ok(stream, host: str, path: str,
     *with* a cloudflare server header still proves the WS path reaches a live
     edge for this Host, so it counts — what we're rejecting is the IP that
     can't carry a WS handshake to this hostname at all.
+
+    ``relaxed`` (relay revalidation on ``/``): also accept any genuine
+    Cloudflare-edge response (e.g. a plain 2xx/3xx) as proof the host route is
+    live, since a relay Worker often serves a landing page instead of upgrading.
     """
     import base64 as _b64
     import os as _os
@@ -357,6 +362,13 @@ def _ws_upgrade_ok(stream, host: str, path: str,
                   or " 403" in text[:16] or " 404" in text[:16]
                   or " 426" in text[:16]):
         return True, "ws reachable (cf 4xx)"
+    # relay/tunnel paths: a bare unauthenticated upgrade on the nested-URL path
+    # is routinely answered by the Worker with a plain 2xx/3xx (it serves its
+    # landing page) rather than 101 — yet the host route IS live through this
+    # edge. When the caller flags this as a relay revalidation we accept ANY
+    # genuine Cloudflare-edge response as proof the WS layer reaches the host.
+    if relaxed and is_cf:
+        return True, "ws reachable (cf edge, relay-relaxed)"
     return False, "ws upgrade refused"
 
 
@@ -371,6 +383,53 @@ def _is_relay_path(path: str) -> bool:
     """
     p = (path or "").lower()
     return ("http://" in p) or ("https://" in p) or ("@" in p and ":" in p)
+
+
+# Hostnames that are *always* fronted by Cloudflare — a bare TLS handshake to
+# them proves nothing about whether the specific Worker/Pages route works (the
+# anycast edge answers TLS for any SNI). These must be validated by the edge
+# probe only, never by a TLS-handshake latency fallback.
+_CLOUDFLARE_HOST_SUFFIXES: tuple[str, ...] = (
+    ".pages.dev",
+    ".workers.dev",
+    ".trycloudflare.com",
+    ".cloudflare.com",
+    ".cdn.cloudflare.net",
+)
+
+
+def is_cloudflare_host(host: str) -> bool:
+    """True when *host* is served by Cloudflare's anycast edge.
+
+    Used to decide whether a bare TLS-handshake latency is *honest* evidence
+    that a config works. For a Cloudflare-fronted host it is NOT — every anycast
+    IP completes a TLS handshake for any SNI, so a broken Worker/Pages route
+    still "handshakes" (the 电信-SIN-07 / AYYILDIZ false-green). For such hosts
+    only the real edge probe (trace + ws upgrade) may decide green. A direct
+    (non-CF) VPS, by contrast, only answers TLS when it is genuinely alive, so
+    the fallback stays meaningful there.
+
+    Accepts an IP literal (checked against the published Cloudflare ranges) or a
+    hostname (checked against well-known Cloudflare suffixes).
+    """
+    h = (host or "").strip().strip("[]").lower()
+    if not h:
+        return False
+    # IP literal → is it inside a published Cloudflare range?
+    try:
+        addr = ipaddress.ip_address(h)
+        for cidr in CLOUDFLARE_IPV4_CIDRS:
+            try:
+                if addr in ipaddress.ip_network(cidr, strict=False):
+                    return True
+            except ValueError:
+                continue
+        return False
+    except ValueError:
+        pass
+    # hostname → known Cloudflare-fronted suffix
+    return any(h == s.lstrip(".") or h.endswith(s)
+               for s in _CLOUDFLARE_HOST_SUFFIXES)
 
 
 def _read_response(stream, timeout: float,

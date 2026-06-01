@@ -108,7 +108,7 @@ def tls_latency(host: str, port: int, timeout: float, *,
     now means "this endpoint really answers for this config", matching the
     behaviour the user expects from V2RayTun.
     """
-    from .cf_scanner import cf_ip_probe, ProbeSpec, OK, RST, TIMEOUT
+    from .cf_scanner import cf_ip_probe, ProbeSpec, OK, RST, TIMEOUT, is_cloudflare_host
 
     spec = ProbeSpec(
         port=int(port),
@@ -145,9 +145,19 @@ def tls_latency(host: str, port: int, timeout: float, *,
     # میکنه". For a direct config the host IS the real server (not a shared
     # anycast IP), so a genuine TLS handshake presenting the config's own SNI is
     # honest evidence the endpoint is alive and speaks TLS for this config.
-    # Only meaningful for TLS configs; a plaintext direct config has no handshake
-    # to validate, so we leave it honestly red rather than fake a number.
-    if is_tls:
+    #
+    # CRITICAL (电信-SIN-07 / AYYILDIZ false-green): this fallback is ONLY honest
+    # for a *direct* (non-Cloudflare) server. For a Cloudflare-fronted host
+    # (a CF anycast IP, or a *.pages.dev / *.workers.dev SNI) every anycast edge
+    # completes a TLS handshake for ANY SNI — so the handshake "succeeds" even
+    # when the IP is dirty / the Worker route is dead / the config can't connect.
+    # That is precisely the reported "should be red but shows green" bug. So for
+    # Cloudflare-fronted configs we DO NOT fall back: only the real edge probe
+    # (trace + ws upgrade) above may turn the ping green. Honest red otherwise.
+    cf_fronted = (is_cloudflare_host(host)
+                  or is_cloudflare_host(server_name)
+                  or is_cloudflare_host(host_header))
+    if is_tls and not cf_fronted:
         sni = (server_name or host or "").strip().strip("[]")
         ms = _tls_handshake_latency(host, int(port), timeout, server_name=sni)
         if ms is not None:
