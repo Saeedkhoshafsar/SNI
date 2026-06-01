@@ -363,40 +363,90 @@ class EngineController:
         worked"). When the tunnel is up we sidestep that contradiction entirely
         by measuring through it.
 
-        Only meaningful while :pyattr:`is_running` / status active; returns
-        ``(False, None, ...)`` otherwise.
+        Only meaningful while the tunnel is up (status active/connecting);
+        returns ``(False, None, ...)`` otherwise.
+
+        Robustness (the repeated "تونل زنده پاسخ نداد although I'm connected"
+        bug): a single HTTPS-over-CONNECT request to ONE endpoint is fragile —
+        the captive 204 host may be slow/blocked, or the TLS-through-proxy
+        handshake may hiccup, even while normal browsing through the tunnel
+        works fine. So we now try several lightweight connectivity-check
+        endpoints (the same ones OSes use for captive-portal detection),
+        preferring **plain-HTTP 204** probes (which travel the proxy as an
+        ordinary GET — no CONNECT/TLS layer to trip over) and falling back to
+        HTTPS. Success on ANY endpoint ⇒ the tunnel works; we report the best
+        latency seen. We only report failure if EVERY endpoint failed.
         """
         import time
         import urllib.request
 
-        if self._status != STATUS_ACTIVE:
+        # accept connecting too: the user may ping right as it comes up; the
+        # proxy port is already bound by then. (Idle/error → nothing to test.)
+        if self._status not in (STATUS_ACTIVE, STATUS_CONNECTING):
             return (False, None, "tunnel not active")
         try:
             _socks, http_port = self._effective_ports()
         except Exception:
             return (False, None, "no bound port")
+        if not http_port:
+            return (False, None, "no http inbound")
         proxy = f"http://127.0.0.1:{http_port}"
-        test_url = "https://www.gstatic.com/generate_204"
         handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         opener = urllib.request.build_opener(handler)
+        # captive-portal / connectivity-check endpoints. Plain-HTTP 204 first
+        # (cheapest + most proxy-friendly), then HTTPS as a fallback.
+        endpoints = [
+            "http://www.gstatic.com/generate_204",
+            "http://cp.cloudflare.com/generate_204",
+            "http://connectivitycheck.gstatic.com/generate_204",
+            "https://www.gstatic.com/generate_204",
+            "https://cp.cloudflare.com/generate_204",
+        ]
+        # a per-request timeout that scales with samples but stays snappy; the
+        # caller's overall budget is roughly samples * per_timeout.
+        per_timeout = max(4.0, float(timeout) / max(1, int(samples) + 1))
         best = None
         last_detail = ""
-        n = max(1, int(samples))
-        for _ in range(n):
+        attempts = max(1, int(samples))
+        for i in range(attempts):
+            url = endpoints[i % len(endpoints)] if attempts <= len(endpoints) \
+                else endpoints[i % len(endpoints)]
             req = urllib.request.Request(
-                test_url, headers={"User-Agent": "SNISpoofer-ping"})
+                url, headers={"User-Agent": "SNISpoofer-ping"})
             t0 = time.time()
             try:
-                with opener.open(req, timeout=timeout) as resp:
+                with opener.open(req, timeout=per_timeout) as resp:
                     code = resp.getcode()
                 dt = (time.time() - t0) * 1000.0
                 if code in (200, 204):
                     best = dt if best is None else min(best, dt)
                     last_detail = f"http {code}"
+                    # one solid success is enough to prove the tunnel works;
+                    # keep going only to refine latency if more samples remain.
+                    if best <= 1500:
+                        break
                 else:
                     last_detail = f"unexpected http {code}"
             except Exception as exc:
                 last_detail = f"{type(exc).__name__}: {exc}"
+        # If the sampled endpoints all failed, make one last sweep over ALL
+        # endpoints before giving up — guards against an unlucky pick of a
+        # momentarily-blocked host while the tunnel is genuinely fine.
+        if best is None:
+            for url in endpoints:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "SNISpoofer-ping"})
+                t0 = time.time()
+                try:
+                    with opener.open(req, timeout=per_timeout) as resp:
+                        code = resp.getcode()
+                    if code in (200, 204):
+                        best = (time.time() - t0) * 1000.0
+                        last_detail = f"http {code}"
+                        break
+                    last_detail = f"unexpected http {code}"
+                except Exception as exc:
+                    last_detail = f"{type(exc).__name__}: {exc}"
         if best is not None:
             return (True, float(best), last_detail or "ok")
         return (False, None, last_detail or "no response")
