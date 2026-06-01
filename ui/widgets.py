@@ -6,7 +6,7 @@ ripple) lives in ``animations.py`` and is layered on top of these in step 2.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QPoint, QPointF, QTimer, Signal
+from PySide6.QtCore import Qt, QPoint, QPointF, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGraphicsDropShadowEffect,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from ui import icons
 from ui.i18n import tr
 
 
@@ -266,25 +267,40 @@ class TitleBar(QFrame):
 # ---------------------------------------------------------------------------
 
 class NavItem(QPushButton):
-    def __init__(self, text: str, icon: str = "", parent: QWidget | None = None):
-        label = f"{icon}  {text}" if icon else text
-        super().__init__(label, parent)
+    """A side-nav button with a crisp 3-D vector icon.
+
+    The icon recolours itself to the accent colour when the item is selected
+    and to the muted-text colour when idle, so the active page is obvious.
+    Call :meth:`refresh_icon` after a theme change.
+    """
+
+    def __init__(self, text: str, icon_name: str = "",
+                 parent: QWidget | None = None):
+        super().__init__(text, parent)
         self.setObjectName("NavItem")
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
+        self._icon_name = icon_name
+        if icon_name:
+            self.setIconSize(QSize(20, 20))
+            self.refresh_icon(self.isChecked())
+
+    def refresh_icon(self, checked: bool | None = None) -> None:
+        """Recolour the nav icon for the current checked/theme state."""
+        if not self._icon_name:
+            return
+        if checked is None:
+            checked = self.isChecked()
+        col = icons._nav_active if checked else icons._nav_idle
+        self.setIcon(icons.icon(self._icon_name, color=col, size=20))
 
 
 # ---------------------------------------------------------------------------
 #  Rich profile-list row (icon + name + server detail + badges + active mark)
 # ---------------------------------------------------------------------------
 
-# A glyph per protocol so each row is instantly recognisable.
-_PROTO_ICON = {
-    "vless": "\u2728",        # sparkles
-    "vmess": "\u25c8",        # diamond
-    "trojan": "\u2694",       # crossed swords
-    "shadowsocks": "\U0001f512",  # lock
-}
+# A 3-D vector icon per protocol so each row is instantly recognisable.
+_PROTO_ICON = icons.PROTO_ICON_NAME
 
 
 class ProfileRow(QFrame):
@@ -336,11 +352,18 @@ class ProfileRow(QFrame):
         self.chk_select.toggled.connect(self.selection_toggled.emit)
         lay.addWidget(self.chk_select, 0, Qt.AlignVCenter)
 
-        # protocol glyph (vertically centred so it lines up with the two-row text)
-        glyph = QLabel(_PROTO_ICON.get(profile.protocol, "\u25c9"))
+        # protocol glyph — a crisp 3-D vector icon (vertically centred so it
+        # lines up with the two-row text). Falls back to a generic ring icon
+        # for unknown protocols.
+        self._protocol = profile.protocol
+        self._active = active
+        _proto_name = _PROTO_ICON.get(
+            (profile.protocol or "").lower(), "proto_generic")
+        glyph = QLabel()
         glyph.setObjectName("RowGlyph")
-        glyph.setFixedWidth(24)
+        glyph.setFixedWidth(26)
         glyph.setAlignment(Qt.AlignCenter)
+        glyph.setPixmap(icons.pixmap(_proto_name, size=20))
         lay.addWidget(glyph, 0, Qt.AlignVCenter)
 
         # name + detail column (gets the stretch so it owns the free width)
@@ -402,61 +425,70 @@ class ProfileRow(QFrame):
         col.addLayout(detail_row)
         lay.addLayout(col, 1)
 
-        # transport / security badges (vertically centred)
+        # transport / security badges (vertically centred). Tracked so the
+        # responsive logic can hide them first when the row gets narrow (#2).
+        self._badge_labels: list[QLabel] = []
         for txt in self._badges(profile):
             b = QLabel(txt)
             b.setObjectName("RowBadge")
             lay.addWidget(b, 0, Qt.AlignVCenter)
+            self._badge_labels.append(b)
 
-        # inline ping button — measure THIS server's latency right here and
-        # show the result inline, instead of a buried separate panel (#3).
-        self.btn_ping = QPushButton("\U0001f4e1")
-        self.btn_ping.setObjectName("RowPing")
-        self.btn_ping.setCursor(Qt.PointingHandCursor)
-        self.btn_ping.setFixedSize(28, 28)
-        self.btn_ping.setToolTip(tr("پینگ این سرور"))
-        self.btn_ping.clicked.connect(self.ping.emit)
+        # inline action buttons — all use crisp 3-D vector icons (#1). Tracked
+        # in _icon_buttons so a theme change can recolour them, and referenced
+        # by name in _apply_responsive() for progressive collapse (#2).
+        self._icon_buttons: list[tuple[QPushButton, str]] = []
+
+        # ping — measure THIS server's latency inline (#3)
+        self.btn_ping = self._icon_btn("ping", "RowPing",
+                                       tr("پینگ این سرور"), self.ping.emit)
         lay.addWidget(self.btn_ping, 0, Qt.AlignVCenter)
 
-        # inline "use this server" button — one click activates the profile
-        # without opening any dialog (#8). Hidden when already active.
-        self.btn_use = QPushButton("\u2714")
-        self.btn_use.setObjectName("RowUse")
-        self.btn_use.setCursor(Qt.PointingHandCursor)
-        self.btn_use.setFixedSize(28, 28)
-        self.btn_use.setToolTip(tr("فعال‌سازی این سرور"))
-        self.btn_use.clicked.connect(self.activate.emit)
+        # "use this server" — one click activates without a dialog (#8)
+        self.btn_use = self._icon_btn("check", "RowUse",
+                                      tr("فعال‌سازی این سرور"),
+                                      self.activate.emit)
         self.btn_use.setVisible(not active)
         lay.addWidget(self.btn_use, 0, Qt.AlignVCenter)
 
-        # inline "scan clean Cloudflare IPs" button — runs the scanner using
-        # THIS config as the reference test (issue #3).
-        self.btn_scan = QPushButton("\U0001f50d")
-        self.btn_scan.setObjectName("RowScan")
-        self.btn_scan.setCursor(Qt.PointingHandCursor)
-        self.btn_scan.setFixedSize(28, 28)
-        self.btn_scan.setToolTip(tr("اسکن IP تمیز کلودفلر با این کانفیگ"))
-        self.btn_scan.clicked.connect(self.scan.emit)
+        # "scan clean Cloudflare IPs" using THIS config as the reference (#3)
+        self.btn_scan = self._icon_btn("search", "RowScan",
+                                       tr("اسکن IP تمیز کلودفلر با این کانفیگ"),
+                                       self.scan.emit)
         lay.addWidget(self.btn_scan, 0, Qt.AlignVCenter)
 
-        # inline "share / copy link" button — re-serialise this profile back to
-        # a share link and copy it to the clipboard (issue #2).
-        self.btn_share = QPushButton("\U0001f517")
-        self.btn_share.setObjectName("RowShare")
-        self.btn_share.setCursor(Qt.PointingHandCursor)
-        self.btn_share.setFixedSize(28, 28)
-        self.btn_share.setToolTip(tr("کپی لینک اشتراک‌گذاری این کانفیگ"))
-        self.btn_share.clicked.connect(self.share.emit)
+        # "share / copy link" — re-serialise this profile to a share link (#2)
+        self.btn_share = self._icon_btn("link", "RowShare",
+                                        tr("کپی لینک اشتراک‌گذاری این کانفیگ"),
+                                        self.share.emit)
         lay.addWidget(self.btn_share, 0, Qt.AlignVCenter)
 
-        # inline edit button
-        self.btn_edit = QPushButton("\u270e")
-        self.btn_edit.setObjectName("RowEdit")
-        self.btn_edit.setCursor(Qt.PointingHandCursor)
-        self.btn_edit.setFixedSize(28, 28)
-        self.btn_edit.setToolTip(tr("ویرایش این پروفایل"))
-        self.btn_edit.clicked.connect(self.edit.emit)
+        # edit
+        self.btn_edit = self._icon_btn("edit", "RowEdit",
+                                       tr("ویرایش این پروفایل"),
+                                       self.edit.emit)
         lay.addWidget(self.btn_edit, 0, Qt.AlignVCenter)
+
+    # -- icon-button factory ------------------------------------------------
+    def _icon_btn(self, icon_name: str, obj: str, tip: str, slot) -> QPushButton:
+        """Build a compact icon-only action button with a 3-D vector icon."""
+        b = QPushButton()
+        b.setObjectName(obj)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFixedSize(28, 28)
+        b.setIconSize(QSize(17, 17))
+        b.setIcon(icons.icon(icon_name, size=17))
+        b.setToolTip(tip)
+        b.clicked.connect(slot)
+        self._icon_buttons.append((b, icon_name))
+        return b
+
+    def refresh_icons(self) -> None:
+        """Recolour all row icons after a theme change."""
+        _proto_name = _PROTO_ICON.get(
+            (getattr(self, "_protocol", "") or "").lower(), "proto_generic")
+        for b, name in getattr(self, "_icon_buttons", []):
+            b.setIcon(icons.icon(name, size=17))
 
     # -- inline ping result -------------------------------------------------
     def set_ping_state(self, text: str, kind: str = "info") -> None:
@@ -479,10 +511,37 @@ class ProfileRow(QFrame):
         lbl.style().polish(lbl)
 
     def resizeEvent(self, event):
-        """Elide name + address so long text never overflows the box (#1/#3)."""
+        """Elide name + address so long text never overflows the box (#1/#3)
+        and progressively collapse decoration as the row narrows (#2)."""
         super().resizeEvent(event)
+        self._apply_responsive(self.width())
         self._elide_detail()
         self._elide_name()
+
+    def _apply_responsive(self, w: int) -> None:
+        """Hide non-essential decoration when the row is narrow so nothing
+        spills outside its box at small window sizes (issue #2).
+
+        Priority (kept longest): edit > use/ping > share > scan > badges.
+        The essential name/detail column always keeps the stretch and elides,
+        so even at the narrowest width the row stays tidy inside its frame.
+        """
+        # badges are pure decoration — drop them first
+        show_badges = w >= 380
+        for b in getattr(self, "_badge_labels", []):
+            b.setVisible(show_badges)
+        # then collapse the optional action buttons from least to most useful
+        if hasattr(self, "btn_scan"):
+            self.btn_scan.setVisible(w >= 370)
+        if hasattr(self, "btn_share"):
+            self.btn_share.setVisible(w >= 330)
+        if hasattr(self, "btn_edit"):
+            self.btn_edit.setVisible(w >= 290)
+        # ping + use stay until the very end (most-used inline actions)
+        if hasattr(self, "btn_ping"):
+            self.btn_ping.setVisible(w >= 250)
+        if hasattr(self, "btn_use") and not self._active:
+            self.btn_use.setVisible(w >= 210)
 
     def _elide_detail(self) -> None:
         d = getattr(self, "_detail", None)

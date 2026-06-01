@@ -15,7 +15,7 @@ step 3; dynamic animations land in step 2.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout,
@@ -46,6 +46,7 @@ def _scrollable(page: QWidget) -> QScrollArea:
                      "QScrollArea#PageScroll>QWidget>QWidget{background:transparent;}")
     return sa
 
+from ui import icons as _icons
 from ui import win_effects
 from ui.theme import get_palette, build_qss, ACCENT2_DARK, ACCENT2_LIGHT
 from ui.widgets import (
@@ -57,7 +58,7 @@ from ui.i18n import tr
 
 from core.config_store import ConfigStore
 from core.engine import EngineController
-from core.logbuffer import LEVELS, LogBuffer
+from core.logbuffer import LEVELS, SOURCES, LogBuffer
 from core.profile import Profile
 from core.share_link import parse_link, parse_subscription, ShareLinkError
 from ui.engine_bridge import EngineBridge
@@ -397,11 +398,52 @@ class SettingsPage(QWidget):
         self.mode.currentTextChanged.connect(self._update_mode_hint)
         self._update_mode_hint(self.mode.currentText())
 
+        # --- SNI ↔ connect-IP pair manager (issue #3) ----------------------
+        # Each fake SNI can be paired with the connect IP that is known to work
+        # with it. Picking a saved SNI auto-fills its paired IP, and an "add"
+        # button stores the current SNI+IP as a reusable pair.
+        self._sni_ip_pairs: list[dict] = []
+
         form.addWidget(self._field_label("SNI جعلی"))
         self.sni = NoScrollComboBox()
         self.sni.setEditable(True)
         self.sni.addItems(DEFAULT_SNIS)
+        # picking an existing item auto-fills the paired connect IP (#3)
+        self.sni.activated.connect(self._on_sni_chosen)
         form.addWidget(self.sni)
+
+        form.addWidget(self._field_label("IP اتصال"))
+        self.connect_ip = QLineEdit("104.19.229.21")
+        form.addWidget(self.connect_ip)
+
+        # add / remove pair row
+        pair_row = QHBoxLayout()
+        pair_row.setSpacing(8)
+        self.btn_add_pair = QPushButton(tr("افزودن جفت SNI/IP"))
+        self.btn_add_pair.setObjectName("Ghost")
+        self.btn_add_pair.setIcon(_icons.icon("plus", size=16))
+        self.btn_add_pair.setIconSize(QSize(16, 16))
+        self.btn_add_pair.clicked.connect(self._add_pair)
+        self.btn_remove_pair = QPushButton(tr("حذف این جفت"))
+        self.btn_remove_pair.setObjectName("Ghost")
+        self.btn_remove_pair.setIcon(_icons.icon("trash", size=16))
+        self.btn_remove_pair.setIconSize(QSize(16, 16))
+        self.btn_remove_pair.clicked.connect(self._remove_pair)
+        pair_row.addWidget(self.btn_add_pair)
+        pair_row.addWidget(self.btn_remove_pair)
+        pair_row.addStretch(1)
+        self.lbl_pair_count = QLabel("")
+        self.lbl_pair_count.setObjectName("Faint")
+        pair_row.addWidget(self.lbl_pair_count)
+        form.addLayout(pair_row)
+        self.pair_hint = QLabel("")
+        self.pair_hint.setObjectName("Muted")
+        self.pair_hint.setWordWrap(True)
+        self.pair_hint.setText(tr(
+            "هر SNI جعلی را با IP اتصالی که با آن کار می‌کند ذخیره کنید؛ "
+            "وقتی همان SNI را انتخاب کنید، IP جفت‌شده‌اش خودکار پر می‌شود."))
+        form.addWidget(self.pair_hint)
+        form.addSpacing(6)
 
         ports_wrap = QWidget()
         ports = QHBoxLayout(ports_wrap)
@@ -411,10 +453,6 @@ class SettingsPage(QWidget):
         ports.addWidget(self._labelled_spin("پورت SOCKS", 10808, out="socks"))
         form.addWidget(ports_wrap)
         form.addSpacing(6)
-
-        form.addWidget(self._field_label("IP اتصال"))
-        self.connect_ip = QLineEdit("www.speedtest.net")
-        form.addWidget(self.connect_ip)
 
         # --- LAN sharing (use the proxy from a phone on the same Wi-Fi) ---
         # #5: keep the checkbox LABEL short (QCheckBox never word-wraps, so a
@@ -467,7 +505,16 @@ class SettingsPage(QWidget):
         i = self.mode.findText(mode)
         if i >= 0:
             self.mode.setCurrentIndex(i)
-        self.sni.setCurrentText(cfg.get("FAKE_SNI", "www.speedtest.net"))
+        # load saved SNI↔IP pairs before populating the combo (issue #3)
+        raw_pairs = cfg.get("sni_ip_pairs", []) or []
+        self._sni_ip_pairs = [
+            {"sni": str(p.get("sni", "")).strip(),
+             "ip": str(p.get("ip", "")).strip()}
+            for p in raw_pairs
+            if isinstance(p, dict) and str(p.get("sni", "")).strip()
+        ]
+        self._rebuild_sni_combo()
+        self.sni.setCurrentText(cfg.get("FAKE_SNI", "www.hcaptcha.com"))
         self.spin_listen.setValue(int(cfg.get("LISTEN_PORT", 40443)))
         self.spin_socks.setValue(int(cfg.get("socks_port", 10808)))
         self.connect_ip.setText(str(cfg.get("CONNECT_IP", "")))
@@ -486,6 +533,7 @@ class SettingsPage(QWidget):
             "LISTEN_PORT": self.spin_listen.value(),
             "socks_port": self.spin_socks.value(),
             "CONNECT_IP": self.connect_ip.text().strip(),
+            "sni_ip_pairs": list(self._sni_ip_pairs),
             "allow_lan": self.chk_lan.isChecked(),
             "system_proxy": self.chk_system_proxy.isChecked(),
             "force_spoof": self.chk_force_spoof.isChecked(),
@@ -592,6 +640,118 @@ class SettingsPage(QWidget):
         setattr(self, f"spin_{out}", sp)
         return w
 
+    # -- SNI ↔ IP pair manager (issue #3) ---------------------------------
+    def _rebuild_sni_combo(self) -> None:
+        """Repopulate the SNI combo from defaults + saved pairs, preserving
+        the current text (so editing isn't disrupted)."""
+        current = self.sni.currentText().strip()
+        seen = set()
+        names: list[str] = []
+        # saved pairs first (most relevant to the user), then defaults
+        for pair in self._sni_ip_pairs:
+            s = (pair.get("sni") or "").strip()
+            if s and s.lower() not in seen:
+                seen.add(s.lower())
+                names.append(s)
+        for s in DEFAULT_SNIS:
+            if s and s.lower() not in seen:
+                seen.add(s.lower())
+                names.append(s)
+        self.sni.blockSignals(True)
+        self.sni.clear()
+        self.sni.addItems(names)
+        if current:
+            self.sni.setCurrentText(current)
+        self.sni.blockSignals(False)
+        self._update_pair_count()
+
+    def _find_pair(self, sni: str) -> dict | None:
+        sni = (sni or "").strip().lower()
+        for pair in self._sni_ip_pairs:
+            if (pair.get("sni") or "").strip().lower() == sni:
+                return pair
+        return None
+
+    def _on_sni_chosen(self, _index: int) -> None:
+        """When the user picks an SNI that has a saved pair, auto-fill its
+        connect IP (issue #3)."""
+        sni = self.sni.currentText().strip()
+        pair = self._find_pair(sni)
+        if pair and pair.get("ip"):
+            self.connect_ip.setText(str(pair["ip"]).strip())
+
+    def _add_pair(self) -> None:
+        """Save the current SNI + connect-IP as a reusable pair (issue #3)."""
+        sni = self.sni.currentText().strip()
+        ip = self.connect_ip.text().strip()
+        if not sni or not ip:
+            self.pair_hint.setText(tr(
+                "برای افزودن جفت، هم SNI جعلی و هم IP اتصال را پر کنید."))
+            return
+        existing = self._find_pair(sni)
+        if existing:
+            existing["ip"] = ip          # update the IP for an existing SNI
+        else:
+            self._sni_ip_pairs.append({"sni": sni, "ip": ip})
+        self._rebuild_sni_combo()
+        self.sni.setCurrentText(sni)
+        self.pair_hint.setText(tr(
+            "جفت ذخیره شد: «{sni}» ← {ip}").format(sni=sni, ip=ip))
+
+    def _remove_pair(self) -> None:
+        """Remove the pair matching the current SNI (issue #3)."""
+        sni = self.sni.currentText().strip()
+        pair = self._find_pair(sni)
+        if pair is None:
+            self.pair_hint.setText(tr("برای این SNI جفتی ذخیره نشده است."))
+            return
+        self._sni_ip_pairs = [
+            p for p in self._sni_ip_pairs
+            if (p.get("sni") or "").strip().lower() != sni.lower()]
+        self._rebuild_sni_combo()
+        self.pair_hint.setText(tr("جفت «{sni}» حذف شد.").format(sni=sni))
+
+    def _update_pair_count(self) -> None:
+        n = len(self._sni_ip_pairs)
+        self.lbl_pair_count.setText(
+            tr("{n} جفت ذخیره‌شده").format(n=n) if n else "")
+
+
+class _ViewportWidthListWidget(QListWidget):
+    """A QListWidget whose item widgets are pinned to the viewport width.
+
+    Plain QListWidget sizes each row to its *sizeHint* width, which can be
+    wider than a narrow viewport — the row then renders at its natural width
+    and its right-hand content (badges / action buttons) spills outside the
+    visible box and gets clipped. This is the "از کادر زده بیرون که برش
+    خورده" responsive bug (issue #2).
+
+    By forcing every item's width to match ``viewport().width()`` on every
+    resize, each ProfileRow is told *exactly* how much space it has, so its
+    own ``_apply_responsive`` / elision logic can collapse decoration to fit
+    and nothing ever overflows the frame.
+    """
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_item_widths()
+
+    def _sync_item_widths(self) -> None:
+        vw = self.viewport().width()
+        if vw <= 0:
+            return
+        for i in range(self.count()):
+            item = self.item(i)
+            if item is None:
+                continue
+            hint = item.sizeHint()
+            if hint.width() != vw:
+                hint.setWidth(vw)
+                item.setSizeHint(hint)
+            w = self.itemWidget(item)
+            if w is not None:
+                w.setMaximumWidth(vw)
+
 
 class ProfilesPage(QWidget):
     """Import + manage server profiles (share links / subscriptions).
@@ -673,26 +833,32 @@ class ProfilesPage(QWidget):
         tools = QHBoxLayout()
         tools.setSpacing(7)
 
-        def _tool(glyph: str, obj: str, tip: str) -> QPushButton:
-            b = QPushButton(glyph)
+        # track icon toolbar buttons so a theme change can recolour them (#1)
+        self._tool_buttons: list[tuple[QPushButton, str]] = []
+
+        def _tool(icon_name: str, obj: str, tip: str) -> QPushButton:
+            b = QPushButton()
             b.setObjectName(obj)
             b.setProperty("class", "ToolBtn")
             b.setCursor(Qt.PointingHandCursor)
             b.setFixedSize(34, 30)
+            b.setIconSize(QSize(18, 18))
+            b.setIcon(_icons.icon(icon_name, size=18))
             b.setToolTip(tr(tip))
+            self._tool_buttons.append((b, icon_name))
             return b
 
         # bulk-selection actions (operate on the checkboxes — never activate)
-        self.btn_select_all = _tool("\u2611", "Ghost", "انتخاب همه")
-        self.btn_clear_sel = _tool("\u2610", "Ghost", "لغو انتخاب")
-        self.btn_ping_all_rows = _tool("\U0001f4e1", "Ghost",
+        self.btn_select_all = _tool("check_all", "Ghost", "انتخاب همه")
+        self.btn_clear_sel = _tool("uncheck_all", "Ghost", "لغو انتخاب")
+        self.btn_ping_all_rows = _tool("ping", "Ghost",
                                        "پینگ همه (هم‌زمان روی هر ردیف)")
-        self.btn_ping_selected = _tool("\U0001f4f6", "Ghost",
+        self.btn_ping_selected = _tool("broadcast", "Ghost",
                                        "پینگ کانفیگ‌های انتخاب‌شده")
-        self.btn_copy_selected = _tool("\U0001f517", "Ghost",
+        self.btn_copy_selected = _tool("link", "Ghost",
                                        "کپی لینک کانفیگ‌های انتخاب‌شده")
-        self.btn_edit = _tool("\u270e", "Ghost", "ویرایش کانفیگ انتخاب‌شده")
-        self.btn_delete_selected = _tool("\U0001f5d1", "Danger",
+        self.btn_edit = _tool("edit", "Ghost", "ویرایش کانفیگ انتخاب‌شده")
+        self.btn_delete_selected = _tool("trash", "Danger",
                                          "حذف کانفیگ‌های انتخاب‌شده")
 
         for b in (self.btn_select_all, self.btn_clear_sel):
@@ -706,7 +872,7 @@ class ProfilesPage(QWidget):
         tools.addWidget(self.btn_delete_selected)
         lb.addLayout(tools)
 
-        self.list = QListWidget()
+        self.list = _ViewportWidthListWidget()
         self.list.setObjectName("ProfileList")
         # give the list real breathing room so several servers are visible and
         # rows never get vertically squeezed (the "cramped / clipped" feedback).
@@ -753,6 +919,12 @@ class ProfilesPage(QWidget):
         # at the old row widgets (their result handler already swallows the
         # RuntimeError when a widget is gone), so just forget the keys (#4).
         self._inline_workers = {}
+        # recolour the icon toolbar for the active theme (#1)
+        for b, name in getattr(self, "_tool_buttons", []):
+            try:
+                b.setIcon(_icons.icon(name, size=18))
+            except Exception:
+                pass
         self.list.blockSignals(True)
         self.list.clear()
         sel = self._store.selected_index
@@ -783,6 +955,12 @@ class ProfilesPage(QWidget):
             # enlarges (#3 "از کادر زده بیرون که برش خورده").
             hint = row.sizeHint()
             hint.setHeight(min(max(hint.height(), 62), 64))
+            # pin the width to the viewport so the row is told exactly how much
+            # horizontal space it has and never overflows its box (#2)
+            vw = self.list.viewport().width()
+            if vw > 0:
+                hint.setWidth(vw)
+                row.setMaximumWidth(vw)
             item.setSizeHint(hint)
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
@@ -794,6 +972,8 @@ class ProfilesPage(QWidget):
             ph.setFlags(Qt.NoItemFlags)
             self.list.addItem(ph)
         self.list.blockSignals(False)
+        # final pass to pin widths to the current viewport (#2)
+        self.list._sync_item_widths()
         self._update_selection_ui()
 
     # -- multi-select / bulk actions (#7) ---------------------------------
@@ -1574,6 +1754,11 @@ class LogPage(QWidget):
     }
     _LEVEL_FA = {"all": "همه", "info": "اطلاع", "ok": "موفق",
                  "warn": "هشدار", "err": "خطا"}
+    # log-source labels + chip colours (issue #4) — so spoofer/WinDivert lines
+    # are visually separated from ordinary xray-core lines.
+    _SOURCE_FA = {"all": "همه‌ی منابع", "engine": "موتور",
+                  "spoof": "اسپوف SNI", "core": "هسته xray"}
+    _SOURCE_COLORS = {"engine": "#7c8aa0", "spoof": "#c792ea", "core": "#56b6f7"}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1603,6 +1788,15 @@ class LogPage(QWidget):
             self.cmb_level.addItem(tr(self._LEVEL_FA.get(lv, lv)), lv)
         self.cmb_level.currentIndexChanged.connect(self._rerender)
         bar.addWidget(self.cmb_level)
+
+        # source filter (issue #4): all / engine / spoof / xray-core
+        bar.addWidget(self._field_label("منبع"))
+        self.cmb_source = NoScrollComboBox()
+        self.cmb_source.setObjectName("LogFilter")
+        for src in ("all",) + SOURCES:
+            self.cmb_source.addItem(tr(self._SOURCE_FA.get(src, src)), src)
+        self.cmb_source.currentIndexChanged.connect(self._rerender)
+        bar.addWidget(self.cmb_source)
 
         self.search = QLineEdit()
         self.search.setObjectName("LogSearch")
@@ -1645,14 +1839,31 @@ class LogPage(QWidget):
         data = self.cmb_level.currentData()
         return data if data else "all"
 
+    def _current_source(self) -> str:
+        data = self.cmb_source.currentData() if hasattr(self, "cmb_source") else None
+        return data if data else "all"
+
     def _row_html(self, entry) -> str:
         color = self._COLORS.get(entry.level, self._COLORS["info"])
+        src = getattr(entry, "source", "engine")
+        src_col = self._SOURCE_COLORS.get(src, self._SOURCE_COLORS["engine"])
+        src_label = self._SOURCE_FA.get(src, src)
+        # the source is already encoded as a leading [tag]; strip it from the
+        # body so it isn't shown twice — render it as a coloured chip instead.
+        body = entry.message
+        b = body.lstrip()
+        if b.startswith("["):
+            end = b.find("]")
+            if end > 0:
+                body = b[end + 1:].lstrip()
         # escape minimal HTML so messages can't break the markup
-        msg = (entry.message.replace("&", "&amp;")
-                            .replace("<", "&lt;").replace(">", "&gt;"))
+        msg = (body.replace("&", "&amp;")
+                   .replace("<", "&lt;").replace(">", "&gt;"))
         return (f'<span style="color:{self._stamp_color}">[{entry.stamp}]</span> '
                 f'<span style="color:{color};font-weight:600">'
                 f'{entry.level.upper():<4}</span> '
+                f'<span style="color:{src_col};font-weight:600">'
+                f'[{src_label}]</span> '
                 f'<span style="color:{self._msg_color}">{msg}</span>')
 
     def set_palette(self, palette) -> None:
@@ -1678,7 +1889,7 @@ class LogPage(QWidget):
         # if the new entry passes the active filter, append it incrementally
         from core.logbuffer import matches
         if matches(entry, level=self._current_filter(),
-                   query=self.search.text()):
+                   query=self.search.text(), source=self._current_source()):
             self.log.append(self._row_html(entry))
             sb = self.log.verticalScrollBar()
             sb.setValue(sb.maximum())
@@ -1686,7 +1897,8 @@ class LogPage(QWidget):
     def _rerender(self, *args) -> None:
         """Rebuild the visible console from the buffer under current filters."""
         rows = self._buffer.filtered(level=self._current_filter(),
-                                     query=self.search.text())
+                                     query=self.search.text(),
+                                     source=self._current_source())
         html = "<br>".join(self._row_html(e) for e in rows)
         self.log.setHtml(html)
         sb = self.log.verticalScrollBar()
@@ -2108,18 +2320,23 @@ class MainWindow(QWidget):
 
         # #5: the "تشخیص" (Diagnostics) entry was removed — the page no longer
         # exists. Nav indexes still map 1:1 onto the stack order above.
+        # Each entry now carries a crisp 3-D vector icon-name (issue #1).
         items = [
-            ("داشبورد", "\u25c9"),    # fisheye
-            ("پروفایل‌ها", "\u2630"),  # trigram (list)
-            ("تنظیمات", "\u2699"),     # gear
-            ("استراتژی", "\u29bf"),    # circled bullet
-            ("لاگ", "\u2261"),         # identical-to (log lines)
+            ("داشبورد", "dashboard"),
+            ("پروفایل‌ها", "servers"),
+            ("تنظیمات", "settings"),
+            ("استراتژی", "strategy"),
+            ("لاگ", "logs"),
         ]
-        for idx, (text, icon) in enumerate(items):
-            btn = NavItem(tr(text), icon)
+        self._nav_buttons: list[NavItem] = []
+        for idx, (text, icon_name) in enumerate(items):
+            btn = NavItem(tr(text), icon_name)
             btn.clicked.connect(lambda _=False, i=idx: self.stack.setCurrentIndex(i))
+            # recolour the icon whenever the selection state flips (#1)
+            btn.toggled.connect(lambda checked, b=btn: b.refresh_icon(checked))
             self.nav_group.addButton(btn, idx)
             lay.addWidget(btn)
+            self._nav_buttons.append(btn)
             if idx == 0:
                 btn.setChecked(True)
 
@@ -2133,6 +2350,9 @@ class MainWindow(QWidget):
     def _apply_theme(self):
         palette = get_palette(self._theme)
         self._palette = palette
+        # pull the icon colours from the active palette BEFORE building any
+        # icons so nav/row/toolbar glyphs are tinted for this theme (#1).
+        _icons.apply_palette(palette)
         qss = build_qss(palette)
         # Apply the theme at the *application* level so EVERY top-level window —
         # including dialogs (scanner, QMessageBox confirms, …) — inherits it.
@@ -2153,6 +2373,18 @@ class MainWindow(QWidget):
         for card in self.findChildren(_Card):
             try:
                 card.tune_shadow_for(palette.is_dark)
+            except Exception:
+                pass
+        # recolour every 3-D nav icon for the new palette (#1)
+        for b in getattr(self, "_nav_buttons", []):
+            try:
+                b.refresh_icon()
+            except Exception:
+                pass
+        # rebuild the profiles list so its row glyphs + toolbar icons re-tint
+        if hasattr(self, "page_profiles"):
+            try:
+                self.page_profiles.refresh()
             except Exception:
                 pass
         # recolour the living wave backdrop (accent → secondary gaming accent)

@@ -94,12 +94,37 @@ class EngineController:
 
     # -- callback fan-out (each guarded so one bad handler can't crash us) --
 
-    def _log(self, msg: str) -> None:
-        if self.on_log:
-            try:
-                self.on_log(msg)
-            except Exception:
-                pass
+    # log source tags (issue #4) — each line is attributed to a subsystem so
+    # the UI can separate spoofer/WinDivert/Administrator lines from ordinary
+    # xray-core lines and never confuse the user.
+    TAG_ENGINE = "موتور"
+    TAG_SPOOF = "اسپوف SNI"
+    TAG_CORE = "هسته xray"
+
+    def _log(self, msg: str, tag: str | None = None) -> None:
+        """Emit a log line, prefixing a ``[tag]`` source marker (issue #4).
+
+        If *msg* already starts with a ``[`` it is assumed to carry its own
+        tag and is emitted unchanged; otherwise *tag* (default: engine) is
+        prepended so every line is attributable to a source.
+        """
+        if not self.on_log:
+            return
+        text = msg if msg is None else str(msg)
+        if text and not text.lstrip().startswith("["):
+            text = f"[{tag or self.TAG_ENGINE}] {text}"
+        try:
+            self.on_log(text)
+        except Exception:
+            pass
+
+    def _spoof_log(self, msg: str) -> None:
+        """Log a line attributed to the SNI spoofer / WinDivert (issue #4)."""
+        self._log(msg, tag=self.TAG_SPOOF)
+
+    def _core_log(self, msg: str) -> None:
+        """Log a line attributed to the xray core (issue #4)."""
+        self._log(msg, tag=self.TAG_CORE)
 
     def _set_status(self, status: str) -> None:
         self._status = status
@@ -486,12 +511,19 @@ class EngineController:
             listen="0.0.0.0" if allow_lan else "127.0.0.1",
             api_port=api_port,
         )
-        self._xray.on_log = self._log
-        self._log(
+        # xray-core lines are tagged as the core source (issue #4)
+        self._xray.on_log = self._core_log
+        self._core_log(
             f"حالت تونل (مستقیم مثل V2RayTun): xray → "
             f"{self.profile.dial_address}:{self.profile.dial_port}")
+        # make it explicit that this path uses NO spoofer/WinDivert and needs
+        # no Administrator rights — so the user never sees the admin/WinDivert
+        # warning for an ordinary config (issue #4).
+        self._core_log(
+            "این حالت از اسپوفر/WinDivert استفاده نمی‌کند و نیاز به دسترسی "
+            "Administrator ندارد.")
         if not self._xray.is_available:
-            self._log("هشدار: xray.exe یافت نشد — تونل اجرا نشد")
+            self._core_log("هشدار: xray.exe یافت نشد — تونل اجرا نشد")
             self._set_status(STATUS_ERROR)
             self._xray = None
             return
@@ -499,7 +531,7 @@ class EngineController:
 
         self._maybe_enable_system_proxy(True)
         self._set_status(STATUS_ACTIVE)
-        self._log("✓ اتصال برقرار شد")
+        self._core_log("✓ اتصال برقرار شد")
         # spin up the live-usage poller (issue #3): reads xray's cumulative
         # byte counters and turns them into the dashboard's traffic graph.
         self._start_stats_poller()
@@ -593,11 +625,14 @@ class EngineController:
                                 or prof.spoof_connect_port)
                 fake_sni = (str(self.config.get("FAKE_SNI", "")).strip()
                             or prof.spoof_fake_sni)
-                self._log(
+                self._spoof_log(
                     f"حالت SNI-spoof (خودکفا): xray → 127.0.0.1:"
                     f"{self._spoof_port} → spoofer → {connect_ip}:{connect_port}"
                     f" (SNI جعلی: {fake_sni}، SNI واقعی: "
                     f"{prof.sni or prof.host})")
+                self._spoof_log(
+                    "این حالت از اسپوفر و درایور WinDivert استفاده می‌کند و "
+                    "به دسترسی Administrator نیاز دارد.")
             else:
                 # ordinary, routable config routed through the spoofer because
                 # the user enabled ``force_spoof`` (issue #1). The spoofer dials
@@ -612,16 +647,22 @@ class EngineController:
                                 or prof.port)
                 fake_sni = (str(self.config.get("FAKE_SNI", "")).strip()
                             or prof.spoof_fake_sni)
-                self._log(
+                self._spoof_log(
                     f"حالت SNI-spoof اجباری: xray → 127.0.0.1:{self._spoof_port}"
                     f" → spoofer → {connect_ip}:{connect_port} (SNI جعلی: "
                     f"{fake_sni}، SNI واقعی: {prof.sni or prof.host})")
+                self._spoof_log(
+                    "این حالت از اسپوفر و درایور WinDivert استفاده می‌کند و "
+                    "به دسترسی Administrator نیاز دارد.")
         else:
             self._spoof_port = int(self.config.get("LISTEN_PORT", 40443))
             connect_ip = str(self.config.get("CONNECT_IP", ""))
             connect_port = int(self.config.get("CONNECT_PORT", 443))
             fake_sni = str(self.config.get("FAKE_SNI", "www.speedtest.net"))
-            self._log("حالت SNI Only: فقط فورواردر spoofer")
+            self._spoof_log("حالت SNI Only: فقط فورواردر spoofer")
+            self._spoof_log(
+                "این حالت از اسپوفر و درایور WinDivert استفاده می‌کند و "
+                "به دسترسی Administrator نیاز دارد.")
 
         # --- 2. build + start the spoofer (main.ProxyServer) ---
         proxy_cfg = {
@@ -649,7 +690,7 @@ class EngineController:
         # hand the spoofer the resilience controller if it knows how to use one
         if self._resilience is not None and hasattr(self._proxy, "resilience"):
             self._proxy.resilience = self._resilience
-        self._proxy.on_log = self._log
+        self._proxy.on_log = self._spoof_log
         self._proxy.on_status_change = self._on_proxy_status
         self._proxy.on_connection_count_change = self._emit_count
         # live throughput (upload/download) — the ProxyServer reports cumulative
@@ -664,7 +705,7 @@ class EngineController:
         if started is False:
             err = (getattr(self._proxy, "_start_error", None)
                    or "راه‌اندازی spoofer ناموفق بود")
-            self._log(f"✗ {err}")
+            self._spoof_log(f"✗ {err}")
             # tear down any partially-started pieces first (stop() resets the
             # status to IDLE), *then* set ERROR so it isn't clobbered.
             self.stop()
@@ -690,9 +731,9 @@ class EngineController:
                 gaming_mode=bool(self.config.get("gaming_mode", False)),
                 listen="0.0.0.0" if allow_lan else "127.0.0.1",
             )
-            self._xray.on_log = self._log
+            self._xray.on_log = self._core_log
             if not self._xray.is_available:
-                self._log("هشدار: xray.exe یافت نشد — فقط spoofer اجرا می‌شود")
+                self._core_log("هشدار: xray.exe یافت نشد — فقط spoofer اجرا می‌شود")
             else:
                 self._xray.start()
 
