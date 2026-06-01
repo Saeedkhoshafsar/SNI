@@ -334,15 +334,36 @@ class EngineController:
             return StrategyPingReport(label=t.label, host=t.host, port=t.port)
 
     def is_active_profile(self, profile) -> bool:
-        """True when *profile* is the one the live tunnel is currently running.
+        """True when *profile* is the config the live tunnel is **actually
+        carrying right now** — selected AND the engine is ACTIVE.
 
         Used so the inline ping can give a **definitive** live measurement for
         the active config (a real request through the running proxy) rather than
         an offline guess. Compares by identity first, then by the fields that
         define a config endpoint (address/port/uuid/sni) so a fresh Profile
         object parsed from the same link still matches.
+
+        CRITICAL (user reports, نکته ۱ و ۳): "active" must mean the tunnel is
+        genuinely UP. ``set_profile`` records ``self.profile`` the moment a row
+        is *selected*, long before — or without ever — pressing شروع. The old
+        check only compared the selected profile, so:
+
+          * نکته ۳ — a config that is merely *selected* (no tunnel) was treated
+            as "active", and the inline ping tried a live-tunnel request that
+            of course failed → false red, and the spoof ping buttons looked
+            usable when there was nothing to ping through.
+          * نکته ۱ — conversely, if the comparison ever missed while the tunnel
+            WAS up, AYYILDIZ fell through to the offline edge probe (which a
+            relay config can fail intermittently → "بدون پاسخ" red) even though
+            it pings ~110ms through the live tunnel.
+
+        Gating on ``STATUS_ACTIVE`` makes "active config" mean exactly what the
+        user means: connected and carrying traffic.
         """
         if profile is None or self.profile is None:
+            return False
+        # the tunnel must really be up — a merely-selected config is NOT active.
+        if self._status != STATUS_ACTIVE:
             return False
         if profile is self.profile:
             return True

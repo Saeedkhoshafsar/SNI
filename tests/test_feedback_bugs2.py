@@ -50,11 +50,15 @@ class LivePingTest(unittest.TestCase):
 
     def test_is_active_profile_matches_by_endpoint_fields(self):
         from core.profile import Profile
+        from core.engine import STATUS_ACTIVE
         ctrl = self._ctrl()
         a = Profile(address="ex.com", port=443, uuid="u1")
         b = Profile(address="ex.com", port=443, uuid="u1")
         other = Profile(address="ex.com", port=443, uuid="DIFFERENT")
         ctrl.profile = a
+        # "active config" now requires the tunnel to genuinely be UP — set the
+        # status ACTIVE the way a real connect would.
+        ctrl._status = STATUS_ACTIVE
         self.assertTrue(ctrl.is_active_profile(a))   # identity
         self.assertTrue(ctrl.is_active_profile(b))   # same endpoint
         self.assertFalse(ctrl.is_active_profile(other))
@@ -65,6 +69,27 @@ class LivePingTest(unittest.TestCase):
         ctrl = self._ctrl()
         ctrl.profile = None
         self.assertFalse(ctrl.is_active_profile(Profile(address="x", port=1)))
+
+    def test_is_active_profile_false_when_selected_but_not_connected(self):
+        """نکته ۳: a config that is merely SELECTED — but the tunnel was never
+        started (engine still idle) — is NOT active. Otherwise the inline ping
+        tried a live-tunnel request through a tunnel that doesn't exist (false
+        red), and the spoof ping looked usable with nothing to ping through.
+        """
+        from core.profile import Profile
+        from core.engine import STATUS_ACTIVE
+        ctrl = self._ctrl()
+        a = Profile(address="ex.com", port=443, uuid="u1")
+        ctrl.profile = a                       # selected …
+        # … but never started → engine is idle → NOT active
+        self.assertFalse(ctrl.is_active_profile(a))
+        # only once the tunnel is genuinely up does it count as active
+        ctrl._status = STATUS_ACTIVE
+        self.assertTrue(ctrl.is_active_profile(a))
+        # and a config that is connecting (not yet fully up) is not "active"
+        from core.engine import STATUS_CONNECTING
+        ctrl._status = STATUS_CONNECTING
+        self.assertFalse(ctrl.is_active_profile(a))
 
     def test_live_proxy_ping_refuses_when_not_active(self):
         ctrl = self._ctrl()
@@ -130,14 +155,16 @@ class LivePingTest(unittest.TestCase):
         self.assertIn("55002", captured["proxy"]["http"])
         self.assertNotIn("10809", captured["proxy"]["http"])
 
-    def test_offline_spoof_config_refuses_to_fake_a_number(self):
-        """A spoof config that is NOT the active one must not be given a fake
-        latency offline — a raw connect to its Cloudflare anycast IP answers for
-        anything, which is exactly the meaningless ping the user kept seeing.
+    def test_offline_spoof_config_gives_estimate_in_ping_all(self):
+        """A spoof config that is NOT active now gets an OFFLINE *estimate* in a
+        "ping all" sweep (user request: "وقتی پینگ همه رو میگیرم اونام پینگشون
+        گرفته بشن بدون اینکه دونه دونه وصل بشم").
 
-        The inline worker emits an informational "activate to ping" hint instead
-        of a green/red number. We exercise the worker end-to-end with a fake
-        engine to assert that contract.
+        ``ping_profile`` validates the REAL CDN route the spoofer fronts (real
+        SNI/Host/path via the honest edge probe), so the worker reports its
+        latency — but clearly labelled ``≈ … (تخمینی)`` so it never claims to be
+        the definitive live-tunnel number. The 🛡 live measurement is still the
+        ground truth when the config is activated (separate test).
         """
         from ui.window import InlinePingWorker
 
@@ -145,6 +172,12 @@ class LivePingTest(unittest.TestCase):
             is_spoof_config = True
             address = "127.0.0.1"
             port = 40443
+
+        class _Res:
+            reachable = True
+            best_ms = 73.0
+            jitter_ms = 0.0
+            download_kbps = None
 
         captured = {}
 
@@ -154,9 +187,44 @@ class LivePingTest(unittest.TestCase):
             def live_proxy_ping(self, *_a, **_k):
                 return (False, None, "idle")
             def ping_profile(self, *_a):
-                raise AssertionError("must NOT raw-ping a spoof config offline")
-            def probe_strategies_for(self, *_a, **_k):
-                raise AssertionError("must NOT probe a spoof config offline")
+                # honest edge probe of the real CDN route → reachable estimate
+                return _Res()
+
+        w = InlinePingWorker(_Eng(), _SpoofProfile())
+        w.result.connect(lambda t, k: captured.update(text=t, kind=k))
+        w._run_inner()
+        # an estimate IS shown (a number), tagged ≈ / تخمینی, kind ok
+        self.assertEqual(captured.get("kind"), "ok")
+        self.assertIn("73", captured.get("text", ""))
+        self.assertIn("≈", captured.get("text", ""))
+        self.assertIn("تخمینی", captured.get("text", ""))
+
+    def test_offline_spoof_config_unreachable_points_to_live_ping(self):
+        """When even the offline edge estimate can't reach the spoof route, the
+        worker stays honest: no fake number, an info hint to activate for the
+        real (live) ping — preserving "البته اونم باشه" (the live ping too)."""
+        from ui.window import InlinePingWorker
+
+        class _SpoofProfile:
+            is_spoof_config = True
+            address = "127.0.0.1"
+            port = 40443
+
+        class _Res:
+            reachable = False
+            best_ms = None
+            jitter_ms = None
+            download_kbps = None
+
+        captured = {}
+
+        class _Eng:
+            def is_active_profile(self, *_a):
+                return False
+            def live_proxy_ping(self, *_a, **_k):
+                return (False, None, "idle")
+            def ping_profile(self, *_a):
+                return _Res()
 
         w = InlinePingWorker(_Eng(), _SpoofProfile())
         w.result.connect(lambda t, k: captured.update(text=t, kind=k))
@@ -622,6 +690,61 @@ class CdnPingHonestyTest(unittest.TestCase):
         # one success short-circuits the internal retry, so exactly 1 call here
         self.assertEqual(per_target["n"], 1)
 
+    def test_relay_path_retries_on_refused_upgrade_then_succeeds(self):
+        """A relay config (AYYILDIZ7: ``/stars/http://user:pass@vps...``) opens
+        THREE TLS connections per probe and, under a 'ping all' burst, the edge
+        often *refuses* one WS upgrade (ERROR) transiently even though the route
+        is alive. For a relay path that ERROR must be RETRIED (not just RST /
+        TIMEOUT) so the config doesn't flake red — the reported AYYILDIZ7 bug."""
+        from core import cf_scanner as cf
+        from core.ping import tls_latency
+
+        calls = {"n": 0}
+
+        def fake_probe(host, spec, timeout):
+            calls["n"] += 1
+            # first two passes refuse the upgrade (transient throttle), third OK
+            if calls["n"] < 3:
+                return cf.IPResult(host, cf.ERROR, detail="ws upgrade refused")
+            return cf.IPResult(host, cf.OK, latency_ms=92.0, detail="ws+edge ok")
+
+        self._patch_probe(fake_probe)
+        relay_path = "/stars/http://PQ3YjMsJql:fCfJXXbDcw@vps.webtun.xyz:2087"
+        ms = tls_latency("104.18.151.71", 8443, 2.0,
+                         server_name="hammm2.pages.dev",
+                         host_header="hammm2.pages.dev",
+                         path=relay_path, is_ws=True, is_tls=True, retries=2)
+        self.assertEqual(ms, 92.0)
+        self.assertGreaterEqual(calls["n"], 3)  # ERROR was retried for a relay
+
+    def test_non_relay_error_is_not_retried(self):
+        """For an ORDINARY (non-relay) config an ERROR means a genuinely dead
+        route, so it must NOT be retried as if transient — otherwise a truly
+        broken config would waste attempts and could mask itself green. Only
+        RST/TIMEOUT are transient for non-relay configs."""
+        from core import cf_scanner as cf
+        from core.ping import tls_latency
+        import core.ping as pmod
+
+        calls = {"n": 0}
+
+        def fake_probe(host, spec, timeout):
+            calls["n"] += 1
+            return cf.IPResult(host, cf.ERROR, detail="dead worker route")
+
+        self._patch_probe(fake_probe)
+        # disable the TLS handshake fallback so we only measure probe attempts
+        orig_fb = pmod._tls_handshake_latency
+        pmod._tls_handshake_latency = lambda *a, **k: None
+        self.addCleanup(lambda: setattr(pmod, "_tls_handshake_latency", orig_fb))
+        ms = tls_latency("104.18.151.7", 8443, 2.0,
+                         server_name="young-field.hammm3.workers.dev",
+                         host_header="young-field.hammm3.workers.dev",
+                         path="/?ed=2560", is_ws=True, is_tls=True, retries=2)
+        self.assertIsNone(ms)
+        # ERROR is non-retryable for a non-relay config → tried just once
+        self.assertEqual(calls["n"], 1)
+
 
 # ---------------------------------------------------------------------------
 #  Bug 2 — status mask during auto-restart (no "شروع" flicker, Start ignored)
@@ -656,6 +779,84 @@ class RestartStatusMaskTest(unittest.TestCase):
     def test_manual_power_ignored_during_restart(self):
         self.assertFalse(self._power_allowed(True))
         self.assertTrue(self._power_allowed(False))
+
+
+class CleanRetryStartTest(unittest.TestCase):
+    """نکته ۲: «تلاش دوباره» (and any Start out of a not-fully-idle engine)
+    must do a CLEAN restart — tear EVERYTHING down (kill any lingering attempt
+    / background workers) and THEN start fresh — instead of stacking a new
+    start on top of a half-alive previous attempt.
+
+    We drive the real ``MainWindow._on_power`` against a tiny stub ``self`` so
+    no Qt window is built, recording the exact engine call order.
+    """
+
+    def _stub(self, *, status, running):
+        from ui.window import MainWindow
+
+        calls = []
+
+        class _Engine:
+            def __init__(self):
+                self.status_value = status
+                self.is_running = running
+            def update_config(self, *_a):
+                calls.append("update_config")
+            def set_profile(self, *_a):
+                calls.append("set_profile")
+            def stop(self):
+                calls.append("stop")
+                self.is_running = False
+                self.status_value = "idle"
+            def start(self):
+                calls.append("start")
+
+        class _Dash:
+            def set_status(self, *_a):
+                pass
+
+        class _Store:
+            def __init__(self):
+                self._d = {"connection_mode": "Tunnel"}
+                self.config = self._d
+                self.selected_profile = object()   # a non-None profile
+            def get(self, k, d=None):
+                return self._d.get(k, d)
+
+        stub = MainWindow.__new__(MainWindow)
+        stub.engine = _Engine()
+        stub.store = _Store()
+        stub.page_dashboard = _Dash()
+        stub.active_bar = _Dash()
+        stub._restarting = False
+        return stub, calls
+
+    def test_start_from_error_stops_before_starting(self):
+        # «تلاش دوباره» state == error: a stale attempt may still be alive →
+        # MUST stop() (clean kill) before start().
+        stub, calls = self._stub(status="error", running=False)
+        MainWindowOnPower(stub, "start")
+        self.assertIn("stop", calls)
+        self.assertIn("start", calls)
+        self.assertLess(calls.index("stop"), calls.index("start"))
+
+    def test_start_while_running_stops_before_starting(self):
+        stub, calls = self._stub(status="active", running=True)
+        MainWindowOnPower(stub, "start")
+        self.assertLess(calls.index("stop"), calls.index("start"))
+
+    def test_clean_idle_start_does_not_double_stop(self):
+        # a genuinely idle engine starts directly — no needless stop() churn.
+        stub, calls = self._stub(status="idle", running=False)
+        MainWindowOnPower(stub, "start")
+        self.assertNotIn("stop", calls)
+        self.assertIn("start", calls)
+
+
+def MainWindowOnPower(stub, action):
+    """Call the real, unbound ``MainWindow._on_power`` on *stub*."""
+    from ui.window import MainWindow
+    return MainWindow._on_power(stub, action)
 
 
 # ---------------------------------------------------------------------------

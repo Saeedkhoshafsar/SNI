@@ -108,7 +108,8 @@ def tls_latency(host: str, port: int, timeout: float, *,
     now means "this endpoint really answers for this config", matching the
     behaviour the user expects from V2RayTun.
     """
-    from .cf_scanner import cf_ip_probe, ProbeSpec, OK, RST, TIMEOUT, is_cloudflare_host
+    from .cf_scanner import (cf_ip_probe, ProbeSpec, OK, RST, TIMEOUT, ERROR,
+                             is_cloudflare_host, _is_relay_path)
 
     spec = ProbeSpec(
         port=int(port),
@@ -118,6 +119,17 @@ def tls_latency(host: str, port: int, timeout: float, *,
         is_ws=bool(is_ws),
         is_tls=bool(is_tls),
     )
+    # A *relay* config (AYYILDIZ7: ``/stars/http://user:pass@vps...``) is the
+    # heaviest target we ping — its honest validation opens up to THREE back-to-
+    # back TLS connections (trace + ws-upgrade + ws-root). Under a "ping all"
+    # burst the shared Cloudflare edge frequently resets/refuses one of those
+    # extra handshakes even though the route is perfectly alive, so a single
+    # pass goes red while a one-off ping of the same config is green (exactly the
+    # reported AYYILDIZ7 flake). For these we (a) give the probe MORE attempts and
+    # (b) treat a refused WS upgrade (ERROR) as retryable too — not just RST /
+    # TIMEOUT — because the refusal here is a transient edge throttle, not a dead
+    # route.
+    is_relay = _is_relay_path(path or "/")
     # The honest edge probe is the right test for BOTH TLS and plaintext (port
     # 80 / security=none) Cloudflare-fronted configs: it sends a real HTTP/1.1
     # request (and, for ws, a real Upgrade) carrying the config's Host header, so
@@ -132,13 +144,32 @@ def tls_latency(host: str, port: int, timeout: float, *,
     # we retry a couple of times and only report a miss if EVERY attempt failed,
     # mirroring how the live-tunnel ping sweeps multiple endpoints.
     attempts = max(1, int(retries) + 1)
+    if is_relay:
+        # the relay path needs at least a couple of extra shots to ride out the
+        # transient edge throttling its 3-connection validation runs into.
+        attempts = max(attempts, 4)
+    # Outcomes worth another shot. For a relay config a refused WS upgrade
+    # (ERROR) is almost always a transient throttle of the unauthenticated probe,
+    # so we retry on it too; for ordinary configs ERROR means a genuinely dead
+    # route, so we keep retrying only on RST/TIMEOUT there.
+    retryable = {RST, TIMEOUT} | ({ERROR} if is_relay else set())
     saw_retryable = False
-    for _ in range(attempts):
+    for attempt in range(attempts):
         res = cf_ip_probe(host, spec, timeout)
         if res.outcome == OK:
             return float(res.latency_ms)
-        if res.outcome in (RST, TIMEOUT):
-            saw_retryable = True  # transient — worth another shot
+        if res.outcome not in retryable:
+            # a definitive failure for this config (e.g. a dead-route ERROR on a
+            # non-relay config) — retrying just wastes time and could never turn
+            # it green, so stop now and let the fallback / honest-red decide.
+            break
+        saw_retryable = True  # transient — worth another shot
+        # brief back-off before re-hitting the SAME edge: hammering it with
+        # immediate back-to-back handshakes is itself what triggers the
+        # transient reset/refuse under a "ping all" burst. A short, growing
+        # pause lets the edge's per-IP rate window recover between tries.
+        if attempt < attempts - 1:
+            time.sleep(min(0.15 * (attempt + 1), 0.6))
     # Fallback for NON-Cloudflare ordinary configs (plain VPS VLESS/Trojan/etc):
     # the /cdn-cgi/trace edge check only passes for Cloudflare-fronted hosts, so
     # a perfectly working direct server failed it → "پینگ پاسخ نمیده با اینکه کار

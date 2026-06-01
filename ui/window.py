@@ -1626,18 +1626,45 @@ class InlinePingWorker(QThread):
             self.result.emit(tr("✖ تونل زنده پاسخ نداد"), "err")
             return
 
-        # --- 2) spoof config, not active → DON'T fake a number --------------
-        # A spoof config ONLY works through the running spoofer's decoy-SNI
-        # injection. Offline we'd have to present its REAL SNI to the CDN edge,
-        # which from inside the censored network is DPI-blocked by design — yet
-        # the config works fine once connected. Any "latency" we'd show here is
-        # really just a raw TCP connect to a Cloudflare anycast IP that answers
-        # for ANYTHING, i.e. exactly the fake/meaningless ping the user keeps
-        # seeing. So we refuse to invent a number and tell the truth instead:
-        # the honest measurement for a spoof config is a LIVE one.
+        # --- 2) spoof config, not active → OFFLINE *estimate* (clearly ≈) ---
+        # A spoof config ONLY works end-to-end through the running spoofer's
+        # decoy-SNI injection, so the single most TRUSTWORTHY answer is still a
+        # LIVE measurement (step 1, after you activate it). BUT the user wants a
+        # "ping all" sweep to give EVERY spoof config a number too, without
+        # having to activate them one by one ("میخام وقتی پینگ همه رو میگیرم
+        # اونام پینگشون گرفته بشن بدون اینکه دونه دونه وصل بشم … البته اونم باشه
+        # ولی چیزی که میگمم باشه").
+        #
+        # ``ping_profile`` already does the right thing for a spoof config:
+        # ``target_from_profile`` rewrites the loopback address to the real CDN
+        # connect IP/port and validates against the config's REAL SNI + Host +
+        # path (an honest edge probe). That is a meaningful *reachability /
+        # latency estimate* of the route the spoofer fronts — it just can't
+        # account for the live decoy-SNI DPI evasion, so we label it ≈ تخمینی
+        # and never present it as a guarantee. The definitive 🛡 live number is
+        # still available by activating the config (step 1).
         if getattr(self._profile, "is_spoof_config", False):
+            try:
+                res = self._engine.ping_profile(self._profile)
+            except Exception:
+                res = None
+            if res is not None and res.reachable and res.best_ms is not None:
+                parts = [f"{res.best_ms:.0f}ms"]
+                if res.jitter_ms:
+                    parts.append(f"jitter {res.jitter_ms:.0f}")
+                if getattr(res, "download_kbps", None) is not None:
+                    parts.append(f"dl≈{res.download_kbps:.0f}KB/s")
+                # ≈ + "(تخمینی)" makes it unmistakable this is an offline guess,
+                # not the live-tunnel truth — exactly the "اونم باشه" the user
+                # asked for alongside the real ping.
+                self.result.emit(
+                    tr("≈ {body} (تخمینی · فعال کنید برای پینگ واقعی)").format(
+                        body=" · ".join(parts)), "ok")
+                return
+            # even the offline edge estimate couldn't reach the route → say so,
+            # but keep pointing at the live ping as the definitive test.
             self.result.emit(
-                tr("◍ برای پینگ واقعی، این کانفیگ را فعال کنید"), "info")
+                tr("◍ تخمین نگرفت · برای پینگ واقعی فعال کنید"), "info")
             return
 
         # --- 3) ordinary config, not active → STRICT edge validation --------
@@ -2403,6 +2430,28 @@ class MainWindow(QWidget):
                     self, tr("ابتدا یک پروفایل وارد و انتخاب کنید"), "warn")
                 self.page_dashboard.set_status("idle")
                 return
+            # «تلاش دوباره» = a CLEAN restart (user request, نکته ۲).
+            #
+            # The button shows "شروع" from idle and "تلاش دوباره" from error,
+            # but BOTH emit "start". When we start out of an error (or any
+            # not-fully-idle state), a previous attempt may have left worker
+            # threads (spoofer / xray / stats poller) half-alive — so a bare
+            # start() landed ON TOP of that debris and "sometimes connects,
+            # sometimes won't, gets tangled". The user asked for exactly this:
+            # make تلاش‌دوباره behave like a fresh شروع — first tear EVERYTHING
+            # down, then start clean. So unless the engine is already cleanly
+            # idle, issue a full stop() (kills any lingering attempt) before
+            # the new start.
+            try:
+                needs_clean = bool(self.engine.is_running) or \
+                    (self.engine.status_value != "idle")
+            except Exception:
+                needs_clean = True
+            if needs_clean:
+                try:
+                    self.engine.stop()      # synchronous — kills all workers
+                except Exception:
+                    pass
             self.engine.start()
 
     # Restart state machine (config / strategy switch while connected).
