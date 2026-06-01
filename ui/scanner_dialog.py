@@ -30,45 +30,104 @@ from PySide6.QtWidgets import (
 
 from core.cf_scanner import (
     CFScanner, IPResult, ScanConfig, scan_config_from_profile, profile_with_ip,
+    _fmt_speed,
 )
+from core.cf_xray_validator import XrayValidator, XrayValidation
 from core.profile import Profile
 from ui.i18n import tr
 
 
 class ScanWorker(QThread):
-    """Run the Cloudflare sweep on a worker thread (keeps the GUI responsive).
+    """Run the SenPaiScanner two-phase sweep on a worker thread.
 
-    Emits ``hit(ip, latency_ms)`` for each clean IP found, ``line(text)`` for
-    progress, and ``done(found, tested)`` once finished. Cancellable via
-    :meth:`stop`.
+    **Phase 1** (always) — the :class:`CFScanner` connectivity probe sweeps the
+    Cloudflare IP pool and streams every clean IP via ``hit``.
+
+    **Phase 2** (optional, when ``validate_xray`` is set) — the surviving clean
+    IPs are then validated *end-to-end* through the bundled ``xray.exe`` running
+    the user's real config; each IP that carries real traffic is re-emitted via
+    ``verified`` with its proxied latency + download speed.
+
+    Signals
+    -------
+    hit(ip, latency_ms, detail)        — a Phase-1 clean IP (with colo/speed in
+                                          ``detail``).
+    verified(ip, latency_ms, speed_bps)— a Phase-2 xray-validated IP.
+    rejected(ip)                       — a Phase-1 IP that failed Phase 2.
+    line(text)                         — progress log line.
+    phase(name)                        — "phase1" / "phase2" transition.
+    done(found, tested)                — finished (found = final clean count).
     """
 
-    hit = Signal(str, float, str)   # ip, latency_ms, detail (e.g. "http ok")
+    hit = Signal(str, float, str)        # ip, latency_ms, detail
+    verified = Signal(str, float, float)  # ip, proxied_latency_ms, speed_bps
+    rejected = Signal(str)               # ip that failed Phase 2
     line = Signal(str)
+    phase = Signal(str)
     done = Signal(int, int)
 
-    def __init__(self, profile, cfg: ScanConfig, parent=None):
+    def __init__(self, profile, cfg: ScanConfig, parent=None,
+                 *, validate_xray: bool = False):
         super().__init__(parent)
         self._profile = profile
         self._cfg = cfg
+        self._validate_xray = validate_xray
         self._scanner: Optional[CFScanner] = None
+        self._validator: Optional[XrayValidator] = None
 
     def stop(self):
         if self._scanner is not None:
             self._scanner.stop()
+        if self._validator is not None:
+            self._validator.stop()
 
     def run(self):  # pragma: no cover - exercised via Qt smoke, not unit
         self._scanner = CFScanner(
             on_log=self.line.emit,
+            on_phase=self.phase.emit,
             on_result=lambda r: self.hit.emit(
                 r.ip, r.latency_ms, getattr(r, "detail", "") or ""),
         )
         try:
             report = self._scanner.scan(self._cfg)
-            self.done.emit(len(report.clean), report.tested)
         except Exception as exc:
-            self.line.emit(tr("خطا در اسکن: {exc}").format(exc=exc))
+            self.line.emit(tr("خطا در اسکن (فاز ۱): {exc}").format(exc=exc))
             self.done.emit(0, 0)
+            return
+
+        clean_ips = [r.ip for r in report.clean]
+
+        # --- Phase 2 — real xray end-to-end validation (optional) ---
+        if self._validate_xray and clean_ips and not self._scanner._stopping():
+            self.phase.emit("phase2")
+            self._validator = XrayValidator(
+                self._profile,
+                on_log=self.line.emit,
+                on_result=self._on_validation,
+            )
+            if not self._validator.is_available:
+                self.line.emit(tr(
+                    "هشدار: xray.exe یافت نشد — فاز ۲ (اعتبارسنجی واقعی) "
+                    "نادیده گرفته شد؛ فقط نتایج فاز ۱ نمایش داده می‌شود."))
+                self.done.emit(len(clean_ips), report.tested)
+                return
+            try:
+                results = self._validator.validate_all(clean_ips,
+                                                        concurrency=1)
+                passed = sum(1 for r in results if r.success)
+                self.done.emit(passed, report.tested)
+                return
+            except Exception as exc:
+                self.line.emit(
+                    tr("خطا در اسکن (فاز ۲): {exc}").format(exc=exc))
+
+        self.done.emit(len(clean_ips), report.tested)
+
+    def _on_validation(self, res: "XrayValidation"):  # pragma: no cover - Qt
+        if res.success:
+            self.verified.emit(res.ip, res.latency_ms, res.throughput_bps)
+        else:
+            self.rejected.emit(res.ip)
 
 
 class ScannerDialog(QDialog):
@@ -161,6 +220,25 @@ class ScannerDialog(QDialog):
         opts.addWidget(self.spin_conc)
         opts.addStretch(1)
         root.addLayout(opts)
+
+        # --- Phase 2 toggle: real Xray end-to-end validation ---
+        # This is what makes SenPaiScanner trustworthy: after the Phase-1
+        # connectivity sweep, each clean IP is run through the bundled xray with
+        # the user's REAL config and tested with real traffic (TTFB + download).
+        # Only IPs that actually carry the config end-to-end survive.
+        phase2_row = QHBoxLayout()
+        phase2_row.setSpacing(8)
+        self.chk_xray = QCheckBox(
+            tr("اعتبارسنجی واقعی با xray (فاز ۲ — توصیه‌شده)"))
+        self.chk_xray.setChecked(True)
+        self.chk_xray.setToolTip(tr(
+            "پس از فاز ۱، هر IP تمیز با کانفیگ واقعی شما از طریق xray اجرا و با "
+            "ترافیک واقعی (تأخیر + سرعت دانلود) تست می‌شود. فقط IPهایی که "
+            "واقعاً کانفیگ را سرتاسر منتقل می‌کنند تأیید می‌شوند. کندتر ولی "
+            "دقیق‌تر — دقیقاً مثل SenPaiScanner."))
+        phase2_row.addWidget(self.chk_xray)
+        phase2_row.addStretch(1)
+        root.addLayout(phase2_row)
 
         # --- start/stop ---
         ctrl = QHBoxLayout()
@@ -280,11 +358,20 @@ class ScannerDialog(QDialog):
             max_results=self.spin_results.value(),
             concurrency=self.spin_conc.value(),
         )
+        # track which list rows correspond to which IP so Phase 2 can update /
+        # prune them in place.
+        self._row_for_ip = {}
+        self._verified_ips = set()
+        validate_xray = self.chk_xray.isChecked()
         self._busy(True)
-        self.status.setText(tr("در حال اسکن …"))
-        self._worker = ScanWorker(self._profile, cfg, self)
+        self.status.setText(tr("فاز ۱ — در حال پروب اتصال …"))
+        self._worker = ScanWorker(self._profile, cfg, self,
+                                  validate_xray=validate_xray)
         self._worker.hit.connect(self._on_hit)
+        self._worker.verified.connect(self._on_verified)
+        self._worker.rejected.connect(self._on_rejected)
         self._worker.line.connect(self._on_line)
+        self._worker.phase.connect(self._on_phase)
         self._worker.done.connect(self._on_done)
         self._worker.start()
 
@@ -299,6 +386,7 @@ class ScannerDialog(QDialog):
         self.spin_count.setEnabled(not busy)
         self.spin_results.setEnabled(not busy)
         self.spin_conc.setEnabled(not busy)
+        self.chk_xray.setEnabled(not busy)
 
     def _on_hit(self, ip: str, latency_ms: float, detail: str = ""):
         self._found = getattr(self, "_found", 0) + 1
@@ -316,8 +404,57 @@ class ScannerDialog(QDialog):
             ip=ip, ms=latency_ms, d=detail or "—"))
         item.setData(Qt.UserRole, ip)
         self.list.addItem(item)
+        # remember the row so Phase 2 can mark it verified / prune it
+        self._row_for_ip[ip] = item
         self.lbl_progress.setText(tr("ورکرها: {n}  ·  پیداشده: {f}").format(
             n=self.spin_conc.value(), f=self._found))
+
+    def _on_verified(self, ip: str, latency_ms: float, speed_bps: float):
+        """A Phase-2 (xray) validated IP — annotate its row as ✓✓ confirmed."""
+        self._verified_ips.add(ip)
+        item = self._row_for_ip.get(ip)
+        spd = _fmt_speed(speed_bps) if speed_bps > 0 else "—"
+        label = tr("✅ {ip}   ·   {ms:.0f}ms واقعی   ·   {spd}   "
+                   "(تأییدشده با xray)").format(ip=ip, ms=latency_ms, spd=spd)
+        if item is not None:
+            item.setText(label)
+            item.setCheckState(Qt.Checked)
+            item.setToolTip(tr(
+                "IP: {ip}\nتأخیر واقعی پروکسی: {ms:.0f}ms\nسرعت دانلود: {spd}\n"
+                "این IP با کانفیگ واقعی شما از طریق xray تست و تأیید شد.").format(
+                    ip=ip, ms=latency_ms, spd=spd))
+        else:
+            item = QListWidgetItem(self.list)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            item.setText(label)
+            item.setData(Qt.UserRole, ip)
+            self.list.addItem(item)
+            self._row_for_ip[ip] = item
+
+    def _on_rejected(self, ip: str):
+        """A Phase-1 clean IP that FAILED the Phase-2 xray validation.
+
+        We dim it and uncheck it (so the user doesn't add a config that only
+        passed the lightweight probe but doesn't carry real traffic).
+        """
+        item = self._row_for_ip.get(ip)
+        if item is not None:
+            item.setCheckState(Qt.Unchecked)
+            item.setText(tr("⚠️ {ip}   ·   رد شد در فاز ۲ (xray)").format(ip=ip))
+            item.setForeground(Qt.gray)
+            item.setToolTip(tr(
+                "این IP در فاز ۱ تمیز به‌نظر رسید اما در اعتبارسنجی واقعی با "
+                "xray ترافیک را منتقل نکرد — توصیه نمی‌شود."))
+
+    def _on_phase(self, name: str):
+        if name == "phase1":
+            self.status.setText(tr("فاز ۱ — در حال پروب اتصال …"))
+        elif name == "phase2":
+            self.status.setText(
+                tr("فاز ۲ — اعتبارسنجی واقعی با xray (کندتر، دقیق‌تر) …"))
+            self.lbl_progress.setText(
+                tr("فاز ۲ — اجرای کانفیگ واقعی روی هر IP تمیز …"))
 
     def _on_line(self, text: str):
         self.log.appendPlainText(text)
@@ -327,12 +464,21 @@ class ScannerDialog(QDialog):
 
     def _on_done(self, found: int, tested: int):
         self._busy(False)
-        self.lbl_progress.setText(
-            tr("پایان  ·  پیداشده: {f}  ·  آزمایش‌شده: {t}").format(
-                f=found, t=tested))
-        self.status.setText(
-            tr("تمام شد — {found} IP تمیز از {tested} آزمایش‌شده").format(
-                found=found, tested=tested))
+        xray_done = self.chk_xray.isChecked() and bool(self._verified_ips)
+        if xray_done:
+            self.lbl_progress.setText(
+                tr("پایان  ·  تأییدشده با xray: {f}  ·  آزمایش‌شده: {t}").format(
+                    f=found, t=tested))
+            self.status.setText(
+                tr("تمام شد — {found} IP با xray تأیید شد (از {tested} "
+                   "آزمایش‌شده)").format(found=found, tested=tested))
+        else:
+            self.lbl_progress.setText(
+                tr("پایان  ·  پیداشده: {f}  ·  آزمایش‌شده: {t}").format(
+                    f=found, t=tested))
+            self.status.setText(
+                tr("تمام شد — {found} IP تمیز از {tested} آزمایش‌شده").format(
+                    found=found, tested=tested))
 
     # -- selection helpers -------------------------------------------------
     def _set_all_checked(self, checked: bool):
