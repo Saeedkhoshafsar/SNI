@@ -80,7 +80,8 @@ def tcp_latency(host: str, port: int, timeout: float) -> Optional[float]:
 
 def tls_latency(host: str, port: int, timeout: float, *,
                 server_name: str = "", host_header: str = "",
-                path: str = "/", is_ws: bool = False
+                path: str = "/", is_ws: bool = False,
+                is_tls: bool = True, retries: int = 2
                 ) -> Optional[float]:  # pragma: no cover - net
     """Single-sample latency with **real, config-accurate** validation (stdlib).
 
@@ -107,7 +108,7 @@ def tls_latency(host: str, port: int, timeout: float, *,
     now means "this endpoint really answers for this config", matching the
     behaviour the user expects from V2RayTun.
     """
-    from .cf_scanner import cf_ip_probe, ProbeSpec, OK
+    from .cf_scanner import cf_ip_probe, ProbeSpec, OK, RST, TIMEOUT
 
     spec = ProbeSpec(
         port=int(port),
@@ -115,19 +116,45 @@ def tls_latency(host: str, port: int, timeout: float, *,
         host=(host_header or server_name or host or "").strip(),
         path=path or "/",
         is_ws=bool(is_ws),
-        is_tls=True,
+        is_tls=bool(is_tls),
     )
-    res = cf_ip_probe(host, spec, timeout)
-    if res.outcome == OK:
-        return float(res.latency_ms)
+    # The honest edge probe is the right test for BOTH TLS and plaintext (port
+    # 80 / security=none) Cloudflare-fronted configs: it sends a real HTTP/1.1
+    # request (and, for ws, a real Upgrade) carrying the config's Host header, so
+    # a dead Worker route or wrong host fails honestly — unlike a bare TCP
+    # connect to an anycast IP, which ALWAYS succeeds and produced the reported
+    # "ping is green but the config never connects" for the plaintext SIN-04/06
+    # servers.
+    #
+    # Robustness (the "بدون پاسخ" false-red on a config that DOES connect): a
+    # single attempt is fragile under load — the edge can momentarily reset or
+    # time out the trace / second WS handshake even though the route is fine. So
+    # we retry a couple of times and only report a miss if EVERY attempt failed,
+    # mirroring how the live-tunnel ping sweeps multiple endpoints.
+    attempts = max(1, int(retries) + 1)
+    saw_retryable = False
+    for _ in range(attempts):
+        res = cf_ip_probe(host, spec, timeout)
+        if res.outcome == OK:
+            return float(res.latency_ms)
+        if res.outcome in (RST, TIMEOUT):
+            saw_retryable = True  # transient — worth another shot
     # Fallback for NON-Cloudflare ordinary configs (plain VPS VLESS/Trojan/etc):
     # the /cdn-cgi/trace edge check only passes for Cloudflare-fronted hosts, so
     # a perfectly working direct server failed it → "پینگ پاسخ نمیده با اینکه کار
     # میکنه". For a direct config the host IS the real server (not a shared
     # anycast IP), so a genuine TLS handshake presenting the config's own SNI is
     # honest evidence the endpoint is alive and speaks TLS for this config.
-    sni = (server_name or host or "").strip().strip("[]")
-    return _tls_handshake_latency(host, int(port), timeout, server_name=sni)
+    # Only meaningful for TLS configs; a plaintext direct config has no handshake
+    # to validate, so we leave it honestly red rather than fake a number.
+    if is_tls:
+        sni = (server_name or host or "").strip().strip("[]")
+        ms = _tls_handshake_latency(host, int(port), timeout, server_name=sni)
+        if ms is not None:
+            return ms
+    # all edge attempts failed and the TLS fallback (if any) didn't help.
+    _ = saw_retryable
+    return None
 
 
 def _tls_handshake_latency(host: str, port: int, timeout: float, *,
@@ -417,25 +444,38 @@ class PingTester:
         if not target.host or not (0 < target.port < 65536):
             res.error = "آدرس/پورت نامعتبر"
             return res
-        # #1: for a TLS-bearing target we DON'T trust a bare TCP connect — DPI
-        # lets the TCP handshake through and only drops/resets the TLS
-        # ClientHello (the real SNI). Validate a genuine TLS handshake so the
-        # reported latency reflects whether a real session can actually be set
-        # up (the "green ping but never connects" bug). A caller that injects a
-        # custom ``latency_fn`` (tests) always wins so the suite stays
-        # deterministic and offline.
-        use_tls = (getattr(target, "tls", False)
-                   and self.latency_fn is tcp_latency)
-        for _ in range(self.samples):
+        # We DON'T trust a bare TCP connect for a CDN-fronted config — DPI lets
+        # the TCP handshake through and only drops/resets the real session, and
+        # worse, a bare connect to a Cloudflare anycast IP ALWAYS succeeds, so a
+        # plaintext (security=none, port 80) config went green even when its
+        # Worker route was dead (the reported SIN-04/06 "pings but never
+        # connects" bug). So we use the honest edge probe — a real HTTP/1.1
+        # request (and, for ws, a real Upgrade) carrying the config's Host —
+        # whenever the target is TLS **or** a WebSocket transport (i.e. fronted
+        # by Cloudflare/a CDN), regardless of whether TLS wraps the wire.
+        #
+        # A caller that injects a custom ``latency_fn`` (tests) always wins so
+        # the suite stays deterministic and offline.
+        is_tls = bool(getattr(target, "tls", False))
+        is_ws = bool(getattr(target, "is_ws", False))
+        use_edge = ((is_tls or is_ws) and self.latency_fn is tcp_latency)
+        # The edge probe is heavier than a TCP connect and already retries
+        # internally, so taking it once (instead of ``samples`` times) keeps the
+        # ping snappy and — crucially — avoids hammering the same edge with many
+        # back-to-back handshakes, which was itself triggering the transient
+        # reset/timeout false-reds the user saw under a "ping all" burst.
+        n = 1 if use_edge else self.samples
+        for _ in range(n):
             res.samples_sent += 1
             try:
-                if use_tls:
+                if use_edge:
                     ms = tls_latency(
                         target.host, target.port, self.timeout,
                         server_name=getattr(target, "server_name", ""),
                         host_header=getattr(target, "host_header", ""),
                         path=getattr(target, "path", "/"),
-                        is_ws=bool(getattr(target, "is_ws", False)))
+                        is_ws=is_ws,
+                        is_tls=is_tls)
                 else:
                     ms = self.latency_fn(target.host, target.port, self.timeout)
             except Exception as exc:  # never let one bad sample kill the run
