@@ -2358,6 +2358,17 @@ class MainWindow(QWidget):
                 self.engine.stop()
             except Exception:
                 pass
+            # reflect the stop in the UI IMMEDIATELY. engine.stop() is
+            # synchronous and emits idle, but during a restart we were masking
+            # idle→connecting; since _cancel_restart() just dropped the mask the
+            # next idle would show through, yet a stale "connecting" could still
+            # be on screen for a beat. Force idle now so the button never looks
+            # stuck on "در حال اتصال…" after the user pressed Stop.
+            try:
+                self.page_dashboard.set_status("idle")
+                self.active_bar.set_status("idle")
+            except Exception:
+                pass
             return
         if getattr(self, "_restarting", False):
             Toast.show_message(
@@ -2511,7 +2522,21 @@ class MainWindow(QWidget):
             in_error = (self.engine.status_value == "error")
         except Exception:
             in_error = False
-        should_restart = was_running or (in_error and profile is not None)
+        # Guard against a NEEDLESS restart when the user re-activates the config
+        # that is ALREADY the running one (e.g. clicking «فعال‌سازی» on the
+        # already-active row, or a spurious selection signal). Tearing down and
+        # rebuilding a perfectly working tunnel here is exactly the "I switch the
+        # active config and it resets itself / sometimes breaks" surprise the
+        # user hit. If the engine is up AND this profile is the active endpoint,
+        # there is nothing to switch to — keep the live session untouched.
+        same_active = False
+        if was_running and profile is not None:
+            try:
+                same_active = bool(self.engine.is_active_profile(profile))
+            except Exception:
+                same_active = False
+        should_restart = (was_running or (in_error and profile is not None)) \
+            and not same_active
 
         # --- 1) apply the new profile + any mode change FIRST ---------------
         # so the (re)start below already sees the new server *and* the right

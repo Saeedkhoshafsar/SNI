@@ -451,6 +451,58 @@ class EngineControllerTest(unittest.TestCase):
         ctrl.stop()  # must not raise
         self.assertEqual(ctrl.status, STATUS_IDLE)
 
+    # -- start/stop epoch guard (rapid config-switch race) ---------------
+    #
+    # User report: "I switch the active config while connected (it auto-resets)
+    # and sometimes it breaks / gets stuck / doesn't reconnect." Root cause: a
+    # slow, in-flight start() from the OLD config could finish AFTER the user
+    # switched/stopped and falsely commit ACTIVE over a half-torn-down session.
+    # The epoch guard makes a superseded start refuse to commit.
+
+    def test_commit_active_only_when_epoch_current(self):
+        ctrl = EngineController({"connection_mode": "SNI Only"})
+        ctrl._start_epoch = 5
+        # the current epoch commits ACTIVE
+        self.assertTrue(ctrl._commit_active(5))
+        self.assertEqual(ctrl.status, STATUS_ACTIVE)
+        # a stale epoch (older start) must NOT commit
+        ctrl._set_status(STATUS_IDLE)
+        self.assertFalse(ctrl._commit_active(4))
+        self.assertEqual(ctrl.status, STATUS_IDLE)
+
+    def test_stop_bumps_epoch_so_inflight_start_is_superseded(self):
+        ctrl = EngineController({"connection_mode": "SNI Only"})
+        # a start() captures epoch e1; the engine is told to start
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        e_before = ctrl._start_epoch
+        # stop() must move the epoch on so any racing _do_start can't re-commit
+        ctrl.stop()
+        self.assertGreater(ctrl._start_epoch, e_before)
+        # a stale start (the pre-stop epoch) can no longer commit ACTIVE
+        self.assertFalse(ctrl._commit_active(e_before))
+        self.assertEqual(ctrl.status, STATUS_IDLE)
+
+    def test_superseded_start_does_not_resurrect_active(self):
+        """A new start()/stop() between an old start's bind and its ACTIVE
+        commit invalidates the old commit — no false green over a dead session.
+        """
+        ctrl = EngineController({"connection_mode": "SNI Only"})
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        old_epoch = ctrl._start_epoch
+        # simulate the user switching config: stop then a fresh start
+        ctrl.stop()
+        ctrl.start()
+        self.assertTrue(_wait_status(ctrl, STATUS_ACTIVE))
+        new_epoch = ctrl._start_epoch
+        self.assertNotEqual(old_epoch, new_epoch)
+        # the OLD start trying to commit now is a no-op (epoch moved on)
+        before = ctrl.status
+        self.assertFalse(ctrl._commit_active(old_epoch))
+        self.assertEqual(ctrl.status, before)
+        ctrl.stop()
+
     # -- auto-prober integration -----------------------------------------
 
     def test_auto_prober_picks_winner_and_sets_bypass_method(self):

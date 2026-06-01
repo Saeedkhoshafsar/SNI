@@ -71,6 +71,14 @@ class EngineController:
         self._spoof_port: Optional[int] = None
         self._status = STATUS_IDLE
         self._lock = threading.RLock()
+        # Start/stop epoch (re-entrancy guard for rapid config switches). Every
+        # start() and stop() bumps it under the lock; a background _do_start()
+        # captures the epoch it was launched for and only commits ACTIVE (or an
+        # ERROR) if it is still the current epoch. This stops a slow, in-flight
+        # start from an OLD config resurrecting itself as "active" after the user
+        # already switched away / stopped — the "switch config and it breaks or
+        # gets stuck" class of bug.
+        self._start_epoch = 0
         # latest live throughput (bytes/sec) reported by the spoofer; surfaced
         # in diagnostics even when the resilience baseline isn't built yet (#4)
         self._live_up_bps = 0.0
@@ -503,16 +511,48 @@ class EngineController:
             if self.is_running:
                 self._log("موتور از قبل در حال اجراست")
                 return
+            # claim a fresh epoch for this start so a late/abandoned previous
+            # _do_start() can't commit ACTIVE after we've moved on.
+            self._start_epoch += 1
+            epoch = self._start_epoch
             self._set_status(STATUS_CONNECTING)
-        threading.Thread(target=self._start_blocking, daemon=True).start()
+        threading.Thread(
+            target=self._start_blocking, args=(epoch,), daemon=True).start()
 
-    def _start_blocking(self) -> None:
+    def _start_blocking(self, epoch: int) -> None:
         try:
-            self._do_start()
+            self._do_start(epoch)
         except Exception as exc:  # never let the worker thread die silently
             self._log(f"خطا در راه‌اندازی: {exc}")
-            self._set_status(STATUS_ERROR)
-            self.stop()
+            # only surface the failure if this start is still the current one;
+            # a superseded start failing is irrelevant to the new session.
+            if self._epoch_current(epoch):
+                self._set_status(STATUS_ERROR)
+                self.stop()
+
+    def _epoch_current(self, epoch: int) -> bool:
+        """True when *epoch* is still the engine's active start epoch.
+
+        A background ``_do_start`` captures the epoch it was launched for; if a
+        newer start()/stop() has bumped the epoch since, this start has been
+        superseded and must NOT mutate status / leave a half-built session
+        behind.
+        """
+        with self._lock:
+            return epoch == self._start_epoch
+
+    def _commit_active(self, epoch: int) -> bool:
+        """Mark the engine ACTIVE iff *epoch* is still current.
+
+        Returns True when committed. A superseded start (the user switched
+        config / stopped while we were binding) returns False so the caller can
+        tear its half-built session down instead of falsely going green.
+        """
+        with self._lock:
+            if epoch != self._start_epoch:
+                return False
+            self._set_status(STATUS_ACTIVE)
+            return True
 
     def _load_remote_strategies(self):
         """Fetch + verify a signed ``strategies.json`` if remote updates are on.
@@ -650,7 +690,7 @@ class EngineController:
             self._log(f"تاب‌آوری راه‌اندازی نشد ({exc}) — بدون آن ادامه می‌دهیم")
             self._resilience = None
 
-    def _start_core_only(self) -> None:
+    def _start_core_only(self, epoch: int | None = None) -> None:
         """Plain Tunnel: run xray-core alone, connecting straight to the server.
 
         No spoofer ProxyServer is started, so xray's TLS/WS handshake reaches
@@ -660,6 +700,8 @@ class EngineController:
         portal is unnecessary now that we ship a full xray core).
         """
         assert self.profile is not None
+        if epoch is None:
+            epoch = self._start_epoch
         from core.xray_manager import XrayManager, find_free_port
 
         # the configured strategy is what the UI shows even though no spoofer
@@ -713,8 +755,19 @@ class EngineController:
             self._set_status(STATUS_ERROR)
             return
 
+        # If the user switched config / stopped while xray was launching, this
+        # start has been superseded — don't go green over a half-torn-down
+        # session (the "switch config and it breaks/sticks" race). Tear our own
+        # xray down and bail; the newer start owns the session now.
+        if not self._commit_active(epoch):
+            self._core_log("راه‌اندازی لغو شد (کانفیگ عوض شد) — نشست رها شد")
+            try:
+                if self._xray is not None:
+                    self._xray.stop()
+            except Exception:
+                pass
+            return
         self._maybe_enable_system_proxy(True)
-        self._set_status(STATUS_ACTIVE)
         self._core_log("✓ اتصال برقرار شد")
         # spin up the live-usage poller (issue #3): reads xray's cumulative
         # byte counters and turns them into the dashboard's traffic graph.
@@ -771,7 +824,9 @@ class EngineController:
         self._stats_thread = threading.Thread(target=_run, daemon=True)
         self._stats_thread.start()
 
-    def _do_start(self) -> None:
+    def _do_start(self, epoch: int | None = None) -> None:
+        if epoch is None:
+            epoch = self._start_epoch
         use_core = self.uses_core
         chain_spoofer = self.chains_spoofer
 
@@ -790,7 +845,7 @@ class EngineController:
         # reliable, V2RayTun-equivalent path.
         if use_core and not chain_spoofer:
             self._spoof_port = None
-            self._start_core_only()
+            self._start_core_only(epoch)
             return
 
         # --- 1. work out the spoofer's listen port + upstream target ---
@@ -935,10 +990,27 @@ class EngineController:
                     self._set_status(STATUS_ERROR)
                     return
 
+        # If the user switched config / stopped while the spoofer (+xray) was
+        # coming up, this start has been superseded — don't go green over a
+        # half-torn-down session. Tear our own handles down and bail so the
+        # newer start owns the session cleanly (rapid config-switch race).
+        if not self._commit_active(epoch):
+            self._log("راه‌اندازی لغو شد (کانفیگ عوض شد) — نشست رها شد")
+            try:
+                if self._xray is not None:
+                    self._xray.stop()
+            except Exception:
+                pass
+            try:
+                if self._proxy is not None:
+                    self._proxy.stop()
+            except Exception:
+                pass
+            return
+
         # --- 4. optionally point the OS system proxy at our local HTTP port ---
         self._maybe_enable_system_proxy(chain_spoofer)
 
-        self._set_status(STATUS_ACTIVE)
         self._log("✓ اتصال برقرار شد")
 
         # Tell the user *how* to actually route traffic through the tunnel.
@@ -1105,6 +1177,9 @@ class EngineController:
         # signal the live-usage poller to exit before we drop the xray handle
         self._stats_stop.set()
         with self._lock:
+            # bump the epoch so any in-flight _do_start() from a previous /
+            # racing start is superseded and cannot commit ACTIVE behind us.
+            self._start_epoch += 1
             xray, proxy = self._xray, self._proxy
             sysproxy = self._system_proxy
             self._xray = self._proxy = self._system_proxy = None
