@@ -325,6 +325,82 @@ class EngineController:
             t = target_from_profile(profile)
             return StrategyPingReport(label=t.label, host=t.host, port=t.port)
 
+    def is_active_profile(self, profile) -> bool:
+        """True when *profile* is the one the live tunnel is currently running.
+
+        Used so the inline ping can give a **definitive** live measurement for
+        the active config (a real request through the running proxy) rather than
+        an offline guess. Compares by identity first, then by the fields that
+        define a config endpoint (address/port/uuid/sni) so a fresh Profile
+        object parsed from the same link still matches.
+        """
+        if profile is None or self.profile is None:
+            return False
+        if profile is self.profile:
+            return True
+        a, b = profile, self.profile
+        try:
+            return (
+                getattr(a, "address", None) == getattr(b, "address", None)
+                and int(getattr(a, "port", 0) or 0) == int(getattr(b, "port", 0) or 0)
+                and getattr(a, "uuid", "") == getattr(b, "uuid", "")
+                and getattr(a, "password", "") == getattr(b, "password", "")
+            )
+        except Exception:
+            return False
+
+    def live_proxy_ping(self, *, samples: int = 1, timeout: float = 12.0):
+        """Measure REAL latency through the running tunnel (most honest ping).
+
+        Returns ``(ok: bool, latency_ms: float|None, detail: str)``.
+
+        This is the only test that faithfully reflects what the user
+        experiences, because the request travels the *actual* live chain
+        (xray → spoofer → CDN) — including the spoofer's decoy-SNI injection that
+        an offline probe can never replicate. That injection is exactly why an
+        offline ping of a spoof config's *real* SNI gets DPI-blocked (no ping)
+        even though the config works (bug #1: "spoof config had no ping but
+        worked"). When the tunnel is up we sidestep that contradiction entirely
+        by measuring through it.
+
+        Only meaningful while :pyattr:`is_running` / status active; returns
+        ``(False, None, ...)`` otherwise.
+        """
+        import time
+        import urllib.request
+
+        if self._status != STATUS_ACTIVE:
+            return (False, None, "tunnel not active")
+        try:
+            _socks, http_port = self._effective_ports()
+        except Exception:
+            return (False, None, "no bound port")
+        proxy = f"http://127.0.0.1:{http_port}"
+        test_url = "https://www.gstatic.com/generate_204"
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        opener = urllib.request.build_opener(handler)
+        best = None
+        last_detail = ""
+        n = max(1, int(samples))
+        for _ in range(n):
+            req = urllib.request.Request(
+                test_url, headers={"User-Agent": "SNISpoofer-ping"})
+            t0 = time.time()
+            try:
+                with opener.open(req, timeout=timeout) as resp:
+                    code = resp.getcode()
+                dt = (time.time() - t0) * 1000.0
+                if code in (200, 204):
+                    best = dt if best is None else min(best, dt)
+                    last_detail = f"http {code}"
+                else:
+                    last_detail = f"unexpected http {code}"
+            except Exception as exc:
+                last_detail = f"{type(exc).__name__}: {exc}"
+        if best is not None:
+            return (True, float(best), last_detail or "ok")
+        return (False, None, last_detail or "no response")
+
     # ------------------------------------------------------------------ start
 
     def start(self) -> None:

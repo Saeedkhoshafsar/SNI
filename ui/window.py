@@ -762,13 +762,41 @@ class ProfilesPage(QWidget):
     selected profile is what the engine chains xray + spoofing under.
     """
 
+    # Bug-fix: cap how many inline pings run at once. "Ping all" used to spawn
+    # one QThread *per profile* simultaneously — with a big list that flooded the
+    # CPU/network and (combined with refresh() dropping references) crashed the
+    # app. Pings now queue and run at most this many at a time.
+    _PING_MAX_CONCURRENCY = 6
+
     def __init__(self, store: ConfigStore, engine=None, parent=None):
         super().__init__(parent)
         self._store = store
         self._engine = engine          # EngineBridge — used for ping (optional)
-        # per-row inline ping workers, keyed by row index — allows several rows
-        # to be pinged concurrently / all at once (#4).
-        self._inline_workers: dict[int, "InlinePingWorker"] = {}
+        # Inline-ping job scheduler (rewritten for bug-fix: rapid "ping all" +
+        # "select all" used to CRASH the app). The old design kept one worker per
+        # *row index* in a dict that refresh() reset to ``{}`` — which dropped the
+        # last Python reference to QThreads that were STILL RUNNING, so Qt tore
+        # them down mid-run ("QThread: Destroyed while thread is still running")
+        # and the process died. It also span an *unbounded* number of threads on
+        # "ping all" (one per profile), flooding the machine.
+        #
+        # New model:
+        #   * workers are keyed by a monotonic JOB id (never reused), and each job
+        #     remembers which PROFILE it is pinging — not a fragile row index or a
+        #     stale widget pointer. The result handler re-finds the live row by
+        #     looking the profile up in the current store, so a refresh() that
+        #     rebuilds every row never breaks (or crashes) an in-flight ping.
+        #   * refresh() NO LONGER discards running workers — they stay referenced
+        #     here until they emit their result, then clean themselves up.
+        #   * concurrency is BOUNDED: at most ``_PING_MAX_CONCURRENCY`` workers run
+        #     at once; the rest queue and start as slots free up. "Ping all" now
+        #     enqueues every profile instead of spawning N threads immediately.
+        self._inline_jobs: dict[int, "InlinePingWorker"] = {}
+        self._inline_job_seq: int = 0
+        # profiles currently pinging or queued (by identity) — used to skip
+        # double-firing the same config and to map results back to a row.
+        self._inline_pending: list[tuple[int, object]] = []   # (job_id, profile)
+        self._inline_queue: list[object] = []                 # profiles waiting
         # #7: indexes that are *checked* for bulk actions (delete / copy links).
         # This is independent of the active profile — checking a row never
         # activates it. Stored as a set so order doesn't matter.
@@ -915,10 +943,13 @@ class ProfilesPage(QWidget):
 
     # -- list rendering ----------------------------------------------------
     def refresh(self) -> None:
-        # rows are about to be rebuilt — any in-flight inline-ping workers point
-        # at the old row widgets (their result handler already swallows the
-        # RuntimeError when a widget is gone), so just forget the keys (#4).
-        self._inline_workers = {}
+        # Rows are about to be rebuilt. We must NOT touch ``self._inline_jobs``
+        # here: those QThreads may still be RUNNING, and dropping the last
+        # reference to a running QThread crashes the whole app (this was the
+        # "ping all + select all → نرم‌افزار بسته میشه" crash). The jobs are keyed
+        # by job-id and remember their *profile*, so when each one finishes its
+        # result handler re-finds the (new) row widget by looking the profile up
+        # in the freshly-rebuilt list — no stale widget pointer, no crash.
         # recolour the icon toolbar for the active theme (#1)
         for b, name in getattr(self, "_tool_buttons", []):
             try:
@@ -974,7 +1005,23 @@ class ProfilesPage(QWidget):
         self.list.blockSignals(False)
         # final pass to pin widths to the current viewport (#2)
         self.list._sync_item_widths()
+        # re-apply the "در حال پینگ…" busy state to any row whose profile still
+        # has an in-flight (or queued) ping after this rebuild, so the spinner
+        # text isn't lost when the list is refreshed mid-ping.
+        self._restore_pinging_rows()
         self._update_selection_ui()
+
+    def _restore_pinging_rows(self) -> None:
+        pending_profiles = [p for _, p in getattr(self, "_inline_pending", [])]
+        pending_profiles += list(getattr(self, "_inline_queue", []))
+        if not pending_profiles:
+            return
+        for i, prof in enumerate(self._store.profiles):
+            if i < len(self._rows) and any(p is prof for p in pending_profiles):
+                try:
+                    self._rows[i].set_pinging()
+                except RuntimeError:
+                    pass
 
     # -- multi-select / bulk actions (#7) ---------------------------------
     def _on_row_checked(self, index: int, checked: bool) -> None:
@@ -1280,42 +1327,54 @@ class ProfilesPage(QWidget):
         self._toast(
             tr("{n} کانفیگ با IP تمیز افزوده شد").format(n=added), "ok")
 
-    # -- inline per-row ping (#3) -----------------------------------------
+    # -- inline per-row ping (bounded, crash-safe) ------------------------
+    def _profile_pending(self, prof) -> bool:
+        """True if this exact profile already has a queued / running ping."""
+        if any(p is prof for _, p in self._inline_pending):
+            return True
+        if any(p is prof for p in self._inline_queue):
+            return True
+        return False
+
+    def _enqueue_ping(self, prof) -> None:
+        """Queue a profile for an inline ping (de-duplicated)."""
+        if prof is None or self._profile_pending(prof):
+            return
+        self._inline_queue.append(prof)
+
     def _ping_row(self, row: int):
         """Ping a single profile and show the result inline on its row.
 
-        #4: per-row pings now run **concurrently** — each row gets its own
-        worker tracked in ``self._inline_workers`` keyed by row, so the user can
-        fire several at once (or "ping all") without waiting for the previous
-        one to finish. A row that's already pinging is simply skipped.
+        Pings are now QUEUED and run with bounded concurrency (see
+        ``_PING_MAX_CONCURRENCY``). A profile that's already queued/running is
+        skipped, so double-clicking 📡 or hitting "ping all" repeatedly can't
+        pile up duplicate threads.
         """
         if not (0 <= row < len(self._store.profiles)):
             return
         if self._engine is None:
             self._toast(tr("موتور در دسترس نیست"), "err")
             return
-        workers = getattr(self, "_inline_workers", None)
-        if workers is None:
-            workers = self._inline_workers = {}
-        existing = workers.get(row)
-        if existing is not None and existing.isRunning():
-            return  # this row is already being pinged — don't double-fire
-        rows = getattr(self, "_rows", [])
-        if row >= len(rows):
-            return
-        widget = rows[row]
-        widget.set_pinging()
-        self._engine.update_config(self._store.config)
         prof = self._store.profiles[row]
-        worker = InlinePingWorker(self._engine, prof)
-        worker.result.connect(
-            lambda text, kind, w=widget, r=row:
-                self._inline_ping_done(w, text, kind, r))
-        workers[row] = worker
-        worker.start()
+        if self._profile_pending(prof):
+            return
+        rows = getattr(self, "_rows", [])
+        if 0 <= row < len(rows):
+            try:
+                rows[row].set_pinging()
+            except RuntimeError:
+                pass
+        self._enqueue_ping(prof)
+        self._pump_ping_queue()
 
     def _ping_all_inline(self):
-        """Fire an inline ping on **every** row at once (#4 — "ping all")."""
+        """Queue an inline ping on **every** row (#4 — "ping all").
+
+        Bug-fix: this used to spawn one QThread per profile *immediately*. It now
+        enqueues every profile and lets ``_pump_ping_queue`` start them a few at
+        a time, so a big list (or "ping all" + "select all" fired together) can
+        no longer flood threads and crash the app.
+        """
         if self._engine is None:
             self._toast(tr("موتور در دسترس نیست"), "err")
             return
@@ -1323,20 +1382,100 @@ class ProfilesPage(QWidget):
             self._toast(tr("هیچ پروفایلی برای پینگ نیست"), "warn")
             return
         self._toast(tr("در حال پینگ همهٔ سرورها …"), "info")
-        for row in range(len(self._store.profiles)):
-            self._ping_row(row)
+        rows = getattr(self, "_rows", [])
+        for row, prof in enumerate(self._store.profiles):
+            if self._profile_pending(prof):
+                continue
+            if 0 <= row < len(rows):
+                try:
+                    rows[row].set_pinging()
+                except RuntimeError:
+                    pass
+            self._enqueue_ping(prof)
+        self._pump_ping_queue()
 
-    def _inline_ping_done(self, widget, text: str, kind: str, row: int = -1):
+    def _pump_ping_queue(self) -> None:
+        """Start queued pings up to the concurrency cap."""
+        if self._engine is None:
+            return
+        # config is shared by all probes — push it once per pump, not per row
         try:
-            widget.set_ping_state(text, kind)
-            widget.set_ping_idle()
-        except RuntimeError:
-            # the row widget may have been recreated by a refresh() — ignore
+            self._engine.update_config(self._store.config)
+        except Exception:
             pass
-        # drop the finished worker so the row can be pinged again
-        workers = getattr(self, "_inline_workers", None)
-        if workers is not None and row in workers:
-            workers.pop(row, None)
+        while (self._inline_queue
+               and len(self._inline_pending) < self._PING_MAX_CONCURRENCY):
+            prof = self._inline_queue.pop(0)
+            self._inline_job_seq += 1
+            job_id = self._inline_job_seq
+            worker = InlinePingWorker(self._engine, prof, parent=self)
+            worker.result.connect(
+                lambda text, kind, jid=job_id:
+                    self._inline_ping_done(jid, text, kind))
+            self._inline_jobs[job_id] = worker
+            self._inline_pending.append((job_id, prof))
+            worker.start()
+
+    def _row_index_for_profile(self, prof) -> int:
+        """Find the CURRENT row index of a profile by identity (refresh-safe)."""
+        for i, p in enumerate(self._store.profiles):
+            if p is prof:
+                return i
+        return -1
+
+    def _inline_ping_done(self, job_id: int, text: str, kind: str):
+        # locate the profile this job was pinging
+        prof = None
+        for jid, p in self._inline_pending:
+            if jid == job_id:
+                prof = p
+                break
+        # re-find the LIVE row widget by profile identity — never a stale pointer
+        if prof is not None:
+            row = self._row_index_for_profile(prof)
+            rows = getattr(self, "_rows", [])
+            if 0 <= row < len(rows):
+                try:
+                    rows[row].set_ping_state(text, kind)
+                    rows[row].set_ping_idle()
+                except RuntimeError:
+                    pass
+        # retire the worker safely: wait for the thread to actually finish before
+        # dropping our reference, so we never GC a still-running QThread (crash).
+        worker = self._inline_jobs.pop(job_id, None)
+        if worker is not None:
+            try:
+                worker.wait(2000)
+            except Exception:
+                pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+        self._inline_pending = [
+            (jid, p) for jid, p in self._inline_pending if jid != job_id]
+        # a slot just freed up — start the next queued ping
+        self._pump_ping_queue()
+
+    def stop_inline_pings(self) -> None:
+        """Drain the queue and wait for running ping workers to finish.
+
+        Called on shutdown so the app never tears down a QThread that's still
+        running (which would crash). Safe to call multiple times.
+        """
+        self._inline_queue = []
+        for worker in list(self._inline_jobs.values()):
+            try:
+                if worker.isRunning():
+                    worker.wait(3000)
+            except Exception:
+                pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+        self._inline_jobs = {}
+        self._inline_pending = []
 
     def _emit_selection(self):
         if self.on_selection_changed:
@@ -1364,35 +1503,79 @@ class InlinePingWorker(QThread):
         self._profile = profile
 
     def run(self):  # pragma: no cover - exercised via Qt smoke, not unit
-        # #4: a raw TCP connect to a real (censored) server's IP can succeed at
-        # the transport layer even when DPI blocks the protocol — so a plain
-        # ping showed a misleading "✔ 45ms" for servers that don't actually
-        # work. We therefore also PROBE THE BYPASS: if no strategy completes a
-        # handshake the row honestly reports it as blocked instead of a
-        # false-positive latency.
+        # Bug #1 — make the ping HONEST.
+        #
+        # The hard truth: no *offline* probe can faithfully tell whether a config
+        # works, because spoof configs only succeed when the running spoofer
+        # injects a DECOY SNI to slip past DPI. An offline probe that presents
+        # the config's REAL SNI to the CDN edge gets DPI-blocked → it shows no
+        # ping even though the config works (the user's "اسپوف پینگ نداد ولی کار
+        # میکرد"). Conversely a /cdn-cgi/trace to any live anycast IP answers for
+        # ANY SNI, so an ordinary config can look green yet not route ("پینگ
+        # میدادن ولی کار نمیکردن").
+        #
+        # So we measure differently depending on what we can actually observe:
+        #
+        #   1. If the tunnel is RUNNING this exact config → send a real request
+        #      THROUGH the live proxy. That travels the genuine chain (with the
+        #      spoofer's decoy injection) and is the single most trustworthy
+        #      "does it work + how fast" answer. Marked with 🛡 (تونل زنده).
+        #   2. Otherwise → an offline reachability estimate that is clearly
+        #      labelled as such (≈) and never over-claims. We only assert
+        #      "blocked" when even the raw transport is unreachable; a reachable
+        #      transport is reported as a tentative latency, not a guarantee.
+        try:
+            self._run_inner()
+        except Exception as exc:
+            try:
+                self.result.emit(tr("خطا: {exc}").format(exc=exc), "err")
+            except Exception:
+                pass
+
+    def _run_inner(self):
+        # --- 1) live tunnel measurement for the active config (definitive) ---
+        try:
+            is_active = bool(self._engine.is_active_profile(self._profile))
+        except Exception:
+            is_active = False
+        if is_active:
+            try:
+                ok, ms, _detail = self._engine.live_proxy_ping(samples=2)
+            except Exception:
+                ok, ms = False, None
+            if ok and ms is not None:
+                self.result.emit(
+                    tr("🛡 {ms:.0f}ms (تونل زنده)").format(ms=ms), "ok")
+                return
+            # tunnel is up but the live request failed — that IS meaningful:
+            # this config is selected yet not actually carrying traffic.
+            self.result.emit(tr("✖ تونل زنده پاسخ نداد"), "err")
+            return
+
+        # --- 2) offline estimate (ranking aid, honestly labelled) ------------
         try:
             res = self._engine.ping_profile(self._profile)
         except Exception as exc:
             self.result.emit(tr("خطا: {exc}").format(exc=exc), "err")
             return
-        if res is None:
-            self.result.emit(tr("نتیجه‌ای دریافت نشد"), "err")
-            return
-        if not res.reachable:
+        if res is None or not res.reachable:
+            # even the raw transport didn't answer → genuinely unreachable
             self.result.emit(tr("✖ بدون پاسخ"), "err")
             return
 
-        # the TCP endpoint answered — but does the bypass actually connect?
         best_ms = res.best_ms
+        # a strategy probe refines the estimate when it can connect, but a
+        # FAILED strategy probe is no longer treated as proof the config is dead:
+        # for spoof configs the real SNI is DPI-blocked offline by design, so a
+        # "no strategy connected" here is expected and must NOT flip a working
+        # config to red. We therefore only *upgrade* the number, never reject.
         try:
             report = self._engine.probe_strategies_for(self._profile)
         except Exception:
             report = None
-        if report is not None and report.results:
-            if not report.any_connected:
-                # transport reachable but DPI blocks every strategy ⇒ unusable
-                self.result.emit(tr("✖ مسدود (هیچ استراتژی وصل نشد)"), "err")
-                return
+        connected = bool(report is not None and report.results
+                         and report.any_connected)
+        if connected:
             b = report.best
             if b is not None and b.latency_ms:
                 best_ms = b.latency_ms
@@ -1404,7 +1587,16 @@ class InlinePingWorker(QThread):
             parts.append(f"loss {res.loss*100:.0f}%")
         if getattr(res, "download_kbps", None) is not None:
             parts.append(f"dl≈{res.download_kbps:.0f}KB/s")
-        self.result.emit("✔ " + " · ".join(parts), "ok")
+        if connected:
+            # a bypass strategy actually completed a handshake → confident
+            self.result.emit("✔ " + " · ".join(parts), "ok")
+        else:
+            # transport reachable but we couldn't prove the bypass offline —
+            # report a *tentative* latency (≈) instead of a false green/red, and
+            # hint that the live tunnel gives the real answer.
+            self.result.emit(
+                "≈ " + " · ".join(parts) + tr("  (تخمینی — برای قطعیت وصل شوید)"),
+                "info")
 
 
 class StrategyPage(QWidget):
@@ -2041,9 +2233,12 @@ class MainWindow(QWidget):
         """Connect UI pages to the engine bridge + config store (step 5)."""
         # engine → UI (signals are marshalled to the GUI thread by Qt)
         self.engine.log.connect(self.page_log.append)
-        self.engine.status.connect(self.page_dashboard.set_status)
-        self.engine.status.connect(self._on_status)
-        self.engine.status.connect(self.active_bar.set_status)
+        # All status updates funnel through _dispatch_status so that, while an
+        # automatic config-switch restart is in flight, a transient ``idle`` (the
+        # stop half of stop→start) is presented as ``connecting`` instead of
+        # flashing the "شروع" idle label — which used to let the user press Start
+        # mid-restart and break the connection (bug #2).
+        self.engine.status.connect(self._dispatch_status)
         self.engine.count.connect(self.page_dashboard.on_count)
         self.engine.traffic.connect(self.page_dashboard.on_traffic)
         # feed the persistent status bar's live rate (down_bps, up_bps)
@@ -2081,6 +2276,14 @@ class MainWindow(QWidget):
                 "[init] " + tr("پروفایلی انتخاب نشده — حالت SNI Only"))
 
     def _on_power(self, action: str):
+        # While an automatic config-switch restart is in flight the engine is
+        # briefly idle; a stray Start click here used to kick off a second,
+        # conflicting start ("موتور از قبل در حال اجراست" / a half torn-down
+        # session). Ignore manual power actions until the restart settles (#2).
+        if getattr(self, "_restarting", False):
+            Toast.show_message(
+                self, tr("در حال جابه‌جایی سرور… چند لحظه صبر کنید"), "info")
+            return
         if action == "start":
             # push the freshest settings + profile into the engine first
             self.engine.update_config(self.store.config)
@@ -2095,7 +2298,27 @@ class MainWindow(QWidget):
         else:
             self.engine.stop()
 
+    def _dispatch_status(self, status: str):
+        """Fan a single engine status out to every UI consumer, masking the
+        transient ``idle`` that happens mid auto-restart so the dashboard shows a
+        steady "در حال اتصال…" instead of flickering back to "شروع" (bug #2)."""
+        shown = status
+        if getattr(self, "_restarting", False) and status in ("idle", "error"):
+            # we deliberately tore the engine down to switch configs; keep the
+            # UI on "connecting" until the new session actually comes up.
+            shown = "connecting"
+        elif status in ("active", "error"):
+            # the restart finished (or genuinely failed) — drop the mask
+            self._restarting = False
+        self.page_dashboard.set_status(shown)
+        self.active_bar.set_status(shown)
+        self._on_status(status)
+
     def _on_status(self, status: str):
+        # never act on the *masked* status here — use the raw engine status, but
+        # suppress the "اتصال قطع شد" toast during an intentional restart.
+        if getattr(self, "_restarting", False) and status == "idle":
+            return
         if status == "active":
             Toast.show_message(self, tr("اتصال برقرار شد — spoofing فعال"), "ok")
             self._resilience_timer.start()
@@ -2175,6 +2398,12 @@ class MainWindow(QWidget):
         if was_running:
             self.page_log.append(
                 "[profile] " + tr("راه‌اندازی مجدد خودکار برای اعمال سرور جدید…"))
+            # flag the restart BEFORE stopping so the imminent idle status is
+            # masked as "connecting" and the Start button stays in stop/connect
+            # mode — the user can't accidentally fire a fresh start mid-switch.
+            self._restarting = True
+            self.page_dashboard.set_status("connecting")
+            self.active_bar.set_status("connecting")
             try:
                 self.engine.stop()
             except Exception:
@@ -2230,7 +2459,8 @@ class MainWindow(QWidget):
         except Exception:
             running = False
         self._restart_attempts = getattr(self, "_restart_attempts", 0) + 1
-        if not running or self._restart_attempts > 80:
+        timed_out = self._restart_attempts > 80
+        if not running or timed_out:
             # guard against two overlapping restart timers both firing start()
             # (rapid profile switches) → "موتور از قبل در حال اجراست" + a half
             # torn-down session. Only the first to see idle starts; the flag is
@@ -2238,10 +2468,16 @@ class MainWindow(QWidget):
             if getattr(self, "_restart_started", False):
                 return
             self._restart_started = True
+            if timed_out:
+                # engine never reached idle — give up the mask so the UI isn't
+                # stuck on "در حال اتصال…" forever; the real status will surface.
+                self._restarting = False
             try:
                 self.engine.start()
             except Exception:
-                pass
+                # start failed outright — drop the restart mask so the dashboard
+                # can show the real idle/error state again.
+                self._restarting = False
             return
         QTimer.singleShot(150, self._restart_when_idle)
 
@@ -2286,6 +2522,11 @@ class MainWindow(QWidget):
         if was_running:
             self.page_log.append(
                 "[strategy] " + tr("راه‌اندازی مجدد خودکار برای اعمال استراتژی جدید…"))
+            # mask the stop→start idle as "connecting" (bug #2), same as the
+            # config-switch restart above.
+            self._restarting = True
+            self.page_dashboard.set_status("connecting")
+            self.active_bar.set_status("connecting")
             try:
                 self.engine.stop()
             except Exception:
@@ -2647,6 +2888,12 @@ class MainWindow(QWidget):
         """Stop the engine cleanly so no subprocess / thread is orphaned."""
         try:
             self.wave_bg.set_enabled(False)
+        except Exception:
+            pass
+        # wait for any in-flight inline-ping QThreads before teardown so none is
+        # GC'd mid-run (would crash on exit)
+        try:
+            self.page_profiles.stop_inline_pings()
         except Exception:
             pass
         try:

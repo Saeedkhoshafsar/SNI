@@ -21,9 +21,11 @@ from __future__ import annotations
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QDialog, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout,
+    QWidget,
 )
 
 from core.cf_scanner import (
@@ -82,6 +84,19 @@ class ScannerDialog(QDialog):
         self.setObjectName("ScannerDialog")
         self.setWindowTitle(tr("اسکن IP تمیز کلودفلر"))
         self.setMinimumSize(620, 640)
+        # The main window is frameless with a CUSTOM title bar, so a child
+        # QDialog inherited an awkward geometry and opened with its (native)
+        # title bar pushed off the top of the screen — the user couldn't grab it
+        # to move the window (bug #4). Force a normal, OS-decorated, movable
+        # dialog window and centre it on the active screen in showEvent() so the
+        # title bar is always reachable.
+        self.setWindowFlags(
+            Qt.Dialog
+            | Qt.CustomizeWindowHint
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowCloseButtonHint
+        )
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
@@ -221,6 +236,34 @@ class ScannerDialog(QDialog):
         self.btn_add_selected.clicked.connect(self._add_selected)
         self.btn_add_all.clicked.connect(self._add_all)
         self.btn_close.clicked.connect(self.reject)
+
+    # -- window placement --------------------------------------------------
+    def showEvent(self, event):  # noqa: N802 (Qt naming)
+        """Centre on the active screen so the title bar is never off-screen.
+
+        With a frameless parent the dialog used to appear partly above the top
+        edge, hiding its drag handle (bug #4). We re-centre on first show and
+        clamp the rect inside the available geometry so it's always grabbable.
+        """
+        super().showEvent(event)
+        if getattr(self, "_centered_once", False):
+            return
+        self._centered_once = True
+        try:
+            screen = (self.screen()
+                      or (self.parent().screen() if self.parent() else None)
+                      or QGuiApplication.primaryScreen())
+            avail = screen.availableGeometry()
+            frame = self.frameGeometry()
+            frame.moveCenter(avail.center())
+            # clamp inside the available area so the title bar stays visible
+            x = min(max(frame.left(), avail.left()),
+                    avail.right() - frame.width())
+            y = min(max(frame.top(), avail.top()),
+                    avail.bottom() - frame.height())
+            self.move(max(x, avail.left()), max(y, avail.top()))
+        except Exception:
+            pass
 
     # -- scan lifecycle ----------------------------------------------------
     def _start(self):

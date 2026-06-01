@@ -71,6 +71,21 @@ class EngineBridge(QObject):
         """Test which bypass strategy connects/wins for a profile."""
         return self.controller.probe_strategies_for(profile, strategy=strategy)
 
+    def is_active_profile(self, profile) -> bool:
+        """True when *profile* is the config the live tunnel is running."""
+        try:
+            return self.controller.is_active_profile(profile)
+        except Exception:
+            return False
+
+    def live_proxy_ping(self, *, samples: int = 1, timeout: float = 12.0):
+        """Real latency through the running tunnel — the honest ping (#1)."""
+        try:
+            return self.controller.live_proxy_ping(
+                samples=samples, timeout=timeout)
+        except Exception as exc:
+            return (False, None, f"{type(exc).__name__}: {exc}")
+
     @property
     def is_running(self) -> bool:
         return self.controller.is_running
