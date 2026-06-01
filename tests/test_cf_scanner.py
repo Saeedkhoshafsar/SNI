@@ -98,6 +98,27 @@ def test_scan_on_result_streams_hits():
     assert set(seen) == {"1.1.1.2", "1.1.1.4"}
 
 
+def test_scan_on_progress_fires_for_every_probe():
+    """The live progress callback must tick once per probe (clean OR not) so
+    the UI can show a moving bar — this is the fix for the 'frozen UI' bug."""
+    ips = ["1.1.1.2", "1.1.1.3", "1.1.1.4", "1.1.1.5"]
+    ticks = []
+    sc = CFScanner(
+        probe_fn=_even_clean,
+        on_progress=lambda tested, total, found, ip, ok: ticks.append(
+            (tested, total, found, ip, ok)),
+    )
+    sc.scan(ScanConfig(port=443, server_name="x"), ips=ips)
+    # one tick per IP, total always reported, tested strictly increasing
+    assert len(ticks) == len(ips)
+    assert all(t[1] == len(ips) for t in ticks)            # total
+    assert [t[0] for t in ticks] == [1, 2, 3, 4]           # tested counter
+    assert ticks[-1][2] >= 1                                # found count grows
+    # at least one clean (ok=True) and one not-clean (ok=False) reported
+    oks = {t[4] for t in ticks}
+    assert oks == {True, False}
+
+
 def test_scan_bad_probe_never_aborts():
     def boom(ip, spec, timeout):
         if ip.endswith(".3"):

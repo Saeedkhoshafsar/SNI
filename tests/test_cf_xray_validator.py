@@ -138,6 +138,24 @@ def test_validate_all_streams_results_via_on_result():
     assert set(seen) == {"104.18.0.10", "104.18.0.20"}
 
 
+def test_validate_all_emits_progress_start_and_done():
+    """Phase-2 must announce each IP BEFORE testing it (stage='start') and
+    after (stage='done') so the UI bar advances during the slow xray pass."""
+    ticks = []
+    v = _validator(
+        _profile(),
+        on_progress=lambda done, total, ip, stage: ticks.append(
+            (done, total, ip, stage)),
+    )
+    v.validate_all(["104.18.0.10", "104.18.0.20"], concurrency=1)
+    starts = [t for t in ticks if t[3] == "start"]
+    dones = [t for t in ticks if t[3] == "done"]
+    assert len(starts) == 2 and len(dones) == 2
+    assert all(t[1] == 2 for t in ticks)                   # total always 2
+    assert [t[0] for t in dones] == [1, 2]                 # done counter grows
+    assert {t[2] for t in starts} == {"104.18.0.10", "104.18.0.20"}
+
+
 def test_validate_all_skips_when_xray_unavailable(tmp_path):
     # a real validator whose xray_exe does not exist → returns [] and logs
     logs = []

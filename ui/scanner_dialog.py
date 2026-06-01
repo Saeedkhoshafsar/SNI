@@ -24,8 +24,8 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout,
-    QWidget,
+    QListWidgetItem, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from core.cf_scanner import (
@@ -64,6 +64,10 @@ class ScanWorker(QThread):
     rejected = Signal(str)               # ip that failed Phase 2
     line = Signal(str)
     phase = Signal(str)
+    # live Phase-1 progress: tested, total, found, last_ip, last_ok
+    p1_progress = Signal(int, int, int, str, bool)
+    # live Phase-2 progress: done, total, current_ip, stage
+    p2_progress = Signal(int, int, str, str)
     done = Signal(int, int)
 
     def __init__(self, profile, cfg: ScanConfig, parent=None,
@@ -85,6 +89,7 @@ class ScanWorker(QThread):
         self._scanner = CFScanner(
             on_log=self.line.emit,
             on_phase=self.phase.emit,
+            on_progress=self.p1_progress.emit,
             on_result=lambda r: self.hit.emit(
                 r.ip, r.latency_ms, getattr(r, "detail", "") or ""),
         )
@@ -104,6 +109,7 @@ class ScanWorker(QThread):
                 self._profile,
                 on_log=self.line.emit,
                 on_result=self._on_validation,
+                on_progress=self.p2_progress.emit,
             )
             if not self._validator.is_available:
                 self.line.emit(tr(
@@ -111,6 +117,10 @@ class ScanWorker(QThread):
                     "نادیده گرفته شد؛ فقط نتایج فاز ۱ نمایش داده می‌شود."))
                 self.done.emit(len(clean_ips), report.tested)
                 return
+            self.line.emit(tr(
+                "فاز ۲ شروع شد — {n} IP تمیز با xray واقعی تست می‌شوند. "
+                "هر IP چند ثانیه طول می‌کشد؛ نوار پیشرفت را دنبال کنید.").format(
+                    n=len(clean_ips)))
             try:
                 results = self._validator.validate_all(clean_ips,
                                                         concurrency=1)
@@ -256,6 +266,22 @@ class ScannerDialog(QDialog):
         ctrl.addWidget(self.status)
         root.addLayout(ctrl)
 
+        # --- live progress bar (so the user ALWAYS sees the scan moving) ---
+        # Without this the user just saw "در حال پروب اتصال …" and couldn't tell
+        # whether the scan was working or frozen. This bar + the counter on its
+        # right update on every single probe / xray test.
+        prog_row = QHBoxLayout()
+        prog_row.setSpacing(10)
+        self.progress = QProgressBar()
+        self.progress.setObjectName("ScanProgress")
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        self.progress.setMinimumHeight(22)
+        self.progress.setFormat(tr("آماده"))
+        prog_row.addWidget(self.progress, 1)
+        root.addLayout(prog_row)
+
         # --- results list (checkable) ---
         root.addWidget(QLabel(tr("IPهای تمیز پیداشده (تیک بزنید):")))
         self.list = QListWidget()
@@ -350,6 +376,10 @@ class ScannerDialog(QDialog):
         self.list.clear()
         self.log.clear()
         self._found = 0
+        # reset the progress bar to an indeterminate "starting" state — it goes
+        # determinate the moment the first probe reports back.
+        self.progress.setRange(0, 0)  # busy/indeterminate until first tick
+        self.progress.setFormat(tr("در حال آماده‌سازی …"))
         self.lbl_progress.setText(
             tr("ورکرها: {n}").format(n=self.spin_conc.value()))
         cfg = scan_config_from_profile(
@@ -372,6 +402,8 @@ class ScannerDialog(QDialog):
         self._worker.rejected.connect(self._on_rejected)
         self._worker.line.connect(self._on_line)
         self._worker.phase.connect(self._on_phase)
+        self._worker.p1_progress.connect(self._on_p1_progress)
+        self._worker.p2_progress.connect(self._on_p2_progress)
         self._worker.done.connect(self._on_done)
         self._worker.start()
 
@@ -455,6 +487,51 @@ class ScannerDialog(QDialog):
                 tr("فاز ۲ — اعتبارسنجی واقعی با xray (کندتر، دقیق‌تر) …"))
             self.lbl_progress.setText(
                 tr("فاز ۲ — اجرای کانفیگ واقعی روی هر IP تمیز …"))
+            # switch the bar to phase-2 scale (will be re-ranged on first tick)
+            self.progress.setRange(0, 0)
+            self.progress.setFormat(tr("فاز ۲ — آماده‌سازی xray …"))
+
+    def _on_p1_progress(self, tested: int, total: int, found: int,
+                        last_ip: str, last_ok: bool):
+        """Phase-1 live tick — fired after EVERY probe (clean or not)."""
+        if total > 0:
+            if self.progress.maximum() != total:
+                self.progress.setRange(0, total)
+            self.progress.setValue(tested)
+            pct = int(tested * 100 / total) if total else 0
+            self.progress.setFormat(tr(
+                "فاز ۱: {done}/{total} تست شد ({pct}%) · {found} تمیز").format(
+                    done=tested, total=total, pct=pct, found=found))
+        self.status.setText(tr(
+            "فاز ۱ — پروب اتصال: {done} از {total} IP آزمایش شد").format(
+                done=tested, total=total))
+        self.lbl_progress.setText(tr(
+            "ورکرها: {n}  ·  تست‌شده: {done}/{total}  ·  تمیز: {found}").format(
+                n=self.spin_conc.value(), done=tested, total=total,
+                found=found))
+
+    def _on_p2_progress(self, done: int, total: int, ip: str, stage: str):
+        """Phase-2 live tick — fired at the start and end of each xray test."""
+        if total > 0 and self.progress.maximum() != total:
+            self.progress.setRange(0, total)
+        if total > 0:
+            self.progress.setValue(done)
+            pct = int(done * 100 / total) if total else 0
+            if stage == "start":
+                self.progress.setFormat(tr(
+                    "فاز ۲: در حال تست واقعی {ip} ({done}/{total} · "
+                    "{pct}%)").format(ip=ip, done=done + 1, total=total,
+                                      pct=pct))
+                self.status.setText(tr(
+                    "فاز ۲ — تست واقعی با xray: {ip} ({done}/{total})").format(
+                        ip=ip, done=done + 1, total=total))
+            else:
+                self.progress.setFormat(tr(
+                    "فاز ۲: {done}/{total} اعتبارسنجی شد ({pct}%)").format(
+                        done=done, total=total, pct=pct))
+        self.lbl_progress.setText(tr(
+            "فاز ۲ — اعتبارسنجی واقعی: {done}/{total}").format(
+                done=done, total=total))
 
     def _on_line(self, text: str):
         self.log.appendPlainText(text)
@@ -464,7 +541,19 @@ class ScannerDialog(QDialog):
 
     def _on_done(self, found: int, tested: int):
         self._busy(False)
+        # snap the bar to full so "finished" is unmistakable
+        mx = self.progress.maximum()
+        if mx <= 0:
+            self.progress.setRange(0, 1)
+            mx = 1
+        self.progress.setValue(mx)
         xray_done = self.chk_xray.isChecked() and bool(self._verified_ips)
+        if xray_done:
+            self.progress.setFormat(tr(
+                "پایان — {f} IP تأییدشده با xray").format(f=found))
+        else:
+            self.progress.setFormat(tr(
+                "پایان — {f} IP تمیز").format(f=found))
         if xray_done:
             self.lbl_progress.setText(
                 tr("پایان  ·  تأییدشده با xray: {f}  ·  آزمایش‌شده: {t}").format(
@@ -479,6 +568,14 @@ class ScannerDialog(QDialog):
             self.status.setText(
                 tr("تمام شد — {found} IP تمیز از {tested} آزمایش‌شده").format(
                     found=found, tested=tested))
+        # explicit "found nothing" guidance so the user is never left guessing
+        if found == 0:
+            self.status.setText(tr(
+                "تمام شد — هیچ IP تمیزی پیدا نشد. تعداد IP را بیشتر کنید یا "
+                "دوباره تلاش کنید."))
+            self._on_line(tr(
+                "ℹ️ هیچ IP تمیزی پیدا نشد. می‌توانید «تعداد IP برای تست» را "
+                "افزایش دهید و دوباره اسکن کنید."))
 
     # -- selection helpers -------------------------------------------------
     def _set_all_checked(self, checked: bool):

@@ -890,6 +890,10 @@ class CFScanner:
                    is found (lets the UI stream results live).
     should_stop  : optional ``() -> bool`` polled to cancel the scan early.
     on_phase     : optional ``str -> None`` fired when the scan advances phases.
+    on_progress  : optional ``(tested, total, found, last_ip, last_ok) -> None``
+                   fired after **every** probe completes — even failed ones —
+                   so the UI can show a live "X / Y" counter + progress bar and
+                   the user never wonders whether the scan is stuck.
     """
 
     def __init__(
@@ -900,12 +904,15 @@ class CFScanner:
         on_result: Optional[Callable[[IPResult], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         on_phase: Optional[Callable[[str], None]] = None,
+        on_progress: Optional[
+            Callable[[int, int, int, str, bool], None]] = None,
     ) -> None:
         self.probe_fn = probe_fn
         self._on_log = on_log
         self._on_result = on_result
         self._should_stop = should_stop
         self._on_phase = on_phase
+        self._on_progress = on_progress
         self._stop_flag = threading.Event()
 
     def _log(self, msg: str) -> None:
@@ -919,6 +926,14 @@ class CFScanner:
         if self._on_phase:
             try:
                 self._on_phase(msg)
+            except Exception:
+                pass
+
+    def _progress(self, tested: int, total: int, found: int,
+                  last_ip: str, last_ok: bool) -> None:
+        if self._on_progress:
+            try:
+                self._on_progress(tested, total, found, last_ip, last_ok)
             except Exception:
                 pass
 
@@ -955,6 +970,7 @@ class CFScanner:
                   f"{cfg.port} (SNI: {cfg.server_name or '—'}{ws_note}, "
                   f"تلاش: {cfg.tries}) …")
 
+        total = len(candidates)
         workers = max(1, min(int(cfg.concurrency), 256))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
@@ -968,10 +984,15 @@ class CFScanner:
                         break
                     res = fut.result()
                     report.tested += 1
+                    found = len([r for r in report.results if r.ok])
                     if res is None:
+                        # cancelled probe — still tick the progress bar
+                        self._progress(report.tested, total, found, "", False)
                         continue
-                    if res.ok and self._accept(res, cfg):
+                    accepted = res.ok and self._accept(res, cfg)
+                    if accepted:
                         report.results.append(res)
+                        found += 1
                         extra = f" · {res.detail}" if res.detail else ""
                         self._log(f"✓ IP تمیز: {res.ip} "
                                   f"({res.latency_ms:.0f}ms{extra})")
@@ -980,11 +1001,13 @@ class CFScanner:
                                 self._on_result(res)
                             except Exception:
                                 pass
-                        if (cfg.max_results > 0
-                                and len([r for r in report.results if r.ok])
-                                >= cfg.max_results):
-                            report.stopped_early = True
-                            break
+                    # always report progress so the UI shows live activity
+                    self._progress(report.tested, total, found,
+                                   res.ip, accepted)
+                    if (accepted and cfg.max_results > 0
+                            and found >= cfg.max_results):
+                        report.stopped_early = True
+                        break
             finally:
                 for fut in futures:
                     fut.cancel()

@@ -434,6 +434,8 @@ class XrayValidator:
         on_log: Optional[Callable[[str], None]] = None,
         on_result: Optional[Callable[[XrayValidation], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        on_progress: Optional[
+            Callable[[int, int, str, str], None]] = None,
         process_factory: Optional[Callable] = None,
         connectivity_fn: Optional[Callable] = None,
         speed_fn: Optional[Callable] = None,
@@ -443,6 +445,9 @@ class XrayValidator:
         self._on_log = on_log
         self._on_result = on_result
         self._should_stop = should_stop
+        # on_progress(done, total, current_ip, stage) — stage is
+        # "start" (about to test current_ip) or "done" (current_ip finished).
+        self._on_progress = on_progress
         self._stop_flag = threading.Event()
 
         from core.binary_utils import get_bin_dir
@@ -461,6 +466,13 @@ class XrayValidator:
         if self._on_log:
             try:
                 self._on_log(msg)
+            except Exception:
+                pass
+
+    def _progress(self, done: int, total: int, ip: str, stage: str) -> None:
+        if self._on_progress:
+            try:
+                self._on_progress(done, total, ip, stage)
             except Exception:
                 pass
 
@@ -551,16 +563,23 @@ class XrayValidator:
         self._log(f"فاز ۲ — اعتبارسنجی واقعی {len(ips)} IP با xray "
                   f"(کانفیگ مرجع روی هر IP اجرا و ترافیک واقعی تست می‌شود) …")
 
+        total = len(ips)
         if concurrency <= 1:
-            for ip in ips:
+            for idx, ip in enumerate(ips):
                 if self._stopping():
                     break
+                # announce BEFORE we start (each IP can take several seconds —
+                # this is what tells the user "currently testing 3.4.5.6")
+                self._log(f"… در حال تست واقعی IP {idx + 1}/{total}: {ip}")
+                self._progress(idx, total, ip, "start")
                 res = self.validate_ip(ip)
                 out.append(res)
                 self._emit(res)
+                self._progress(idx + 1, total, ip, "done")
         else:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             workers = max(1, min(int(concurrency), 8))
+            done = 0
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {pool.submit(self.validate_ip, ip): ip for ip in ips}
                 for fut in as_completed(futs):
@@ -572,6 +591,8 @@ class XrayValidator:
                         res = XrayValidation(ip=futs[fut], error=repr(exc))
                     out.append(res)
                     self._emit(res)
+                    done += 1
+                    self._progress(done, total, res.ip, "done")
         passed = sum(1 for r in out if r.success)
         self._log(f"فاز ۲ تمام شد — {passed} از {len(out)} IP "
                   f"اعتبارسنجی واقعی را گذراندند")
