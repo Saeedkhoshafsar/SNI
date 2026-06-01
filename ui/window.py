@@ -785,7 +785,14 @@ class ProfilesPage(QWidget):
     # one QThread *per profile* simultaneously — with a big list that flooded the
     # CPU/network and (combined with refresh() dropping references) crashed the
     # app. Pings now queue and run at most this many at a time.
-    _PING_MAX_CONCURRENCY = 6
+    #
+    # Kept deliberately LOW (3): each inactive-config ping now starts a REAL,
+    # throwaway xray core (+ a spoofer for spoof configs) the v2rayNG way and
+    # fetches through it. That is far heavier than the old hand-rolled socket
+    # probe, so running too many at once would spawn a swarm of xray processes
+    # and exhaust ports/CPU. v2rayNG throttles its real-delay sweep for the same
+    # reason; 3 keeps "ping all" responsive without flooding the machine.
+    _PING_MAX_CONCURRENCY = 3
 
     def __init__(self, store: ConfigStore, engine=None, parent=None):
         super().__init__(parent)
@@ -1626,81 +1633,37 @@ class InlinePingWorker(QThread):
             self.result.emit(tr("✖ تونل زنده پاسخ نداد"), "err")
             return
 
-        # --- 2) spoof config, not active → OFFLINE *estimate* (clearly ≈) ---
-        # A spoof config ONLY works end-to-end through the running spoofer's
-        # decoy-SNI injection, so the single most TRUSTWORTHY answer is still a
-        # LIVE measurement (step 1, after you activate it). BUT the user wants a
-        # "ping all" sweep to give EVERY spoof config a number too, without
-        # having to activate them one by one ("میخام وقتی پینگ همه رو میگیرم
-        # اونام پینگشون گرفته بشن بدون اینکه دونه دونه وصل بشم … البته اونم باشه
-        # ولی چیزی که میگمم باشه").
+        # --- 2) ANY inactive config → REAL delay, the v2rayNG way -----------
+        # The hand-rolled offline probes (manual TLS handshake + /cdn-cgi/trace
+        # + WS upgrade) were fundamentally unreliable and produced every bug the
+        # user kept hitting:
+        #   * AYYILDIZ7 (relay path /stars/http://user:pass@vps…) pinged red even
+        #     though it connects — a bare WS upgrade can't validate a relay route.
+        #   * a deliberately-BROKEN vls-cf-xhttp pinged GREEN — a trace to a live
+        #     Cloudflare anycast IP answers for ANY config, working or not.
+        #   * spoof configs got no number at all.
         #
-        # ``ping_profile`` already does the right thing for a spoof config:
-        # ``target_from_profile`` rewrites the loopback address to the real CDN
-        # connect IP/port and validates against the config's REAL SNI + Host +
-        # path (an honest edge probe). That is a meaningful *reachability /
-        # latency estimate* of the route the spoofer fronts — it just can't
-        # account for the live decoy-SNI DPI evasion, so we label it ≈ تخمینی
-        # and never present it as a guarantee. The definitive 🛡 live number is
-        # still available by activating the config (step 1).
-        if getattr(self._profile, "is_spoof_config", False):
-            try:
-                res = self._engine.ping_profile(self._profile)
-            except Exception:
-                res = None
-            if res is not None and res.reachable and res.best_ms is not None:
-                parts = [f"{res.best_ms:.0f}ms"]
-                if res.jitter_ms:
-                    parts.append(f"jitter {res.jitter_ms:.0f}")
-                if getattr(res, "download_kbps", None) is not None:
-                    parts.append(f"dl≈{res.download_kbps:.0f}KB/s")
-                # ≈ + "(تخمینی)" makes it unmistakable this is an offline guess,
-                # not the live-tunnel truth — exactly the "اونم باشه" the user
-                # asked for alongside the real ping.
-                self.result.emit(
-                    tr("≈ {body} (تخمینی · فعال کنید برای پینگ واقعی)").format(
-                        body=" · ".join(parts)), "ok")
-                return
-            # even the offline edge estimate couldn't reach the route → say so,
-            # but keep pointing at the live ping as the definitive test.
-            self.result.emit(
-                tr("◍ تخمین نگرفت · برای پینگ واقعی فعال کنید"), "info")
-            return
-
-        # --- 3) ordinary config, not active → STRICT edge validation --------
-        # For a direct (non-spoof) config we CAN honestly validate offline: a
-        # real TLS handshake + Cloudflare-edge/WS check against the config's own
-        # SNI/Host. ``ping_profile`` already does this (tls_latency). We only
-        # show a green number when that genuinely validates — a bare TCP connect
-        # is NOT enough (that was the "پینگ میداد ولی کار نمیکرد" false green).
+        # v2rayNG gets this right by NOT guessing: it starts the REAL core with
+        # the config's own outbound on a throwaway local proxy, fetches a known
+        # URL THROUGH it, and times the round-trip. A broken config fails the
+        # fetch (honest red); a working one returns the real body (honest green)
+        # and the elapsed time IS the real delay. ``measure_profile_delay`` does
+        # exactly that — chaining the spoofer underneath for spoof configs, so
+        # the decoy-SNI injection is in the path just like a real connect. One
+        # code path now serves relay / xhttp / spoof / plain configs identically.
         try:
-            res = self._engine.ping_profile(self._profile)
+            ok, ms, _detail = self._engine.measure_profile_delay(
+                self._profile, timeout=15.0)
         except Exception as exc:
             self.result.emit(tr("خطا: {exc}").format(exc=exc), "err")
             return
-        if res is None or not res.reachable:
-            # the honest TLS/edge validation didn't answer → really unreachable
-            self.result.emit(tr("✖ بدون پاسخ"), "err")
+        if ok and ms is not None:
+            # a real, body-verified round-trip through the config's own core.
+            self.result.emit(tr("✔ {ms:.0f}ms (واقعی)").format(ms=ms), "ok")
             return
-
-        # We DON'T run the bypass-strategy probe here. Strategies are SNI-spoof /
-        # DPI-evasion techniques that only sit in the path for *spoof* configs
-        # (handled in step 2 above). An ordinary/direct config never uses a
-        # strategy, so probing them and then declaring "✖ مسدود (هیچ استراتژی
-        # وصل نشد)" was simply wrong — it made perfectly working direct configs
-        # (the user's 电信-SIN-07) look blocked. The strict edge/TLS validation in
-        # ``ping_profile`` above is the honest test for these configs: it already
-        # passed, so report the real latency.
-        best_ms = res.best_ms
-
-        parts = [f"{best_ms:.0f}ms"]
-        if res.jitter_ms is not None:
-            parts.append(f"jitter {res.jitter_ms:.0f}")
-        if res.loss > 0:
-            parts.append(f"loss {res.loss*100:.0f}%")
-        if getattr(res, "download_kbps", None) is not None:
-            parts.append(f"dl≈{res.download_kbps:.0f}KB/s")
-        self.result.emit("✔ " + " · ".join(parts), "ok")
+        # the fetch through the config's real core failed → it genuinely does
+        # not carry traffic right now (broken route / blocked / dead Worker).
+        self.result.emit(tr("✖ بدون پاسخ (کار نمی‌کند)"), "err")
 
 
 class StrategyPage(QWidget):

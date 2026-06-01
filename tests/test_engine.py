@@ -880,6 +880,54 @@ class EnginePingTest(unittest.TestCase):
         finally:
             ping_mod.tcp_latency = saved
 
+    def test_measure_profile_delay_failsoft_when_no_core(self):
+        """measure_profile_delay must never raise into the UI. When xray.exe is
+        unavailable (or any error), it returns (False, None, detail) so the
+        inline ping just shows an honest red instead of crashing."""
+        ctrl = EngineController({})
+        ok, ms, detail = ctrl.measure_profile_delay(
+            self._profile("h"), timeout=1.0)
+        self.assertFalse(ok)
+        self.assertIsNone(ms)
+        self.assertIsInstance(detail, str)
+
+    def test_measure_profile_delay_returns_real_delay_through_core(self):
+        """When the temporary core comes up and a body-verified fetch succeeds,
+        measure_profile_delay returns the real round-trip delay — mirroring how
+        v2rayNG times a request through the config's own outbound."""
+        import core.engine as eng_mod
+        from core.xray_manager import XrayManager
+
+        ctrl = EngineController({})
+
+        # fake a temporary core that "starts" and binds a known http port
+        class _FakeXray:
+            http_port = 51999
+            socks_port = 51998
+            is_available = True
+            def start(self):
+                return True
+            def stop(self):
+                pass
+
+        saved_xm = eng_mod.__dict__.get("XrayManager", None)
+        # patch the late import target used inside measure_profile_delay
+        import core.xray_manager as xm
+        saved_real = xm.XrayManager
+        xm.XrayManager = lambda *a, **k: _FakeXray()
+        # patch the body-verified prober to report a clean real fetch
+        saved_probe = EngineController._live_proxy_ping_verified
+        EngineController._live_proxy_ping_verified = (
+            lambda self, opener, per_timeout, attempts: (True, 64.0, "verified"))
+        try:
+            ok, ms, detail = ctrl.measure_profile_delay(
+                self._profile("h"), timeout=2.0)
+            self.assertTrue(ok)
+            self.assertAlmostEqual(ms, 64.0)
+        finally:
+            xm.XrayManager = saved_real
+            EngineController._live_proxy_ping_verified = saved_probe
+
     def test_probe_strategies_via_engine_picks_winner(self):
         import core.prober as prober_mod
         from core.prober import ProbeResult, OK, RST

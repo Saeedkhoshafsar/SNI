@@ -428,6 +428,124 @@ class EngineController:
         attempts = max(1, int(samples))
         return self._live_proxy_ping_verified(opener, per_timeout, attempts)
 
+    # --- v2rayNG-style REAL delay for an *inactive* profile -----------------
+    #
+    # The honest truth (the user's repeated bug reports — AYYILDIZ7 pinged red
+    # though it works, a deliberately-broken vls-cf-xhttp pinged GREEN, spoof
+    # configs got no estimate): NO offline hand-rolled TLS/WS/trace probe can
+    # faithfully decide whether an arbitrary config (relay path, xhttp, spoof,
+    # plain CDN) actually carries traffic. A /cdn-cgi/trace to a live anycast IP
+    # answers for ANY config (false-green), and a relay/xhttp route can't be
+    # validated by a bare WS upgrade (false-red).
+    #
+    # v2rayNG solves this the only reliable way: it spins up the REAL core with
+    # the config's own outbound on a throwaway local inbound, then fetches a
+    # known URL THROUGH it and times the round-trip. If the config is broken the
+    # fetch fails (red); if it works the fetch returns the real body (green) and
+    # the elapsed time IS the real delay. We mirror that exactly here — a
+    # temporary xray (chained behind the spoofer for spoof configs, just like a
+    # real connect) + a body-verified GET. This is the same machinery
+    # ``_start_core_only`` / the spoofer path already use, just torn down right
+    # after the measurement.
+    def measure_profile_delay(self, profile, *, timeout: float = 12.0):
+        """Measure a profile's REAL delay the v2rayNG way (temporary core).
+
+        Returns ``(ok: bool, latency_ms: float|None, detail: str)``. Works for
+        ANY config — relay/xhttp/spoof/plain — because the request travels the
+        config's genuine outbound, not a hand-rolled probe. Fully fail-soft and
+        self-contained: it binds its own free ports and always tears the
+        temporary core (and spoofer, if any) down before returning.
+        """
+        import time
+        import urllib.request
+
+        try:
+            from core.xray_manager import XrayManager, find_free_port
+        except Exception as exc:  # pragma: no cover - import guard
+            return (False, None, f"xray unavailable: {exc}")
+
+        # never disturb a live tunnel: if the engine is currently running, the
+        # caller should use live_proxy_ping for the active config instead.
+        socks_port = find_free_port()
+        http_port = find_free_port(socks_port + 1)
+
+        spoofer = None
+        xray = None
+        try:
+            is_spoof = bool(getattr(profile, "is_spoof_config", False))
+            spoof_port = None
+            if is_spoof:
+                # bring up a throwaway spoofer exactly like a real connect would,
+                # so the decoy-SNI injection (the whole point of a spoof config)
+                # is in the path — otherwise the real SNI would be DPI-blocked
+                # and a working config would falsely measure red.
+                spoof_port = find_free_port(
+                    int(getattr(profile, "dial_port", 0) or 40443))
+                connect_ip = (getattr(profile, "spoof_connect_ip", "")
+                              or "").strip()
+                connect_port = int(getattr(profile, "spoof_connect_port", 0)
+                                   or (443 if getattr(profile, "is_tls", False)
+                                       else 80))
+                fake_sni = (getattr(profile, "spoof_fake_sni", "") or "").strip()
+                try:
+                    from main import ProxyServer
+                except Exception as exc:
+                    return (False, None, f"spoofer unavailable: {exc}")
+                spoofer = ProxyServer({
+                    "LISTEN_HOST": "127.0.0.1",
+                    "LISTEN_PORT": spoof_port,
+                    "CONNECT_IP": connect_ip,
+                    "CONNECT_PORT": connect_port,
+                    "FAKE_SNI": fake_sni,
+                    "gaming_mode": False,
+                })
+                # pick a sane bypass method without disturbing engine state
+                try:
+                    spoofer.bypass_method = self._choose_bypass_method(
+                        connect_ip, connect_port)
+                except Exception:
+                    pass
+                if spoofer.start() is False:
+                    return (False, None,
+                            getattr(spoofer, "_start_error", None)
+                            or "spoofer failed to start")
+
+            xray = XrayManager(
+                profile,
+                socks_port=socks_port,
+                http_port=http_port,
+                spoof_port=spoof_port,
+                gaming_mode=False,
+                listen="127.0.0.1",
+            )
+            if not xray.is_available:
+                return (False, None, "xray.exe not found")
+            if xray.start() is False:
+                # a bad/broken config makes xray exit immediately → honest red,
+                # which is EXACTLY what we want for the sabotaged vls-cf-xhttp.
+                return (False, None, "core failed to start (config broken)")
+
+            # let the temporary core finish binding + the first handshake.
+            time.sleep(1.2)
+            real_http = int(getattr(xray, "http_port", http_port) or http_port)
+            proxy = f"http://127.0.0.1:{real_http}"
+            handler = urllib.request.ProxyHandler(
+                {"http": proxy, "https": proxy})
+            opener = urllib.request.build_opener(handler)
+            per_timeout = max(4.0, float(timeout) / 2.0)
+            # reuse the body-verified prober so a config that only reaches the
+            # CDN edge (the broken xhttp) is reported red, not green.
+            return self._live_proxy_ping_verified(opener, per_timeout, 2)
+        except Exception as exc:  # never raise into the UI
+            return (False, None, f"{type(exc).__name__}: {exc}")
+        finally:
+            for obj in (xray, spoofer):
+                if obj is not None:
+                    try:
+                        obj.stop()
+                    except Exception:
+                        pass
+
     # --- body-verified live tunnel probes (bug: "fake" green ping) ----------
     #
     # A captive-portal ``generate_204`` endpoint is NOT enough to prove the
