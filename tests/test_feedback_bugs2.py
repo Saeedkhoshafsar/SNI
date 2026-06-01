@@ -155,16 +155,15 @@ class LivePingTest(unittest.TestCase):
         self.assertIn("55002", captured["proxy"]["http"])
         self.assertNotIn("10809", captured["proxy"]["http"])
 
-    def test_offline_spoof_config_gives_estimate_in_ping_all(self):
-        """A spoof config that is NOT active now gets an OFFLINE *estimate* in a
-        "ping all" sweep (user request: "وقتی پینگ همه رو میگیرم اونام پینگشون
-        گرفته بشن بدون اینکه دونه دونه وصل بشم").
+    def test_inactive_config_uses_real_v2rayng_delay(self):
+        """Every INACTIVE config (relay / xhttp / spoof / plain) is now measured
+        the v2rayNG way: a temporary core carrying the config's own outbound +
+        a body-verified fetch through it. A working config reports the REAL
+        round-trip delay (✔ … واقعی), NOT a hand-rolled offline guess.
 
-        ``ping_profile`` validates the REAL CDN route the spoofer fronts (real
-        SNI/Host/path via the honest edge probe), so the worker reports its
-        latency — but clearly labelled ``≈ … (تخمینی)`` so it never claims to be
-        the definitive live-tunnel number. The 🛡 live measurement is still the
-        ground truth when the config is activated (separate test).
+        This is the fix for the user's three bugs at once: AYYILDIZ7 (relay) no
+        longer false-reds, a broken xhttp no longer false-greens, and spoof
+        configs finally get a number — all from the same real-traffic path.
         """
         from ui.window import InlinePingWorker
 
@@ -173,48 +172,37 @@ class LivePingTest(unittest.TestCase):
             address = "127.0.0.1"
             port = 40443
 
-        class _Res:
-            reachable = True
-            best_ms = 73.0
-            jitter_ms = 0.0
-            download_kbps = None
-
         captured = {}
+        seen = {"called": False}
 
         class _Eng:
             def is_active_profile(self, *_a):
                 return False
             def live_proxy_ping(self, *_a, **_k):
                 return (False, None, "idle")
+            def measure_profile_delay(self, _profile, **_k):
+                seen["called"] = True
+                # real fetch through the temporary core succeeded
+                return (True, 73.0, "verified 204")
             def ping_profile(self, *_a):
-                # honest edge probe of the real CDN route → reachable estimate
-                return _Res()
+                raise AssertionError(
+                    "must use the real measure_profile_delay, not ping_profile")
 
         w = InlinePingWorker(_Eng(), _SpoofProfile())
         w.result.connect(lambda t, k: captured.update(text=t, kind=k))
         w._run_inner()
-        # an estimate IS shown (a number), tagged ≈ / تخمینی, kind ok
+        self.assertTrue(seen["called"], "must measure via the real core")
         self.assertEqual(captured.get("kind"), "ok")
         self.assertIn("73", captured.get("text", ""))
-        self.assertIn("≈", captured.get("text", ""))
-        self.assertIn("تخمینی", captured.get("text", ""))
+        self.assertIn("واقعی", captured.get("text", ""))
 
-    def test_offline_spoof_config_unreachable_points_to_live_ping(self):
-        """When even the offline edge estimate can't reach the spoof route, the
-        worker stays honest: no fake number, an info hint to activate for the
-        real (live) ping — preserving "البته اونم باشه" (the live ping too)."""
+    def test_broken_config_real_delay_is_honest_red(self):
+        """A config whose real core can't carry a body-verified fetch (the
+        deliberately-broken vls-cf-xhttp the user reported) must ping RED — the
+        v2rayNG path can't be fooled by a live CDN edge the way the old trace
+        probe was (which false-greened it)."""
         from ui.window import InlinePingWorker
-
-        class _SpoofProfile:
-            is_spoof_config = True
-            address = "127.0.0.1"
-            port = 40443
-
-        class _Res:
-            reachable = False
-            best_ms = None
-            jitter_ms = None
-            download_kbps = None
+        from core.profile import Profile
 
         captured = {}
 
@@ -223,14 +211,15 @@ class LivePingTest(unittest.TestCase):
                 return False
             def live_proxy_ping(self, *_a, **_k):
                 return (False, None, "idle")
-            def ping_profile(self, *_a):
-                return _Res()
+            def measure_profile_delay(self, _profile, **_k):
+                # real fetch failed → broken route, honest red
+                return (False, None, "core failed to start (config broken)")
 
-        w = InlinePingWorker(_Eng(), _SpoofProfile())
+        w = InlinePingWorker(_Eng(), Profile(address="x", port=1))
         w.result.connect(lambda t, k: captured.update(text=t, kind=k))
         w._run_inner()
-        self.assertEqual(captured.get("kind"), "info")
-        self.assertNotIn("ms", captured.get("text", ""))
+        self.assertEqual(captured.get("kind"), "err")
+        self.assertIn("✖", captured.get("text", ""))
 
     def test_active_config_uses_live_tunnel_ping(self):
         """When the profile IS the running config, the worker reports the live

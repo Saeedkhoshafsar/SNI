@@ -86,6 +86,18 @@ class EngineBridge(QObject):
         except Exception as exc:
             return (False, None, f"{type(exc).__name__}: {exc}")
 
+    def measure_profile_delay(self, profile, *, timeout: float = 12.0):
+        """v2rayNG-style REAL delay for an inactive profile (temporary core).
+
+        Spins the config's own outbound up on throwaway ports, fetches a
+        body-verified URL through it, returns ``(ok, latency_ms|None, detail)``.
+        """
+        try:
+            return self.controller.measure_profile_delay(
+                profile, timeout=timeout)
+        except Exception as exc:
+            return (False, None, f"{type(exc).__name__}: {exc}")
+
     @property
     def is_running(self) -> bool:
         return self.controller.is_running
