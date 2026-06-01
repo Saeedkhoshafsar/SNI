@@ -2403,6 +2403,28 @@ class MainWindow(QWidget):
                     self, tr("ابتدا یک پروفایل وارد و انتخاب کنید"), "warn")
                 self.page_dashboard.set_status("idle")
                 return
+            # «تلاش دوباره» = a CLEAN restart (user request, نکته ۲).
+            #
+            # The button shows "شروع" from idle and "تلاش دوباره" from error,
+            # but BOTH emit "start". When we start out of an error (or any
+            # not-fully-idle state), a previous attempt may have left worker
+            # threads (spoofer / xray / stats poller) half-alive — so a bare
+            # start() landed ON TOP of that debris and "sometimes connects,
+            # sometimes won't, gets tangled". The user asked for exactly this:
+            # make تلاش‌دوباره behave like a fresh شروع — first tear EVERYTHING
+            # down, then start clean. So unless the engine is already cleanly
+            # idle, issue a full stop() (kills any lingering attempt) before
+            # the new start.
+            try:
+                needs_clean = bool(self.engine.is_running) or \
+                    (self.engine.status_value != "idle")
+            except Exception:
+                needs_clean = True
+            if needs_clean:
+                try:
+                    self.engine.stop()      # synchronous — kills all workers
+                except Exception:
+                    pass
             self.engine.start()
 
     # Restart state machine (config / strategy switch while connected).

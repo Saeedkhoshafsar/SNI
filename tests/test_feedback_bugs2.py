@@ -50,11 +50,15 @@ class LivePingTest(unittest.TestCase):
 
     def test_is_active_profile_matches_by_endpoint_fields(self):
         from core.profile import Profile
+        from core.engine import STATUS_ACTIVE
         ctrl = self._ctrl()
         a = Profile(address="ex.com", port=443, uuid="u1")
         b = Profile(address="ex.com", port=443, uuid="u1")
         other = Profile(address="ex.com", port=443, uuid="DIFFERENT")
         ctrl.profile = a
+        # "active config" now requires the tunnel to genuinely be UP — set the
+        # status ACTIVE the way a real connect would.
+        ctrl._status = STATUS_ACTIVE
         self.assertTrue(ctrl.is_active_profile(a))   # identity
         self.assertTrue(ctrl.is_active_profile(b))   # same endpoint
         self.assertFalse(ctrl.is_active_profile(other))
@@ -65,6 +69,27 @@ class LivePingTest(unittest.TestCase):
         ctrl = self._ctrl()
         ctrl.profile = None
         self.assertFalse(ctrl.is_active_profile(Profile(address="x", port=1)))
+
+    def test_is_active_profile_false_when_selected_but_not_connected(self):
+        """نکته ۳: a config that is merely SELECTED — but the tunnel was never
+        started (engine still idle) — is NOT active. Otherwise the inline ping
+        tried a live-tunnel request through a tunnel that doesn't exist (false
+        red), and the spoof ping looked usable with nothing to ping through.
+        """
+        from core.profile import Profile
+        from core.engine import STATUS_ACTIVE
+        ctrl = self._ctrl()
+        a = Profile(address="ex.com", port=443, uuid="u1")
+        ctrl.profile = a                       # selected …
+        # … but never started → engine is idle → NOT active
+        self.assertFalse(ctrl.is_active_profile(a))
+        # only once the tunnel is genuinely up does it count as active
+        ctrl._status = STATUS_ACTIVE
+        self.assertTrue(ctrl.is_active_profile(a))
+        # and a config that is connecting (not yet fully up) is not "active"
+        from core.engine import STATUS_CONNECTING
+        ctrl._status = STATUS_CONNECTING
+        self.assertFalse(ctrl.is_active_profile(a))
 
     def test_live_proxy_ping_refuses_when_not_active(self):
         ctrl = self._ctrl()
@@ -656,6 +681,84 @@ class RestartStatusMaskTest(unittest.TestCase):
     def test_manual_power_ignored_during_restart(self):
         self.assertFalse(self._power_allowed(True))
         self.assertTrue(self._power_allowed(False))
+
+
+class CleanRetryStartTest(unittest.TestCase):
+    """نکته ۲: «تلاش دوباره» (and any Start out of a not-fully-idle engine)
+    must do a CLEAN restart — tear EVERYTHING down (kill any lingering attempt
+    / background workers) and THEN start fresh — instead of stacking a new
+    start on top of a half-alive previous attempt.
+
+    We drive the real ``MainWindow._on_power`` against a tiny stub ``self`` so
+    no Qt window is built, recording the exact engine call order.
+    """
+
+    def _stub(self, *, status, running):
+        from ui.window import MainWindow
+
+        calls = []
+
+        class _Engine:
+            def __init__(self):
+                self.status_value = status
+                self.is_running = running
+            def update_config(self, *_a):
+                calls.append("update_config")
+            def set_profile(self, *_a):
+                calls.append("set_profile")
+            def stop(self):
+                calls.append("stop")
+                self.is_running = False
+                self.status_value = "idle"
+            def start(self):
+                calls.append("start")
+
+        class _Dash:
+            def set_status(self, *_a):
+                pass
+
+        class _Store:
+            def __init__(self):
+                self._d = {"connection_mode": "Tunnel"}
+                self.config = self._d
+                self.selected_profile = object()   # a non-None profile
+            def get(self, k, d=None):
+                return self._d.get(k, d)
+
+        stub = MainWindow.__new__(MainWindow)
+        stub.engine = _Engine()
+        stub.store = _Store()
+        stub.page_dashboard = _Dash()
+        stub.active_bar = _Dash()
+        stub._restarting = False
+        return stub, calls
+
+    def test_start_from_error_stops_before_starting(self):
+        # «تلاش دوباره» state == error: a stale attempt may still be alive →
+        # MUST stop() (clean kill) before start().
+        stub, calls = self._stub(status="error", running=False)
+        MainWindowOnPower(stub, "start")
+        self.assertIn("stop", calls)
+        self.assertIn("start", calls)
+        self.assertLess(calls.index("stop"), calls.index("start"))
+
+    def test_start_while_running_stops_before_starting(self):
+        stub, calls = self._stub(status="active", running=True)
+        MainWindowOnPower(stub, "start")
+        self.assertLess(calls.index("stop"), calls.index("start"))
+
+    def test_clean_idle_start_does_not_double_stop(self):
+        # a genuinely idle engine starts directly — no needless stop() churn.
+        stub, calls = self._stub(status="idle", running=False)
+        MainWindowOnPower(stub, "start")
+        self.assertNotIn("stop", calls)
+        self.assertIn("start", calls)
+
+
+def MainWindowOnPower(stub, action):
+    """Call the real, unbound ``MainWindow._on_power`` on *stub*."""
+    from ui.window import MainWindow
+    return MainWindow._on_power(stub, action)
 
 
 # ---------------------------------------------------------------------------
