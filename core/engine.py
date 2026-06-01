@@ -777,7 +777,8 @@ class EngineController:
         # path uses, so a config that loads but can't reach its server is
         # reported red instead of a misleading green.
         if self.config.get("self_test", True):
-            threading.Thread(target=self._self_test_chain, daemon=True).start()
+            threading.Thread(target=self._self_test_chain, args=(epoch,),
+                             daemon=True).start()
 
     def _start_stats_poller(self) -> None:
         """Poll xray's StatsService and emit live traffic for plain configs (#3).
@@ -1035,7 +1036,7 @@ class EngineController:
         # after start, so the log unambiguously shows whether the full internal
         # path works — independent of the user's browser/system-proxy settings.
         if chain_spoofer and self.config.get("self_test", True):
-            threading.Thread(target=self._self_test_chain,
+            threading.Thread(target=self._self_test_chain, args=(epoch,),
                              daemon=True).start()
 
     def _effective_ports(self) -> tuple[int, int]:
@@ -1090,7 +1091,7 @@ class EngineController:
             self._log(f"تنظیم پروکسی سیستم ناموفق: {exc}")
             self._system_proxy = None
 
-    def _self_test_chain(self) -> None:
+    def _self_test_chain(self, epoch: int | None = None) -> None:
         """Probe the full internal chain through our own local HTTP proxy.
 
         Runs off-thread shortly after Start. Makes a real HTTPS request to a
@@ -1099,14 +1100,28 @@ class EngineController:
         would. The result is logged in plain language so the user can tell
         whether the tunnel itself works, separately from whether their browser
         is pointed at the proxy.
+
+        Enforcement (the sabotaged-spoof "connected + چند کیلوبایت دیتا ولی هیچ
+        سایتی باز نشد" bug): when the test CONCLUSIVELY shows the tunnel only
+        reaches the CDN edge — a real status came back but the verifiable body
+        never did — we now DEMOTE the engine to ERROR instead of merely logging.
+        That stops a broken config from sitting "active" while xray retries leak
+        a few KB to the dead backend, which the user mistook for a working
+        tunnel. Controlled by ``self_test_enforce`` (default on); a transient
+        network/exception failure is logged but does NOT demote (could be the
+        captive host, not the tunnel).
         """
         import time
         import urllib.request
 
+        if epoch is None:
+            epoch = self._start_epoch
         # give xray + the spoofer a moment to finish binding/handshaking
         time.sleep(3.0)
         if self._status != STATUS_ACTIVE:
             return  # already stopped / errored — nothing to test
+        if not self._epoch_current(epoch):
+            return  # superseded by a newer start/stop — don't touch this session
 
         # probe the REAL bound http port (xray may have moved off 10809 on a
         # port conflict); testing the configured default would hit a dead port.
@@ -1148,20 +1163,70 @@ class EngineController:
             elif code in (200, 204):
                 # got a status but NOT the expected body → only the CDN edge
                 # answered; real traffic isn't passing. This is exactly the
-                # "fake healthy" config — report it honestly as broken.
+                # "fake healthy" config — report it honestly as broken AND, when
+                # enforcement is on, demote the session to ERROR so it doesn't
+                # masquerade as connected while leaking a few retry-KB.
                 self._log(
                     f"[self-test] ✗ تونل واقعی کار نمی‌کند: فقط لبهٔ CDN پاسخ "
                     f"داد (HTTP {code} ولی محتوای واقعی رد نشد). این کانفیگ "
                     f"وصل به‌نظر می‌رسد اما ترافیک واقعی عبور نمی‌کند — مسیر "
                     f"Worker/سرور پشت CDN خراب است. [conn #...] را بررسی کنید.")
+                self._demote_failed_selftest(
+                    epoch, "فقط لبهٔ CDN پاسخ داد — ترافیک واقعی عبور نمی‌کند")
             else:
                 self._log(f"[self-test] ⚠ پاسخ غیرمنتظره HTTP {code} — مسیر "
                           f"کامل برقرار نشد.", )
+                self._demote_failed_selftest(
+                    epoch, f"پاسخ غیرمنتظره HTTP {code} — مسیر کامل برقرار نشد")
         except Exception as exc:
+            # a transient network/proxy hiccup here is NOT proof the tunnel is
+            # dead (the captive host could be slow/blocked). Log it, but do not
+            # demote — the live-tunnel ping / browsing remains the source of
+            # truth, and demoting on a flaky probe would falsely red a working
+            # config.
             self._log(
                 f"[self-test] ✗ مسیر داخلی شکست خورد: {type(exc).__name__}: "
                 f"{exc} — یعنی xray به اسپوفر یا اسپوفر به CDN وصل نمی‌شود. "
                 f"لاگ‌های [conn #...] و [xray] بالا را بررسی کنید.")
+
+    def _demote_failed_selftest(self, epoch: int | None, reason: str) -> None:
+        """Flip an apparently-active-but-non-working session to ERROR.
+
+        Called by :meth:`_self_test_chain` when the internal probe proves the
+        tunnel only reaches the CDN edge (the sabotaged-spoof "connected but
+        loads nothing" case). Guards:
+
+        * ``self_test_enforce`` config flag (default on) — turn off to keep the
+          old log-only behaviour.
+        * epoch check — never demote a session a newer start/stop already owns.
+        * only demote from ACTIVE — if we already moved on, do nothing.
+
+        On demotion we tear the live chain down (so the leaked retry-KB stop)
+        and set ERROR, which the UI surfaces as «تلاش دوباره» / red.
+        """
+        if not self.config.get("self_test_enforce", True):
+            return
+        if epoch is not None and not self._epoch_current(epoch):
+            return
+        with self._lock:
+            if self._status != STATUS_ACTIVE:
+                return
+            if epoch is not None and epoch != self._start_epoch:
+                return
+            # supersede any racing start and claim the demotion under the lock
+            self._start_epoch += 1
+        self._log(
+            f"[self-test] ⛔ اتصال به‌عنوان ناموفق علامت‌گذاری شد: {reason}. "
+            f"وضعیت به «خطا» تغییر کرد تا کانفیگ خراب به‌اشتباه «متصل» نشان "
+            f"داده نشود.")
+        # tear the dead chain down FIRST (xray/spoofer/system-proxy + counters)
+        # so it stops retrying and leaking bytes; stop() ends on IDLE, so we set
+        # ERROR *after* it to leave the UI on the red «تلاش دوباره» state.
+        try:
+            self.stop()
+        except Exception:
+            pass
+        self._set_status(STATUS_ERROR)
 
     def _on_proxy_status(self, running: bool) -> None:
         # the proxy reports its own listen-loop coming up/down; only downgrade
