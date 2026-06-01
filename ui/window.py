@@ -919,6 +919,8 @@ class ProfilesPage(QWidget):
                                         "تست سرعت دانلود همه (مطمئن‌تر، اتصال مدت‌دار)")
         self.btn_ping_selected = _tool("broadcast", "Ghost",
                                        "پینگ کانفیگ‌های انتخاب‌شده")
+        self.btn_speed_selected = _tool("download", "Ghost",
+                                        "تست سرعت دانلود کانفیگ‌های انتخاب‌شده")
         self.btn_copy_selected = _tool("link", "Ghost",
                                        "کپی لینک کانفیگ‌های انتخاب‌شده")
         self.btn_edit = _tool("edit", "Ghost", "ویرایش کانفیگ انتخاب‌شده")
@@ -930,7 +932,7 @@ class ProfilesPage(QWidget):
         sep = QFrame(); sep.setObjectName("ToolSep"); sep.setFixedWidth(1)
         tools.addWidget(sep)
         for b in (self.btn_ping_all_rows, self.btn_speed_all_rows,
-                  self.btn_ping_selected,
+                  self.btn_ping_selected, self.btn_speed_selected,
                   self.btn_copy_selected, self.btn_edit):
             tools.addWidget(b)
         tools.addStretch(1)
@@ -969,6 +971,7 @@ class ProfilesPage(QWidget):
         self.btn_select_all.clicked.connect(self._select_all)
         self.btn_clear_sel.clicked.connect(self._clear_selection)
         self.btn_ping_selected.clicked.connect(self._ping_selected)
+        self.btn_speed_selected.clicked.connect(self._speed_selected)
         self.btn_copy_selected.clicked.connect(self._copy_selected_links)
         self.btn_delete_selected.clicked.connect(self._delete_checked)
 
@@ -1009,6 +1012,11 @@ class ProfilesPage(QWidget):
             row.activate.connect(lambda _=False, idx=i: self._activate_index(idx))
             # inline per-row ping (#3)
             row.ping.connect(lambda _=False, idx=i: self._ping_row(idx))
+            # inline per-row DOWNLOAD speed test (PR #34)
+            row.download.connect(lambda _=False, idx=i: self._download_row(idx))
+            # inline per-row single delete (PR #34)
+            row.delete_one.connect(
+                lambda _=False, idx=i: self._delete_one_index(idx))
             # copy this config back to a share link (issue #2)
             row.share.connect(lambda _=False, idx=i: self._share_index(idx))
             # scan clean Cloudflare IPs using this config as reference (issue #3)
@@ -1110,8 +1118,8 @@ class ProfilesPage(QWidget):
                 tr("{n} مورد انتخاب شده").format(n=n))
         else:
             self.lbl_sel_count.setText(tr("هیچ موردی انتخاب نشده"))
-        for b in (self.btn_ping_selected, self.btn_copy_selected,
-                  self.btn_delete_selected):
+        for b in (self.btn_ping_selected, self.btn_speed_selected,
+                  self.btn_copy_selected, self.btn_delete_selected):
             b.setEnabled(n > 0)
         has_rows = bool(self._store.profiles)
         self.btn_select_all.setEnabled(has_rows)
@@ -1136,6 +1144,18 @@ class ProfilesPage(QWidget):
         self._toast(tr("در حال پینگ کانفیگ‌های انتخاب‌شده …"), "info")
         for row in sorted(self._checked):
             self._ping_row(row)
+
+    def _speed_selected(self) -> None:
+        """Download-speed test ONLY the checked rows, concurrently (PR #34)."""
+        if self._engine is None:
+            self._toast(tr("موتور در دسترس نیست"), "err")
+            return
+        if not self._checked:
+            self._toast(tr("هیچ کانفیگی انتخاب نشده"), "warn")
+            return
+        self._toast(tr("در حال تست سرعت دانلود کانفیگ‌های انتخاب‌شده …"), "info")
+        for row in sorted(self._checked):
+            self._ping_row(row, mode="download")
 
     def _copy_selected_links(self) -> None:
         """Copy the share links of every checked profile, one per line (#7)."""
@@ -1415,8 +1435,12 @@ class ProfilesPage(QWidget):
             return
         self._inline_queue.append((prof, mode))
 
-    def _ping_row(self, row: int):
+    def _ping_row(self, row: int, mode: str = "delay"):
         """Ping a single profile and show the result inline on its row.
+
+        ``mode`` is "delay" (latency in ms — the default 📡 button) or
+        "download" (sustained download-speed test in Mbps — the ⇩ button,
+        PR #34).
 
         Pings are now QUEUED and run with bounded concurrency (see
         ``_PING_MAX_CONCURRENCY``). A profile that's already queued/running is
@@ -1437,8 +1461,35 @@ class ProfilesPage(QWidget):
                 rows[row].set_pinging()
             except RuntimeError:
                 pass
-        self._enqueue_ping(prof)
+        self._enqueue_ping(prof, mode)
         self._pump_ping_queue()
+
+    def _download_row(self, row: int):
+        """Run a DOWNLOAD speed test on a single row (PR #34)."""
+        self._ping_row(row, mode="download")
+
+    def _delete_one_index(self, idx: int) -> None:
+        """Delete a single config straight from its row trash button (PR #34)."""
+        if not (0 <= idx < len(self._store.profiles)):
+            return
+        from PySide6.QtWidgets import QMessageBox
+        prof = self._store.profiles[idx]
+        remark = getattr(prof, "remark", "") or tr("بدون نام")
+        resp = QMessageBox.question(
+            self.window(),
+            tr("حذف کانفیگ"),
+            tr("آیا کانفیگ «{name}» حذف شود؟").format(name=remark),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return
+        self._store.remove_profiles({idx})
+        # keep the checked set consistent with the now-shifted indexes
+        self._checked = {(i if i < idx else i - 1)
+                         for i in self._checked if i != idx}
+        self.refresh()
+        self._emit_selection()
+        self._toast(tr("کانفیگ حذف شد"), "warn")
 
     def _ping_all_inline(self):
         """Queue an inline ping on **every** row (#4 — "ping all").
@@ -1655,6 +1706,23 @@ class InlinePingWorker(QThread):
         except Exception:
             is_active = False
         if is_active:
+            # Respect the requested mode even for the active config: a download
+            # test on the connected server must measure DOWNLOAD through the
+            # live tunnel — not fall back to a latency ms (the user's bug:
+            # "پینگ دانلود روی کانفیگ فعال، ms می‌داد").
+            if self._mode == "download":
+                try:
+                    ok, mbps, _detail = self._engine.live_proxy_download(
+                        duration=8.0)
+                except Exception:
+                    ok, mbps = False, None
+                if ok and mbps is not None:
+                    self.result.emit(
+                        tr("🛡⇩ {mbps:.1f} Mbps (تونل زنده)").format(mbps=mbps),
+                        "ok")
+                    return
+                self.result.emit(tr("✖ دانلود تونل زنده انجام نشد"), "err")
+                return
             try:
                 ok, ms, _detail = self._engine.live_proxy_ping(samples=2)
             except Exception:

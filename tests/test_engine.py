@@ -958,6 +958,79 @@ class EnginePingTest(unittest.TestCase):
         finally:
             EngineController._spawn_measure_core = saved
 
+    def test_live_proxy_download_red_when_tunnel_not_active(self):
+        """A download test on a config that isn't connected must fail soft
+        (the live tunnel only exists for the ACTIVE config)."""
+        ctrl = EngineController({})  # status starts IDLE
+        ok, mbps, detail = ctrl.live_proxy_download(duration=0.2)
+        self.assertFalse(ok)
+        self.assertIsNone(mbps)
+        self.assertIsInstance(detail, str)
+
+    def test_live_proxy_download_reports_throughput_through_live_tunnel(self):
+        """When the tunnel is active and bytes stream through the live http
+        inbound, live_proxy_download returns Mbps — NOT a latency ms. This is
+        the fix for "download test on the active config gave ms" (issue #3).
+
+        The fake opener also absorbs the throwaway ``_warm_tunnel`` GET, so we
+        exercise the real warm-then-stream path without touching the network.
+        """
+        ctrl = EngineController({})
+        ctrl._status = STATUS_ACTIVE
+        # pretend the live http inbound is bound to a port
+        ctrl._effective_ports = lambda: (10808, 10809)
+
+        class _Resp:
+            def __init__(self):
+                self._chunks = [b"x" * 65536] * 8 + [b""]  # ~512 KiB then EOF
+                self._i = 0
+            def getcode(self):
+                return 200
+            def read(self, _n=0):
+                c = self._chunks[self._i] if self._i < len(self._chunks) else b""
+                self._i += 1
+                return c
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        class _Opener:
+            def open(self, _req, timeout=None):
+                return _Resp()
+
+        import urllib.request
+        saved_build = urllib.request.build_opener
+        urllib.request.build_opener = lambda *a, **k: _Opener()
+        try:
+            ok, mbps, detail = ctrl.live_proxy_download(duration=1.0)
+            self.assertTrue(ok)
+            self.assertIsNotNone(mbps)
+            self.assertGreater(mbps, 0.0)
+        finally:
+            urllib.request.build_opener = saved_build
+
+    def test_live_proxy_download_red_when_no_bytes(self):
+        """Active tunnel but every URL refuses → honest red, never a ms."""
+        ctrl = EngineController({})
+        ctrl._status = STATUS_ACTIVE
+        ctrl._effective_ports = lambda: (10808, 10809)
+
+        class _Opener:
+            def open(self, _req, timeout=None):
+                raise OSError("connection refused")
+
+        import urllib.request
+        saved_build = urllib.request.build_opener
+        urllib.request.build_opener = lambda *a, **k: _Opener()
+        try:
+            ok, mbps, detail = ctrl.live_proxy_download(duration=0.5)
+            self.assertFalse(ok)
+            self.assertIsNone(mbps)
+            self.assertIsInstance(detail, str)
+        finally:
+            urllib.request.build_opener = saved_build
+
     def test_wait_proxy_ready_times_out_on_dead_port(self):
         """The readiness poll (race fix) returns False quickly for a dead port
         instead of blocking, so a broken core can't hang the batch."""

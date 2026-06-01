@@ -315,9 +315,11 @@ class ProfileRow(QFrame):
 
     edit = Signal()
     ping = Signal()       # inline "ping this server" button clicked
+    download = Signal()   # inline "download-speed test this server" clicked
     activate = Signal()   # inline "use this server" button clicked
     share = Signal()      # inline "copy this config as a share link" clicked
     scan = Signal()       # inline "scan clean Cloudflare IPs for this config"
+    delete_one = Signal()  # inline "delete just this config" clicked
     selection_toggled = Signal(bool)  # the multi-select checkbox changed (#7)
 
     def __init__(self, profile, *, active: bool = False,
@@ -444,6 +446,12 @@ class ProfileRow(QFrame):
                                        tr("پینگ این سرور"), self.ping.emit)
         lay.addWidget(self.btn_ping, 0, Qt.AlignVCenter)
 
+        # download-speed test THIS server inline (sustained connection)
+        self.btn_download = self._icon_btn(
+            "download", "RowDownload",
+            tr("تست سرعت دانلود این سرور"), self.download.emit)
+        lay.addWidget(self.btn_download, 0, Qt.AlignVCenter)
+
         # "use this server" — one click activates without a dialog (#8)
         self.btn_use = self._icon_btn("check", "RowUse",
                                       tr("فعال‌سازی این سرور"),
@@ -468,6 +476,12 @@ class ProfileRow(QFrame):
                                        tr("ویرایش این پروفایل"),
                                        self.edit.emit)
         lay.addWidget(self.btn_edit, 0, Qt.AlignVCenter)
+
+        # delete JUST this config (separate from the bulk-delete toolbar action)
+        self.btn_delete = self._icon_btn("trash", "RowDelete",
+                                         tr("حذف این کانفیگ"),
+                                         self.delete_one.emit)
+        lay.addWidget(self.btn_delete, 0, Qt.AlignVCenter)
 
     # -- icon-button factory ------------------------------------------------
     def _icon_btn(self, icon_name: str, obj: str, tip: str, slot) -> QPushButton:
@@ -532,11 +546,15 @@ class ProfileRow(QFrame):
             b.setVisible(show_badges)
         # then collapse the optional action buttons from least to most useful
         if hasattr(self, "btn_scan"):
-            self.btn_scan.setVisible(w >= 370)
+            self.btn_scan.setVisible(w >= 410)
         if hasattr(self, "btn_share"):
-            self.btn_share.setVisible(w >= 330)
+            self.btn_share.setVisible(w >= 370)
         if hasattr(self, "btn_edit"):
-            self.btn_edit.setVisible(w >= 290)
+            self.btn_edit.setVisible(w >= 330)
+        if hasattr(self, "btn_download"):
+            self.btn_download.setVisible(w >= 300)
+        if hasattr(self, "btn_delete"):
+            self.btn_delete.setVisible(w >= 270)
         # ping + use stay until the very end (most-used inline actions)
         if hasattr(self, "btn_ping"):
             self.btn_ping.setVisible(w >= 250)

@@ -440,6 +440,65 @@ class EngineController:
         attempts = max(1, int(samples))
         return self._live_proxy_ping_verified(opener, per_timeout, attempts)
 
+    def live_proxy_download(self, *, duration: float = 8.0,
+                            max_bytes: int = 12_000_000):
+        """DOWNLOAD speed test through the *already running* live tunnel.
+
+        Returns ``(ok, mbps|None, detail)``. Used when the user asks for a
+        download test on the config that's currently connected — we must
+        measure through the live proxy, NOT spin up a second temporary core
+        (which would clash with the running one). Mirrors
+        ``measure_profile_download`` but reuses the live http inbound.
+        """
+        import time
+        import urllib.request
+
+        if self._status not in (STATUS_ACTIVE, STATUS_CONNECTING):
+            return (False, None, "tunnel not active")
+        try:
+            _socks, http_port = self._effective_ports()
+        except Exception:
+            return (False, None, "no bound port")
+        if not http_port:
+            return (False, None, "no http inbound")
+        proxy = f"http://127.0.0.1:{http_port}"
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        opener = urllib.request.build_opener(handler)
+        self._warm_tunnel(opener)
+        best = None
+        last_err = ""
+        for url in self._DOWNLOAD_TEST_URLS:
+            for _ in range(2):
+                req = self._dl_request(url)
+                t0 = time.time()
+                total = 0
+                try:
+                    with opener.open(
+                            req, timeout=max(8.0, duration + 5.0)) as resp:
+                        if resp.getcode() not in (200, 206):
+                            last_err = f"HTTP {resp.getcode()}"
+                            continue
+                        deadline = t0 + float(duration)
+                        while time.time() < deadline and total < max_bytes:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                except Exception as exc:
+                    last_err = f"{type(exc).__name__}: {exc}"
+                    continue
+                dt = max(time.time() - t0, 0.001)
+                if total >= 16 * 1024:
+                    return (True, round((total * 8.0) / dt / 1_000_000.0, 2),
+                            f"{total // 1024} KiB in {dt:.2f}s")
+                elif total > 0 and best is None:
+                    best = ((total * 8.0) / dt / 1_000_000.0, total, dt)
+        if best is not None:
+            mbps, total, dt = best
+            return (True, round(mbps, 2),
+                    f"{total // 1024} KiB in {dt:.2f}s (low)")
+        return (False, None, last_err or "no data through tunnel")
+
     # --- shared: spin up a throwaway measurement core (race-free) ----------
     #
     # Both the REAL-delay and DOWNLOAD-speed tests need the same thing: a
@@ -628,11 +687,21 @@ class EngineController:
     # itself instead of being judged on one cold packet. We mirror that: fetch a
     # sizeable file THROUGH the config's own core for up to ``duration`` seconds
     # and measure bytes/second.
+    # Download endpoints, tried in order. We deliberately lead with PLAIN-HTTP
+    # endpoints: they travel the proxy as an ordinary GET (no CONNECT/TLS layer
+    # to negotiate), which is exactly why spoof/relay configs — whose path is
+    # slower to warm and more sensitive to an extra TLS handshake through the
+    # tunnel — were failing the old https-only list (the user's "spoof/AYYILDIZ7
+    # download always red"). The https Cloudflare endpoint stays as a high-cap
+    # fallback for fast plain configs.
     _DOWNLOAD_TEST_URLS = (
-        # Cloudflare's speed endpoint streams an arbitrary number of bytes and
-        # is reachable worldwide; the count is the byte size.
+        # plain-HTTP, streams an arbitrary byte count — no TLS-through-proxy.
+        "http://speed.cloudflare.com/__down?bytes=10000000",
+        # plain-HTTP large objects (OS/CDN mirrors, globally reachable).
+        "http://speedtest.tele2.net/10MB.zip",
+        "http://proof.ovh.net/files/10Mb.dat",
+        # https fallbacks (need CONNECT/TLS; fine for fast plain configs).
         "https://speed.cloudflare.com/__down?bytes=10000000",
-        # Fallback: a stable multi-MB object.
         "https://speed.hetzner.de/100MB.bin",
     )
 
@@ -648,40 +717,85 @@ class EngineController:
         """
         import time
 
+        is_spoof = bool(getattr(profile, "is_spoof_config", False))
+        # spoof/relay configs need a longer warm-up: their first handshake
+        # through the decoy-SNI path / relay hop is slower to establish, and a
+        # download started too early simply errors (the cause of the always-red
+        # spoof download). Give them more readiness budget.
+        ready = 9.0 if is_spoof else 6.0
         opener, cleanup, err = self._spawn_measure_core(
-            profile, ready_timeout=6.0)
+            profile, ready_timeout=ready)
         if opener is None:
             return (False, None, err or "core failed to start (config broken)")
         try:
+            # warm the tunnel with a tiny request first so the first BIG read
+            # isn't racing the very first handshake (this is what made spoof /
+            # long relay-path configs flap to red). A failure here is NOT fatal —
+            # the real download below is the verdict.
+            self._warm_tunnel(opener)
+
+            best = None
+            last_err = err
             for url in self._DOWNLOAD_TEST_URLS:
-                req = self._dl_request(url)
-                t0 = time.time()
-                total = 0
-                try:
-                    with opener.open(req, timeout=max(6.0, duration + 4.0)) as resp:
-                        code = resp.getcode()
-                        if code not in (200, 206):
-                            continue
-                        deadline = t0 + float(duration)
-                        while time.time() < deadline and total < max_bytes:
-                            chunk = resp.read(65536)
-                            if not chunk:
-                                break
-                            total += len(chunk)
-                except Exception as exc:
-                    err = f"{type(exc).__name__}: {exc}"
-                    continue
-                dt = max(time.time() - t0, 0.001)  # avoid div-by-zero
-                if total > 0:
-                    mbps = (total * 8.0) / dt / 1_000_000.0
-                    return (True, round(mbps, 2),
-                            f"{total // 1024} KiB in {dt:.2f}s")
-            return (False, None, err or "no data through tunnel")
+                # two attempts per URL (v2rayNG-style) so a slow-to-warm route
+                # gets a fair second shot before we move on.
+                for attempt in range(2):
+                    req = self._dl_request(url)
+                    t0 = time.time()
+                    total = 0
+                    try:
+                        with opener.open(
+                                req, timeout=max(8.0, duration + 5.0)) as resp:
+                            code = resp.getcode()
+                            if code not in (200, 206):
+                                last_err = f"HTTP {code}"
+                                continue
+                            deadline = t0 + float(duration)
+                            while time.time() < deadline and total < max_bytes:
+                                chunk = resp.read(65536)
+                                if not chunk:
+                                    break
+                                total += len(chunk)
+                    except Exception as exc:
+                        last_err = f"{type(exc).__name__}: {exc}"
+                        continue
+                    dt = max(time.time() - t0, 0.001)  # avoid div-by-zero
+                    # require a meaningful amount of data (≥16 KiB) so a tiny
+                    # error page can't masquerade as a successful download.
+                    if total >= 16 * 1024:
+                        mbps = (total * 8.0) / dt / 1_000_000.0
+                        return (True, round(mbps, 2),
+                                f"{total // 1024} KiB in {dt:.2f}s")
+                    elif total > 0 and best is None:
+                        best = ((total * 8.0) / dt / 1_000_000.0, total, dt)
+            # nothing crossed the 16 KiB bar, but if *some* bytes streamed the
+            # tunnel clearly carries traffic — report the best small sample
+            # rather than a misleading red.
+            if best is not None:
+                mbps, total, dt = best
+                return (True, round(mbps, 2),
+                        f"{total // 1024} KiB in {dt:.2f}s (low)")
+            return (False, None, last_err or "no data through tunnel")
         except Exception as exc:  # never raise into the UI
             return (False, None, f"{type(exc).__name__}: {exc}")
         finally:
             if cleanup is not None:
                 cleanup()
+
+    @staticmethod
+    def _warm_tunnel(opener) -> None:
+        """Fire one tiny throwaway GET to warm the tunnel before a big read."""
+        import urllib.request
+        for url in ("http://cp.cloudflare.com/generate_204",
+                    "http://www.gstatic.com/generate_204"):
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "SNISpoofer-warm"})
+                with opener.open(req, timeout=6.0) as resp:
+                    resp.read(64)
+                return
+            except Exception:
+                continue
 
     @staticmethod
     def _dl_request(url: str):
