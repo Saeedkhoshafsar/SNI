@@ -120,7 +120,51 @@ def tls_latency(host: str, port: int, timeout: float, *,
     res = cf_ip_probe(host, spec, timeout)
     if res.outcome == OK:
         return float(res.latency_ms)
-    return None
+    # Fallback for NON-Cloudflare ordinary configs (plain VPS VLESS/Trojan/etc):
+    # the /cdn-cgi/trace edge check only passes for Cloudflare-fronted hosts, so
+    # a perfectly working direct server failed it → "پینگ پاسخ نمیده با اینکه کار
+    # میکنه". For a direct config the host IS the real server (not a shared
+    # anycast IP), so a genuine TLS handshake presenting the config's own SNI is
+    # honest evidence the endpoint is alive and speaks TLS for this config.
+    sni = (server_name or host or "").strip().strip("[]")
+    return _tls_handshake_latency(host, int(port), timeout, server_name=sni)
+
+
+def _tls_handshake_latency(host: str, port: int, timeout: float, *,
+                           server_name: str = ""
+                           ) -> Optional[float]:  # pragma: no cover - net
+    """Validated TLS-handshake latency to a real server (stdlib only).
+
+    Connects then completes a TLS handshake presenting ``server_name`` as SNI
+    (cert validation off — proxies use self/edge certs). A completed handshake
+    proves the endpoint actually answers TLS for this config, which for a
+    *direct* (non-CDN) server is meaningful liveness — unlike a bare TCP connect.
+    Returns elapsed-ms on success, ``None`` on any failure.
+    """
+    import ssl
+
+    sni = (server_name or host or "").strip().strip("[]")
+    start = time.monotonic()
+    try:
+        raw = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return None
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            with ctx.wrap_socket(raw, server_hostname=sni or host) as tls:
+                # handshake completed; touch the cipher to be sure it's up
+                _ = tls.cipher()
+            return (time.monotonic() - start) * 1000.0
+        except (ssl.SSLError, OSError):
+            return None
+    finally:
+        try:
+            raw.close()
+        except OSError:
+            pass
 
 
 def tcp_throughput(host: str, port: int,

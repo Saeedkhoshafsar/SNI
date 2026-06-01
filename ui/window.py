@@ -2293,6 +2293,15 @@ class MainWindow(QWidget):
     # ------------------------------------------------------------------ core
     def _wire_core(self):
         """Connect UI pages to the engine bridge + config store (step 5)."""
+        # restart state machine (config/strategy switch while connected). Init
+        # explicitly so the phase-driven dispatcher never relies on getattr
+        # defaults firing in the right order.
+        self._restarting = False
+        self._restart_phase = "idle"      # "stopping" | "starting" | "idle"
+        self._restart_gen = 0
+        self._restart_attempts = 0
+        self._restart_settle = 0
+
         # engine → UI (signals are marshalled to the GUI thread by Qt)
         self.engine.log.connect(self.page_log.append)
         # All status updates funnel through _dispatch_status so that, while an
@@ -2370,29 +2379,44 @@ class MainWindow(QWidget):
                 return
             self.engine.start()
 
+    # Restart state machine (config / strategy switch while connected).
+    #
+    # The tricky part is that engine teardown emits a *late* ``idle`` from a
+    # WORKER thread (the proxy listen-loop reporting down), which reaches the GUI
+    # via a queued connection AFTER we've already fired the new start(). The old
+    # boolean flag misread that stale idle as "the new config failed" and flipped
+    # the dashboard to «شروع» / «تلاش دوباره» mid-restart (the reported bug). We
+    # now drive an explicit phase so stale signals can't fool us:
+    #
+    #   "stopping" — stop() issued, waiting for the engine to reach idle. ALL
+    #                idle/error are the dying old session → mask as connecting.
+    #   "starting" — new start() fired. We IGNORE idle/error until we've actually
+    #                observed the NEW session move (connecting→active). Only an
+    #                idle/error seen *after* that counts as a genuine failure.
+    #
+    # ``_restarting`` is True for both phases (mask on); a generation counter
+    # retires stale timers; a watchdog guarantees the mask can never wedge.
+
     def _cancel_restart(self):
         """Abort any in-flight auto-restart and drop the connecting mask.
 
-        Called when the user explicitly hits Stop (so they can always escape a
-        stuck "در حال اتصال…") and by the watchdog when the new config never
-        comes up. Bumps a generation counter so a still-pending
-        ``_restart_when_idle`` / watchdog timer from this cycle becomes a no-op.
+        Called when the user hits Stop (so they can always escape a stuck
+        "در حال اتصال…") and by the watchdog. Bumps the generation so pending
+        poll/watchdog timers from this cycle become no-ops.
         """
         self._restarting = False
-        self._restart_started = True   # block any pending poll from firing start
-        self._restart_gen = getattr(self, "_restart_gen", 0) + 1
-
-    def _begin_restart(self):
-        """Kick off a fresh stop→idle→start restart cycle.
-
-        Masks the transient idle as "connecting", supersedes any older pending
-        restart timer (new generation), then begins polling for idle. A watchdog
-        armed once start() fires guarantees the mask can never wedge the UI.
-        """
-        self._restarting = True
+        self._restart_phase = "idle"
         self._restart_gen = getattr(self, "_restart_gen", 0) + 1
         self._restart_attempts = 0
-        self._restart_started = False
+        self._restart_settle = 0
+
+    def _begin_restart(self):
+        """Kick off a fresh stop→idle→start restart cycle (phase-driven)."""
+        self._restarting = True
+        self._restart_phase = "stopping"
+        self._restart_gen = getattr(self, "_restart_gen", 0) + 1
+        self._restart_attempts = 0
+        self._restart_settle = 0
         self.page_dashboard.set_status("connecting")
         self.active_bar.set_status("connecting")
         try:
@@ -2403,32 +2427,41 @@ class MainWindow(QWidget):
 
     def _dispatch_status(self, status: str):
         """Fan a single engine status out to every UI consumer, masking the
-        transient ``idle`` that happens mid auto-restart so the dashboard shows a
-        steady "در حال اتصال…" instead of flickering back to "شروع" (bug #2)."""
+        transient idle/connecting churn of an auto-restart so the dashboard
+        shows a steady "در حال اتصال…" instead of flickering to «شروع» (bug #2).
+        """
         shown = status
-        if status == "active":
-            # the new session came up — restart done, drop the mask.
-            self._restarting = False
-        elif getattr(self, "_restarting", False) and status in ("idle", "error"):
-            if getattr(self, "_restart_started", False):
-                # we've ALREADY fired the new start, yet the engine fell back to
-                # idle/error → the new config genuinely failed. Stop masking so
-                # the user sees the real state and can act (don't trap them on
-                # "در حال اتصال…"). The watchdog is a backstop for the rarer case
-                # where the engine wedges WITHOUT emitting any terminal status.
+        if getattr(self, "_restarting", False):
+            phase = getattr(self, "_restart_phase", "idle")
+            if status == "active":
+                # new session is up — restart complete, drop the mask.
                 self._restarting = False
-            else:
-                # still tearing the old session down before the new start —
-                # keep the UI steady on "connecting" instead of flickering.
+                self._restart_phase = "idle"
+            elif phase == "stopping":
+                # still tearing the old session down (or its late worker-thread
+                # idle is arriving) — keep a steady "connecting".
                 shown = "connecting"
+            elif phase == "starting":
+                if status == "connecting":
+                    # the NEW start is handshaking — exactly what we expect.
+                    shown = "connecting"
+                else:
+                    # idle/error AFTER we fired the new start. This may still be
+                    # a *stale* teardown idle queued from a worker thread, so we
+                    # DON'T trust it to mean failure — keep masking. The watchdog
+                    # (and a real, later active) resolve the true outcome. This
+                    # is what stops the mid-restart flip to «شروع»/«تلاش دوباره».
+                    shown = "connecting"
         self.page_dashboard.set_status(shown)
         self.active_bar.set_status(shown)
         self._on_status(status)
 
     def _on_status(self, status: str):
         # never act on the *masked* status here — use the raw engine status, but
-        # suppress the "اتصال قطع شد" toast during an intentional restart.
-        if getattr(self, "_restarting", False) and status == "idle":
+        # suppress the transient "اتصال قطع شد" / "خطا" toasts during an
+        # intentional restart (they're just the old session dying / stale signal
+        # churn; the resolver shows the real outcome when the restart settles).
+        if getattr(self, "_restarting", False) and status in ("idle", "error"):
             return
         if status == "active":
             Toast.show_message(self, tr("اتصال برقرار شد — spoofing فعال"), "ok")
@@ -2473,6 +2506,16 @@ class MainWindow(QWidget):
             was_running = bool(self.engine.is_running)
         except Exception:
             was_running = False
+        # Also restart when the engine is sitting in ERROR (the «تلاش دوباره»
+        # button is showing): the user picking a new config clearly wants to
+        # connect to it, so switching the active config must kick off a fresh
+        # connect — not leave the stale «تلاش دوباره» button (reported bug). We
+        # only do this when a real profile is being selected (not a deselect).
+        try:
+            in_error = (self.engine.status_value == "error")
+        except Exception:
+            in_error = False
+        should_restart = was_running or (in_error and profile is not None)
 
         # --- 1) apply the new profile + any mode change FIRST ---------------
         # so the (re)start below already sees the new server *and* the right
@@ -2505,15 +2548,14 @@ class MainWindow(QWidget):
                     self, tr("حالت به «Tunnel» تغییر کرد (برای استفاده از کانفیگ)"),
                     "ok")
 
-        # --- 2) now restart the live engine if it was running --------------
-        if was_running:
+        # --- 2) (re)start the live engine if it was running OR errored ------
+        if should_restart:
             self.page_log.append(
                 "[profile] " + tr("راه‌اندازی مجدد خودکار برای اعمال سرور جدید…"))
-            # flag the restart BEFORE stopping so the imminent idle status is
-            # masked as "connecting" and the Start button stays in stop/connect
-            # mode — the user can't accidentally fire a fresh start mid-switch.
-            # _begin_restart() also arms a watchdog so a wedged connect can't
-            # trap the UI on "در حال اتصال…" (bug: stuck connecting, can't stop).
+            # _begin_restart() masks the transient idle as "connecting", drives
+            # the phase state machine and arms a resolver so the dashboard shows
+            # «در حال اتصال…» immediately (not «شروع»/«تلاش دوباره») and the user
+            # can't accidentally fire a conflicting start mid-switch.
             self._begin_restart()
             try:
                 Toast.show_message(
@@ -2546,7 +2588,7 @@ class MainWindow(QWidget):
                 pass
 
     def _restart_when_idle(self, gen: int | None = None):
-        """Start the engine once it has fully stopped (feedback #2).
+        """Phase "stopping": wait for the old session to fully stop, then start.
 
         Polls engine status every 150 ms (≈12 s cap). Starting only after the
         previous session reached idle guarantees the spoofer port + xray
@@ -2561,6 +2603,8 @@ class MainWindow(QWidget):
             gen = getattr(self, "_restart_gen", 0)
         if gen != getattr(self, "_restart_gen", 0):
             return  # cancelled / superseded — do nothing
+        if getattr(self, "_restart_phase", "idle") != "stopping":
+            return  # already moved on (started / cancelled)
         try:
             running = bool(self.engine.is_running)
         except Exception:
@@ -2568,51 +2612,95 @@ class MainWindow(QWidget):
         self._restart_attempts = getattr(self, "_restart_attempts", 0) + 1
         timed_out = self._restart_attempts > 80
         if not running or timed_out:
-            # guard against two overlapping restart timers both firing start()
-            # (rapid profile switches) → "موتور از قبل در حال اجراست" + a half
-            # torn-down session. Only the first to see idle starts; the flag is
-            # cleared once the engine reports it left idle (or on the next stop).
-            if getattr(self, "_restart_started", False):
-                return
-            self._restart_started = True
-            if timed_out:
-                # engine never reached idle — give up the mask so the UI isn't
-                # stuck on "در حال اتصال…" forever; the real status will surface.
-                self._restarting = False
+            # the old session is down — fire the new start and switch to the
+            # "starting" phase so the resolver (not fragile signal timing) judges
+            # success/failure.
+            self._restart_phase = "starting"
+            self._restart_attempts = 0
             try:
                 self.engine.start()
             except Exception:
-                # start failed outright — drop the restart mask so the dashboard
-                # can show the real idle/error state again.
+                # start failed outright — drop the mask, surface reality.
                 self._restarting = False
+                self._restart_phase = "idle"
+                self._surface_restart_failure(gen)
                 return
-            # Arm a watchdog: if the NEW config never reaches "active" within the
-            # grace window the restart is considered failed — drop the mask so
-            # the dashboard shows the real idle/error and Start works again. This
-            # is the core fix for "گیر میکنه روی در حال اتصال و هیچ کاری نمیشه
-            # کرد": even a wedged engine-side connect can no longer trap the UI.
-            QTimer.singleShot(20000, lambda g=gen: self._restart_watchdog(g))
+            QTimer.singleShot(200, lambda g=gen: self._restart_resolve(g))
             return
         QTimer.singleShot(150, lambda g=gen: self._restart_when_idle(g))
 
-    def _restart_watchdog(self, gen: int):
-        """Drop the connecting-mask if a restart never reached 'active'."""
+    def _restart_resolve(self, gen: int):
+        """Phase "starting": decide success/failure from the ENGINE's own state.
+
+        Polls the live engine status rather than trusting (possibly stale,
+        out-of-order) status signals. Resolves when the engine is genuinely
+        ``active`` (success) or has settled on ``idle``/``error`` for a sustained
+        stretch after the new start (real failure). A hard cap frees the UI no
+        matter what so it can never wedge on "در حال اتصال…".
+        """
         if gen != getattr(self, "_restart_gen", 0):
-            return  # a newer cycle / Stop already cleared this one
-        if not getattr(self, "_restarting", False):
-            return  # already settled (active reached) — nothing to do
-        # the new session never came up in time; surface reality + free the UI.
-        self._restarting = False
+            return  # superseded / cancelled
+        if getattr(self, "_restart_phase", "idle") != "starting":
+            return
         try:
             status = self.engine.status_value
         except Exception:
             status = "idle"
+        self._restart_attempts = getattr(self, "_restart_attempts", 0) + 1
+
+        if status == "active":
+            # success — drop the mask; _dispatch_status already shows "active".
+            self._restarting = False
+            self._restart_phase = "idle"
+            self.page_dashboard.set_status("active")
+            self.active_bar.set_status("active")
+            return
+
+        # Count consecutive non-connecting settles. The new start should reach
+        # "connecting" quickly; if instead it sits at idle/error for ~2.4s, the
+        # new config genuinely failed.
+        if status in ("idle", "error"):
+            self._restart_settle = getattr(self, "_restart_settle", 0) + 1
+        else:  # connecting — still working, reset the settle counter
+            self._restart_settle = 0
+
+        # hard cap (~24s) OR a sustained settle (~16 polls × 150ms ≈ 2.4s).
+        if self._restart_attempts > 160 or self._restart_settle >= 16:
+            self._restarting = False
+            self._restart_phase = "idle"
+            self._restart_settle = 0
+            self._surface_restart_failure(gen)
+            return
+        QTimer.singleShot(150, lambda g=gen: self._restart_resolve(g))
+
+    def _surface_restart_failure(self, gen: int):
+        """Show the engine's real (failed) status and free the controls."""
+        try:
+            status = self.engine.status_value
+        except Exception:
+            status = "idle"
+        if status not in ("idle", "error"):
+            status = "error"
         self.page_dashboard.set_status(status)
         self.active_bar.set_status(status)
         self.page_log.append(
-            "[restart] " + tr("اتصال مجدد در زمان مقرر برقرار نشد — کنترل آزاد شد"))
-        Toast.show_message(
-            self, tr("اتصال مجدد ناموفق بود — می‌توانید دوباره تلاش کنید"), "warn")
+            "[restart] " + tr("اتصال مجدد برقرار نشد — کنترل آزاد شد"))
+        try:
+            Toast.show_message(
+                self, tr("اتصال مجدد ناموفق بود — می‌توانید دوباره تلاش کنید"),
+                "warn")
+        except Exception:
+            pass
+
+    # back-compat shim: older callers/tests referenced _restart_watchdog.
+    def _restart_watchdog(self, gen: int):
+        if gen != getattr(self, "_restart_gen", 0):
+            return
+        if not getattr(self, "_restarting", False):
+            return
+        self._restarting = False
+        self._restart_phase = "idle"
+        self._surface_restart_failure(gen)
 
     def _on_auto_prober_changed(self, enabled: bool):
         # the StrategyPage already persisted the flag; push it to the live engine

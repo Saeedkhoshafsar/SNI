@@ -182,6 +182,193 @@ class LivePingTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+#  Round 3, Bug A part 2 — live tunnel ping must be ROBUST, not one fragile
+#  endpoint ("تونل زنده پاسخ نداد" even though connected). It now tries several
+#  captive-portal endpoints and only fails when EVERY one fails.
+# ---------------------------------------------------------------------------
+
+class LiveProxyPingRobustnessTest(unittest.TestCase):
+    def _ctrl_active(self):
+        from core import engine as eng_mod
+        from core.engine import EngineController
+        ctrl = EngineController({"socks_port": 10808, "http_port": 10809})
+        ctrl._status = eng_mod.STATUS_ACTIVE
+
+        class _Xray:
+            socks_port = 55001
+            http_port = 55002
+        ctrl._xray = _Xray()
+        return ctrl
+
+    def _run_with_opener(self, ctrl, open_fn, **kw):
+        import urllib.request as ur
+
+        class _Opener:
+            def open(self, req, timeout=0):
+                return open_fn(req, timeout)
+        real_build, real_handler = ur.build_opener, ur.ProxyHandler
+        ur.ProxyHandler = lambda mapping: object()
+        ur.build_opener = lambda _h: _Opener()
+        try:
+            return ctrl.live_proxy_ping(**kw)
+        finally:
+            ur.build_opener, ur.ProxyHandler = real_build, real_handler
+
+    def test_accepts_connecting_status(self):
+        """User may ping right as the tunnel comes up; the port is bound by
+        then, so CONNECTING must be allowed (not rejected as 'not active')."""
+        from core import engine as eng_mod
+        ctrl = self._ctrl_active()
+        ctrl._status = eng_mod.STATUS_CONNECTING
+
+        class _Resp:
+            def getcode(self):
+                return 204
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        ok, ms, _ = self._run_with_opener(
+            ctrl, lambda req, timeout: _Resp(), samples=1)
+        self.assertTrue(ok)
+
+    def test_first_endpoint_fails_then_a_later_one_succeeds(self):
+        """One blocked captive host must NOT make the whole ping fail — the
+        all-endpoint sweep should still find a working one."""
+        calls = {"n": 0}
+
+        class _Resp:
+            def getcode(self):
+                return 204
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def open_fn(req, timeout):
+            calls["n"] += 1
+            # fail the first two attempts, succeed afterwards
+            if calls["n"] <= 2:
+                raise OSError("blocked host")
+            return _Resp()
+
+        ctrl = self._ctrl_active()
+        ok, ms, detail = self._run_with_opener(ctrl, open_fn, samples=1)
+        self.assertTrue(ok)
+        self.assertIsInstance(ms, float)
+        self.assertGreater(calls["n"], 1)  # proves it retried other endpoints
+
+    def test_only_fails_when_every_endpoint_fails(self):
+        def open_fn(req, timeout):
+            raise OSError("all blocked")
+        ctrl = self._ctrl_active()
+        ok, ms, detail = self._run_with_opener(ctrl, open_fn, samples=1)
+        self.assertFalse(ok)
+        self.assertIsNone(ms)
+        self.assertTrue(detail)  # carries the last failure reason
+
+    def test_no_http_port_is_honest_failure(self):
+        from core import engine as eng_mod
+        from core.engine import EngineController
+        ctrl = EngineController({"socks_port": 0, "http_port": 0})
+        ctrl._status = eng_mod.STATUS_ACTIVE
+        ctrl._xray = None
+        ok, ms, detail = ctrl.live_proxy_ping()
+        self.assertFalse(ok)
+        self.assertIsNone(ms)
+
+
+# ---------------------------------------------------------------------------
+#  Round 3, Bug A part 1 — ordinary (non-Cloudflare) configs must still get a
+#  ping. The CF /cdn-cgi/trace check fails for a plain VPS; a real TLS
+#  handshake presenting the config's own SNI is honest liveness evidence.
+# ---------------------------------------------------------------------------
+
+class TlsHandshakeFallbackTest(unittest.TestCase):
+    def test_handshake_latency_returns_ms_on_success(self):
+        import core.ping as ping_mod
+
+        class _TLS:
+            def cipher(self):
+                return ("X", "Y", 256)
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        class _Ctx:
+            check_hostname = True
+            verify_mode = None
+            def wrap_socket(self, sock, server_hostname=""):
+                _Ctx.captured_sni = server_hostname
+                return _TLS()
+
+        class _Raw:
+            def close(self):
+                pass
+
+        import socket as sock_mod
+        import ssl as ssl_mod
+        real_conn = sock_mod.create_connection
+        real_ctx = ssl_mod.create_default_context
+        sock_mod.create_connection = lambda *a, **k: _Raw()
+        ssl_mod.create_default_context = lambda: _Ctx()
+        try:
+            ms = ping_mod._tls_handshake_latency(
+                "vps.example.com", 443, 5.0, server_name="vps.example.com")
+        finally:
+            sock_mod.create_connection = real_conn
+            ssl_mod.create_default_context = real_ctx
+        self.assertIsInstance(ms, float)
+        self.assertEqual(_Ctx.captured_sni, "vps.example.com")
+
+    def test_handshake_returns_none_on_connect_failure(self):
+        import core.ping as ping_mod
+        import socket as sock_mod
+        real_conn = sock_mod.create_connection
+
+        def boom(*a, **k):
+            raise OSError("refused")
+        sock_mod.create_connection = boom
+        try:
+            ms = ping_mod._tls_handshake_latency("x", 443, 2.0)
+        finally:
+            sock_mod.create_connection = real_conn
+        self.assertIsNone(ms)
+
+    def test_tls_latency_falls_back_when_cf_probe_not_ok(self):
+        """For a non-CF host, cf_ip_probe won't return OK → tls_latency must
+        invoke the TLS-handshake fallback rather than report None."""
+        import core.ping as ping_mod
+        from core import cf_scanner
+
+        class _Res:
+            outcome = cf_scanner.RST   # anything but OK
+            latency_ms = 0.0
+
+        real_probe = cf_scanner.cf_ip_probe
+        called = {"fallback": False}
+
+        def fake_fallback(host, port, timeout, *, server_name=""):
+            called["fallback"] = True
+            return 42.0
+
+        # tls_latency does `from .cf_scanner import cf_ip_probe` at call time,
+        # so patching cf_scanner.cf_ip_probe is what takes effect.
+        orig_fallback = ping_mod._tls_handshake_latency
+        cf_scanner.cf_ip_probe = lambda *a, **k: _Res()
+        ping_mod._tls_handshake_latency = fake_fallback
+        try:
+            ms = ping_mod.tls_latency(
+                "vps.example.com", 443, 5.0, server_name="vps.example.com")
+        finally:
+            cf_scanner.cf_ip_probe = real_probe
+            ping_mod._tls_handshake_latency = orig_fallback
+        self.assertTrue(called["fallback"])
+        self.assertEqual(ms, 42.0)
+
+
+# ---------------------------------------------------------------------------
 #  Bug 2 — status mask during auto-restart (no "شروع" flicker, Start ignored)
 # ---------------------------------------------------------------------------
 
@@ -309,7 +496,13 @@ class _FakeEngine:
 # ---------------------------------------------------------------------------
 
 class _RestartEngine:
-    """Engine stub for restart-recovery tests; records start/stop calls."""
+    """Engine stub for restart-recovery tests; records start/stop calls.
+
+    ``status_value`` is the *authoritative* engine state the phase-based
+    resolver polls (mirrors EngineBridge.status_value), independent of the
+    ``status`` *signal* — which is exactly the late/stale-signal source the
+    redesign must be robust against.
+    """
 
     def __init__(self):
         self.started = 0
@@ -327,6 +520,7 @@ class _RestartEngine:
 
     def start(self):
         self.started += 1
+        self._running = True
 
 
 def _bare_window():
@@ -334,21 +528,26 @@ def _bare_window():
 
     We only need the restart-state methods, so we bind them to a lightweight
     object that carries the same attributes. This keeps the test fast and free
-    of a real engine/event-loop while exercising the exact logic.
+    of a real engine/event-loop while exercising the exact phase logic.
     """
     from ui.window import MainWindow
 
     class _Page:
-        def set_status(self, *_a):
-            pass
+        def __init__(self):
+            self.status = None
+
+        def set_status(self, s, *_a):
+            self.status = s
     obj = MainWindow.__new__(MainWindow)
     obj.engine = _RestartEngine()
     obj.page_dashboard = _Page()
     obj.active_bar = _Page()
+    # phase-based restart state (matches MainWindow._wire_core init order)
     obj._restarting = False
+    obj._restart_phase = "idle"
     obj._restart_gen = 0
-    obj._restart_started = False
     obj._restart_attempts = 0
+    obj._restart_settle = 0
 
     class _Log:
         def append(self, *_a):
@@ -365,22 +564,49 @@ class RestartRecoveryTest(unittest.TestCase):
     def test_cancel_restart_clears_mask_and_bumps_generation(self):
         w = _bare_window()
         w._restarting = True
+        w._restart_phase = "stopping"
         g0 = w._restart_gen
         w._cancel_restart()
         self.assertFalse(w._restarting)
+        self.assertEqual(w._restart_phase, "idle")
         self.assertGreater(w._restart_gen, g0)
         # a stale poll from the old generation must be a no-op (not start)
         w.engine._running = False
         w._restart_when_idle(g0)
         self.assertEqual(w.engine.started, 0)
 
-    def test_watchdog_drops_mask_when_connect_never_completes(self):
+    def test_begin_restart_resets_counters_and_enters_stopping(self):
+        w = _bare_window()
+        w._restart_attempts = 99
+        w._restart_settle = 99
+        w._begin_restart()
+        # _begin_restart stops the engine then advances the phase poller; the
+        # important invariants are: mask on, counters reset, stop() issued.
+        self.assertTrue(w._restarting)
+        self.assertEqual(w._restart_settle, 0)
+        self.assertEqual(w.engine.stopped, 1)
+
+    def test_surface_failure_drops_mask_and_shows_error(self):
         import ui.window as win
         w = _bare_window()
         w._restarting = True
+        w._restart_phase = "starting"
+        w.engine.status_value = "error"
+        orig = win.Toast.show_message
+        win.Toast.show_message = staticmethod(lambda *a, **k: None)
+        try:
+            w._surface_restart_failure(w._restart_gen)
+        finally:
+            win.Toast.show_message = orig
+        self.assertEqual(w.page_dashboard.status, "error")
+
+    def test_watchdog_backcompat_drops_mask(self):
+        import ui.window as win
+        w = _bare_window()
+        w._restarting = True
+        w._restart_phase = "starting"
         gen = w._restart_gen
         w.engine.status_value = "idle"
-        # the watchdog pops a Toast which needs a real widget parent; stub it.
         orig = win.Toast.show_message
         win.Toast.show_message = staticmethod(lambda *a, **k: None)
         try:
@@ -395,35 +621,121 @@ class RestartRecoveryTest(unittest.TestCase):
         w._restart_watchdog(w._restart_gen)
         self.assertFalse(w._restarting)
 
-    def test_dispatch_status_unmasks_on_failed_start(self):
-        """Once the new start has fired, an incoming idle/error means the new
-        config failed → drop the mask so the user isn't trapped."""
+
+class RestartPhaseMachineTest(unittest.TestCase):
+    """Exercise the phase-aware _dispatch_status directly: stale idle/error
+    signals must NOT flip the dashboard to «شروع»/«تلاش دوباره» mid-restart
+    (the reported bug). Only a genuine ``active`` drops the mask.
+    """
+
+    def setUp(self):
+        from PySide6.QtWidgets import QApplication
+        self.app = QApplication.instance() or QApplication([])
+
+    def _dispatch(self, w, status):
         from ui.window import MainWindow
+        w._on_status = lambda *_a: None
+        MainWindow._dispatch_status(w, status)
+
+    def test_stale_idle_masked_during_stopping(self):
         w = _bare_window()
         w._restarting = True
-        w._restart_started = True  # the new start() already fired
+        w._restart_phase = "stopping"
+        self._dispatch(w, "idle")
+        self.assertTrue(w._restarting)            # mask kept
+        self.assertEqual(w.page_dashboard.status, "connecting")
 
-        # call the real _dispatch_status with a stubbed _on_status
-        w._on_status = lambda *_a: None
-        MainWindow._dispatch_status(w, "idle")
+    def test_stale_idle_masked_during_starting(self):
+        """The CORE fix: a late worker-thread idle that lands AFTER the new
+        start() must keep masking — the resolver, not this stale signal,
+        decides the outcome."""
+        w = _bare_window()
+        w._restarting = True
+        w._restart_phase = "starting"
+        self._dispatch(w, "idle")
+        self.assertTrue(w._restarting)            # still masked, not failed
+        self.assertEqual(w.page_dashboard.status, "connecting")
+
+    def test_stale_error_masked_during_starting(self):
+        w = _bare_window()
+        w._restarting = True
+        w._restart_phase = "starting"
+        self._dispatch(w, "error")
+        self.assertTrue(w._restarting)
+        self.assertEqual(w.page_dashboard.status, "connecting")
+
+    def test_connecting_shown_during_starting(self):
+        w = _bare_window()
+        w._restarting = True
+        w._restart_phase = "starting"
+        self._dispatch(w, "connecting")
+        self.assertTrue(w._restarting)
+        self.assertEqual(w.page_dashboard.status, "connecting")
+
+    def test_active_drops_mask(self):
+        w = _bare_window()
+        w._restarting = True
+        w._restart_phase = "starting"
+        self._dispatch(w, "active")
+        self.assertFalse(w._restarting)           # restart complete
+        self.assertEqual(w._restart_phase, "idle")
+        self.assertEqual(w.page_dashboard.status, "active")
+
+    def test_passthrough_when_not_restarting(self):
+        w = _bare_window()
+        w._restarting = False
+        self._dispatch(w, "idle")
+        self.assertEqual(w.page_dashboard.status, "idle")
+
+    def test_resolver_success_on_active(self):
+        w = _bare_window()
+        w._restarting = True
+        w._restart_phase = "starting"
+        w.engine.status_value = "active"
+        w._restart_resolve(w._restart_gen)
         self.assertFalse(w._restarting)
+        self.assertEqual(w._restart_phase, "idle")
+        self.assertEqual(w.page_dashboard.status, "active")
 
-    def test_dispatch_status_keeps_mask_during_teardown(self):
-        from ui.window import MainWindow
+    def test_resolver_fails_after_sustained_settle(self):
+        import ui.window as win
         w = _bare_window()
         w._restarting = True
-        w._restart_started = False  # still tearing the old session down
-        shown = {}
+        w._restart_phase = "starting"
+        w.engine.status_value = "idle"
+        w._restart_settle = 15      # one short of the 16 threshold
+        orig = win.Toast.show_message
+        win.Toast.show_message = staticmethod(lambda *a, **k: None)
+        try:
+            w._restart_resolve(w._restart_gen)  # tips settle to 16 → failure
+        finally:
+            win.Toast.show_message = orig
+        self.assertFalse(w._restarting)
+        self.assertEqual(w._restart_phase, "idle")
 
-        class _P:
-            def set_status(self, s):
-                shown["v"] = s
-        w.page_dashboard = _P()
-        w.active_bar = _P()
-        w._on_status = lambda *_a: None
-        MainWindow._dispatch_status(w, "idle")
-        self.assertTrue(w._restarting)        # mask kept
-        self.assertEqual(shown.get("v"), "connecting")
+
+class ErrorStateRestartTest(unittest.TestCase):
+    """Round 3 Bug C: switching the active config while the engine is in
+    ERROR (the «تلاش دوباره» button is showing) must auto-restart on the new
+    config — not leave the stale retry button stuck.
+    """
+
+    @staticmethod
+    def _should_restart(was_running, in_error, profile):
+        # mirrors the decision in _on_profile_selected
+        return was_running or (in_error and profile is not None)
+
+    def test_error_plus_new_profile_triggers_restart(self):
+        self.assertTrue(self._should_restart(False, True, object()))
+
+    def test_error_with_deselect_does_not_restart(self):
+        self.assertFalse(self._should_restart(False, True, None))
+
+    def test_running_always_restarts(self):
+        self.assertTrue(self._should_restart(True, False, object()))
+
+    def test_idle_no_profile_change_does_not_restart(self):
+        self.assertFalse(self._should_restart(False, False, object()))
 
 
 # ---------------------------------------------------------------------------
