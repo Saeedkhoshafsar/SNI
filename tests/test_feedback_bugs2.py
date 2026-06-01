@@ -155,14 +155,16 @@ class LivePingTest(unittest.TestCase):
         self.assertIn("55002", captured["proxy"]["http"])
         self.assertNotIn("10809", captured["proxy"]["http"])
 
-    def test_offline_spoof_config_refuses_to_fake_a_number(self):
-        """A spoof config that is NOT the active one must not be given a fake
-        latency offline — a raw connect to its Cloudflare anycast IP answers for
-        anything, which is exactly the meaningless ping the user kept seeing.
+    def test_offline_spoof_config_gives_estimate_in_ping_all(self):
+        """A spoof config that is NOT active now gets an OFFLINE *estimate* in a
+        "ping all" sweep (user request: "وقتی پینگ همه رو میگیرم اونام پینگشون
+        گرفته بشن بدون اینکه دونه دونه وصل بشم").
 
-        The inline worker emits an informational "activate to ping" hint instead
-        of a green/red number. We exercise the worker end-to-end with a fake
-        engine to assert that contract.
+        ``ping_profile`` validates the REAL CDN route the spoofer fronts (real
+        SNI/Host/path via the honest edge probe), so the worker reports its
+        latency — but clearly labelled ``≈ … (تخمینی)`` so it never claims to be
+        the definitive live-tunnel number. The 🛡 live measurement is still the
+        ground truth when the config is activated (separate test).
         """
         from ui.window import InlinePingWorker
 
@@ -170,6 +172,12 @@ class LivePingTest(unittest.TestCase):
             is_spoof_config = True
             address = "127.0.0.1"
             port = 40443
+
+        class _Res:
+            reachable = True
+            best_ms = 73.0
+            jitter_ms = 0.0
+            download_kbps = None
 
         captured = {}
 
@@ -179,9 +187,44 @@ class LivePingTest(unittest.TestCase):
             def live_proxy_ping(self, *_a, **_k):
                 return (False, None, "idle")
             def ping_profile(self, *_a):
-                raise AssertionError("must NOT raw-ping a spoof config offline")
-            def probe_strategies_for(self, *_a, **_k):
-                raise AssertionError("must NOT probe a spoof config offline")
+                # honest edge probe of the real CDN route → reachable estimate
+                return _Res()
+
+        w = InlinePingWorker(_Eng(), _SpoofProfile())
+        w.result.connect(lambda t, k: captured.update(text=t, kind=k))
+        w._run_inner()
+        # an estimate IS shown (a number), tagged ≈ / تخمینی, kind ok
+        self.assertEqual(captured.get("kind"), "ok")
+        self.assertIn("73", captured.get("text", ""))
+        self.assertIn("≈", captured.get("text", ""))
+        self.assertIn("تخمینی", captured.get("text", ""))
+
+    def test_offline_spoof_config_unreachable_points_to_live_ping(self):
+        """When even the offline edge estimate can't reach the spoof route, the
+        worker stays honest: no fake number, an info hint to activate for the
+        real (live) ping — preserving "البته اونم باشه" (the live ping too)."""
+        from ui.window import InlinePingWorker
+
+        class _SpoofProfile:
+            is_spoof_config = True
+            address = "127.0.0.1"
+            port = 40443
+
+        class _Res:
+            reachable = False
+            best_ms = None
+            jitter_ms = None
+            download_kbps = None
+
+        captured = {}
+
+        class _Eng:
+            def is_active_profile(self, *_a):
+                return False
+            def live_proxy_ping(self, *_a, **_k):
+                return (False, None, "idle")
+            def ping_profile(self, *_a):
+                return _Res()
 
         w = InlinePingWorker(_Eng(), _SpoofProfile())
         w.result.connect(lambda t, k: captured.update(text=t, kind=k))
@@ -646,6 +689,61 @@ class CdnPingHonestyTest(unittest.TestCase):
         PingTester(samples=5, timeout=2.0).ping_target(t)
         # one success short-circuits the internal retry, so exactly 1 call here
         self.assertEqual(per_target["n"], 1)
+
+    def test_relay_path_retries_on_refused_upgrade_then_succeeds(self):
+        """A relay config (AYYILDIZ7: ``/stars/http://user:pass@vps...``) opens
+        THREE TLS connections per probe and, under a 'ping all' burst, the edge
+        often *refuses* one WS upgrade (ERROR) transiently even though the route
+        is alive. For a relay path that ERROR must be RETRIED (not just RST /
+        TIMEOUT) so the config doesn't flake red — the reported AYYILDIZ7 bug."""
+        from core import cf_scanner as cf
+        from core.ping import tls_latency
+
+        calls = {"n": 0}
+
+        def fake_probe(host, spec, timeout):
+            calls["n"] += 1
+            # first two passes refuse the upgrade (transient throttle), third OK
+            if calls["n"] < 3:
+                return cf.IPResult(host, cf.ERROR, detail="ws upgrade refused")
+            return cf.IPResult(host, cf.OK, latency_ms=92.0, detail="ws+edge ok")
+
+        self._patch_probe(fake_probe)
+        relay_path = "/stars/http://PQ3YjMsJql:fCfJXXbDcw@vps.webtun.xyz:2087"
+        ms = tls_latency("104.18.151.71", 8443, 2.0,
+                         server_name="hammm2.pages.dev",
+                         host_header="hammm2.pages.dev",
+                         path=relay_path, is_ws=True, is_tls=True, retries=2)
+        self.assertEqual(ms, 92.0)
+        self.assertGreaterEqual(calls["n"], 3)  # ERROR was retried for a relay
+
+    def test_non_relay_error_is_not_retried(self):
+        """For an ORDINARY (non-relay) config an ERROR means a genuinely dead
+        route, so it must NOT be retried as if transient — otherwise a truly
+        broken config would waste attempts and could mask itself green. Only
+        RST/TIMEOUT are transient for non-relay configs."""
+        from core import cf_scanner as cf
+        from core.ping import tls_latency
+        import core.ping as pmod
+
+        calls = {"n": 0}
+
+        def fake_probe(host, spec, timeout):
+            calls["n"] += 1
+            return cf.IPResult(host, cf.ERROR, detail="dead worker route")
+
+        self._patch_probe(fake_probe)
+        # disable the TLS handshake fallback so we only measure probe attempts
+        orig_fb = pmod._tls_handshake_latency
+        pmod._tls_handshake_latency = lambda *a, **k: None
+        self.addCleanup(lambda: setattr(pmod, "_tls_handshake_latency", orig_fb))
+        ms = tls_latency("104.18.151.7", 8443, 2.0,
+                         server_name="young-field.hammm3.workers.dev",
+                         host_header="young-field.hammm3.workers.dev",
+                         path="/?ed=2560", is_ws=True, is_tls=True, retries=2)
+        self.assertIsNone(ms)
+        # ERROR is non-retryable for a non-relay config → tried just once
+        self.assertEqual(calls["n"], 1)
 
 
 # ---------------------------------------------------------------------------
