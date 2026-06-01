@@ -797,6 +797,11 @@ class ProfilesPage(QWidget):
         # double-firing the same config and to map results back to a row.
         self._inline_pending: list[tuple[int, object]] = []   # (job_id, profile)
         self._inline_queue: list[object] = []                 # profiles waiting
+        # Completed ping results, keyed by a stable profile key so they SURVIVE
+        # a refresh()/row-rebuild (bug: "بعد از پینگ هر کاری کنم پینگ‌ها میرن").
+        # refresh() re-applies these to the rebuilt rows; only a fresh ping (or
+        # an edit/removal of that profile) replaces the stored value.
+        self._ping_results: dict[str, tuple[str, str]] = {}   # key -> (text,kind)
         # #7: indexes that are *checked* for bulk actions (delete / copy links).
         # This is independent of the active profile — checking a row never
         # activates it. Stored as a set so order doesn't matter.
@@ -1005,11 +1010,43 @@ class ProfilesPage(QWidget):
         self.list.blockSignals(False)
         # final pass to pin widths to the current viewport (#2)
         self.list._sync_item_widths()
-        # re-apply the "در حال پینگ…" busy state to any row whose profile still
-        # has an in-flight (or queued) ping after this rebuild, so the spinner
-        # text isn't lost when the list is refreshed mid-ping.
+        # re-apply any COMPLETED ping result first, then overlay the busy state
+        # for rows still pinging. Order matters: a row that's both cached AND
+        # re-pinging should show the spinner, not the stale number.
+        self._restore_ping_results()
         self._restore_pinging_rows()
         self._update_selection_ui()
+
+    def _restore_ping_results(self) -> None:
+        """Re-paint cached ping results onto the freshly rebuilt rows.
+
+        Keeps a measured ping visible until the user explicitly re-pings (or
+        edits/removes that profile) — instead of clearing the moment any other
+        action triggers a refresh().
+        """
+        results = getattr(self, "_ping_results", {})
+        if not results:
+            return
+        live_keys = set()
+        for i, prof in enumerate(self._store.profiles):
+            key = self._profile_key(prof)
+            live_keys.add(key)
+            if i >= len(self._rows):
+                continue
+            cached = results.get(key)
+            if not cached:
+                continue
+            text, kind = cached
+            try:
+                self._rows[i].set_ping_state(text, kind)
+                self._rows[i].set_ping_idle()
+            except RuntimeError:
+                pass
+        # prune results for profiles that no longer exist (edited/removed) so
+        # the cache can't grow without bound.
+        stale = [k for k in results if k not in live_keys]
+        for k in stale:
+            results.pop(k, None)
 
     def _restore_pinging_rows(self) -> None:
         pending_profiles = [p for _, p in getattr(self, "_inline_pending", [])]
@@ -1423,6 +1460,20 @@ class ProfilesPage(QWidget):
                 return i
         return -1
 
+    @staticmethod
+    def _profile_key(prof) -> str:
+        """Stable identity for caching a ping result across row rebuilds.
+
+        Keyed by the config-defining fields (address/port/uuid/password/sni/
+        path) so the cached result follows the *config*, not a transient Python
+        object — a re-parsed Profile for the same link still matches.
+        """
+        try:
+            return "|".join(str(getattr(prof, f, "") or "") for f in (
+                "address", "port", "uuid", "password", "sni", "path"))
+        except Exception:
+            return repr(prof)
+
     def _inline_ping_done(self, job_id: int, text: str, kind: str):
         # locate the profile this job was pinging
         prof = None
@@ -1430,6 +1481,10 @@ class ProfilesPage(QWidget):
             if jid == job_id:
                 prof = p
                 break
+        # persist the result so it SURVIVES any later refresh()/row rebuild
+        # (bug: results vanished the moment the user did anything else).
+        if prof is not None:
+            self._ping_results[self._profile_key(prof)] = (text, kind)
         # re-find the LIVE row widget by profile identity — never a stale pointer
         if prof is not None:
             row = self._row_index_for_profile(prof)
@@ -1552,33 +1607,49 @@ class InlinePingWorker(QThread):
             self.result.emit(tr("✖ تونل زنده پاسخ نداد"), "err")
             return
 
-        # --- 2) offline estimate (ranking aid, honestly labelled) ------------
+        # --- 2) spoof config, not active → DON'T fake a number --------------
+        # A spoof config ONLY works through the running spoofer's decoy-SNI
+        # injection. Offline we'd have to present its REAL SNI to the CDN edge,
+        # which from inside the censored network is DPI-blocked by design — yet
+        # the config works fine once connected. Any "latency" we'd show here is
+        # really just a raw TCP connect to a Cloudflare anycast IP that answers
+        # for ANYTHING, i.e. exactly the fake/meaningless ping the user keeps
+        # seeing. So we refuse to invent a number and tell the truth instead:
+        # the honest measurement for a spoof config is a LIVE one.
+        if getattr(self._profile, "is_spoof_config", False):
+            self.result.emit(
+                tr("◍ برای پینگ واقعی، این کانفیگ را فعال کنید"), "info")
+            return
+
+        # --- 3) ordinary config, not active → STRICT edge validation --------
+        # For a direct (non-spoof) config we CAN honestly validate offline: a
+        # real TLS handshake + Cloudflare-edge/WS check against the config's own
+        # SNI/Host. ``ping_profile`` already does this (tls_latency). We only
+        # show a green number when that genuinely validates — a bare TCP connect
+        # is NOT enough (that was the "پینگ میداد ولی کار نمیکرد" false green).
         try:
             res = self._engine.ping_profile(self._profile)
         except Exception as exc:
             self.result.emit(tr("خطا: {exc}").format(exc=exc), "err")
             return
         if res is None or not res.reachable:
-            # even the raw transport didn't answer → genuinely unreachable
+            # the honest TLS/edge validation didn't answer → really unreachable
             self.result.emit(tr("✖ بدون پاسخ"), "err")
             return
 
+        # additionally require a bypass strategy to actually connect; if none
+        # does, the transport is reachable but DPI blocks the protocol → not
+        # usable, report honestly instead of a misleading latency.
         best_ms = res.best_ms
-        # a strategy probe refines the estimate when it can connect, but a
-        # FAILED strategy probe is no longer treated as proof the config is dead:
-        # for spoof configs the real SNI is DPI-blocked offline by design, so a
-        # "no strategy connected" here is expected and must NOT flip a working
-        # config to red. We therefore only *upgrade* the number, never reject.
         try:
             report = self._engine.probe_strategies_for(self._profile)
         except Exception:
             report = None
-        connected = bool(report is not None and report.results
-                         and report.any_connected)
-        if connected:
-            b = report.best
-            if b is not None and b.latency_ms:
-                best_ms = b.latency_ms
+        if report is not None and report.results and not report.any_connected:
+            self.result.emit(tr("✖ مسدود (هیچ استراتژی وصل نشد)"), "err")
+            return
+        if report is not None and report.best is not None and report.best.latency_ms:
+            best_ms = report.best.latency_ms
 
         parts = [f"{best_ms:.0f}ms"]
         if res.jitter_ms is not None:
@@ -1587,16 +1658,7 @@ class InlinePingWorker(QThread):
             parts.append(f"loss {res.loss*100:.0f}%")
         if getattr(res, "download_kbps", None) is not None:
             parts.append(f"dl≈{res.download_kbps:.0f}KB/s")
-        if connected:
-            # a bypass strategy actually completed a handshake → confident
-            self.result.emit("✔ " + " · ".join(parts), "ok")
-        else:
-            # transport reachable but we couldn't prove the bypass offline —
-            # report a *tentative* latency (≈) instead of a false green/red, and
-            # hint that the live tunnel gives the real answer.
-            self.result.emit(
-                "≈ " + " · ".join(parts) + tr("  (تخمینی — برای قطعیت وصل شوید)"),
-                "info")
+        self.result.emit("✔ " + " · ".join(parts), "ok")
 
 
 class StrategyPage(QWidget):
@@ -2279,7 +2341,19 @@ class MainWindow(QWidget):
         # While an automatic config-switch restart is in flight the engine is
         # briefly idle; a stray Start click here used to kick off a second,
         # conflicting start ("موتور از قبل در حال اجراست" / a half torn-down
-        # session). Ignore manual power actions until the restart settles (#2).
+        # session). So we ignore a manual *Start* until the restart settles.
+        #
+        # BUT we must ALWAYS honour a *Stop* — otherwise if the new config never
+        # comes up the user is trapped on "در حال اتصال…" with no way out (the
+        # reported "gets stuck connecting, can't stop or do anything" bug). Stop
+        # cancels the pending restart and tears the engine down for real.
+        if action == "stop":
+            self._cancel_restart()
+            try:
+                self.engine.stop()
+            except Exception:
+                pass
+            return
         if getattr(self, "_restarting", False):
             Toast.show_message(
                 self, tr("در حال جابه‌جایی سرور… چند لحظه صبر کنید"), "info")
@@ -2295,21 +2369,58 @@ class MainWindow(QWidget):
                 self.page_dashboard.set_status("idle")
                 return
             self.engine.start()
-        else:
+
+    def _cancel_restart(self):
+        """Abort any in-flight auto-restart and drop the connecting mask.
+
+        Called when the user explicitly hits Stop (so they can always escape a
+        stuck "در حال اتصال…") and by the watchdog when the new config never
+        comes up. Bumps a generation counter so a still-pending
+        ``_restart_when_idle`` / watchdog timer from this cycle becomes a no-op.
+        """
+        self._restarting = False
+        self._restart_started = True   # block any pending poll from firing start
+        self._restart_gen = getattr(self, "_restart_gen", 0) + 1
+
+    def _begin_restart(self):
+        """Kick off a fresh stop→idle→start restart cycle.
+
+        Masks the transient idle as "connecting", supersedes any older pending
+        restart timer (new generation), then begins polling for idle. A watchdog
+        armed once start() fires guarantees the mask can never wedge the UI.
+        """
+        self._restarting = True
+        self._restart_gen = getattr(self, "_restart_gen", 0) + 1
+        self._restart_attempts = 0
+        self._restart_started = False
+        self.page_dashboard.set_status("connecting")
+        self.active_bar.set_status("connecting")
+        try:
             self.engine.stop()
+        except Exception:
+            pass
+        self._restart_when_idle(self._restart_gen)
 
     def _dispatch_status(self, status: str):
         """Fan a single engine status out to every UI consumer, masking the
         transient ``idle`` that happens mid auto-restart so the dashboard shows a
         steady "در حال اتصال…" instead of flickering back to "شروع" (bug #2)."""
         shown = status
-        if getattr(self, "_restarting", False) and status in ("idle", "error"):
-            # we deliberately tore the engine down to switch configs; keep the
-            # UI on "connecting" until the new session actually comes up.
-            shown = "connecting"
-        elif status in ("active", "error"):
-            # the restart finished (or genuinely failed) — drop the mask
+        if status == "active":
+            # the new session came up — restart done, drop the mask.
             self._restarting = False
+        elif getattr(self, "_restarting", False) and status in ("idle", "error"):
+            if getattr(self, "_restart_started", False):
+                # we've ALREADY fired the new start, yet the engine fell back to
+                # idle/error → the new config genuinely failed. Stop masking so
+                # the user sees the real state and can act (don't trap them on
+                # "در حال اتصال…"). The watchdog is a backstop for the rarer case
+                # where the engine wedges WITHOUT emitting any terminal status.
+                self._restarting = False
+            else:
+                # still tearing the old session down before the new start —
+                # keep the UI steady on "connecting" instead of flickering.
+                shown = "connecting"
         self.page_dashboard.set_status(shown)
         self.active_bar.set_status(shown)
         self._on_status(status)
@@ -2401,21 +2512,9 @@ class MainWindow(QWidget):
             # flag the restart BEFORE stopping so the imminent idle status is
             # masked as "connecting" and the Start button stays in stop/connect
             # mode — the user can't accidentally fire a fresh start mid-switch.
-            self._restarting = True
-            self.page_dashboard.set_status("connecting")
-            self.active_bar.set_status("connecting")
-            try:
-                self.engine.stop()
-            except Exception:
-                pass
-            # Poll until the engine has fully torn down (xray killed, the
-            # 127.0.0.1:40443 spoofer port released) before starting again. A
-            # blind fixed delay sometimes re-bound before the old spoofer let go
-            # of the port, so xray dialed a half-dead spoofer ⇒ the new config
-            # never came up and the user had to stop/start manually (#2).
-            self._restart_attempts = 0
-            self._restart_started = False
-            self._restart_when_idle()
+            # _begin_restart() also arms a watchdog so a wedged connect can't
+            # trap the UI on "در حال اتصال…" (bug: stuck connecting, can't stop).
+            self._begin_restart()
             try:
                 Toast.show_message(
                     self, tr("سرور جدید فعال شد — اتصال بازنشانی شد"), "ok")
@@ -2446,14 +2545,22 @@ class MainWindow(QWidget):
             except Exception:
                 pass
 
-    def _restart_when_idle(self):
+    def _restart_when_idle(self, gen: int | None = None):
         """Start the engine once it has fully stopped (feedback #2).
 
-        Polls engine status every 150 ms (≈6 s cap). Starting only after the
+        Polls engine status every 150 ms (≈12 s cap). Starting only after the
         previous session reached idle guarantees the spoofer port + xray
         subprocess are released, so the new profile actually connects instead of
         the engine appearing "active" while stuck on the old config.
+
+        ``gen`` pins the restart cycle this timer belongs to; if the user hit
+        Stop (or a newer restart began) the generation moved on and this timer
+        silently retires so it can't resurrect a cancelled start.
         """
+        if gen is None:
+            gen = getattr(self, "_restart_gen", 0)
+        if gen != getattr(self, "_restart_gen", 0):
+            return  # cancelled / superseded — do nothing
         try:
             running = bool(self.engine.is_running)
         except Exception:
@@ -2478,8 +2585,34 @@ class MainWindow(QWidget):
                 # start failed outright — drop the restart mask so the dashboard
                 # can show the real idle/error state again.
                 self._restarting = False
+                return
+            # Arm a watchdog: if the NEW config never reaches "active" within the
+            # grace window the restart is considered failed — drop the mask so
+            # the dashboard shows the real idle/error and Start works again. This
+            # is the core fix for "گیر میکنه روی در حال اتصال و هیچ کاری نمیشه
+            # کرد": even a wedged engine-side connect can no longer trap the UI.
+            QTimer.singleShot(20000, lambda g=gen: self._restart_watchdog(g))
             return
-        QTimer.singleShot(150, self._restart_when_idle)
+        QTimer.singleShot(150, lambda g=gen: self._restart_when_idle(g))
+
+    def _restart_watchdog(self, gen: int):
+        """Drop the connecting-mask if a restart never reached 'active'."""
+        if gen != getattr(self, "_restart_gen", 0):
+            return  # a newer cycle / Stop already cleared this one
+        if not getattr(self, "_restarting", False):
+            return  # already settled (active reached) — nothing to do
+        # the new session never came up in time; surface reality + free the UI.
+        self._restarting = False
+        try:
+            status = self.engine.status_value
+        except Exception:
+            status = "idle"
+        self.page_dashboard.set_status(status)
+        self.active_bar.set_status(status)
+        self.page_log.append(
+            "[restart] " + tr("اتصال مجدد در زمان مقرر برقرار نشد — کنترل آزاد شد"))
+        Toast.show_message(
+            self, tr("اتصال مجدد ناموفق بود — می‌توانید دوباره تلاش کنید"), "warn")
 
     def _on_auto_prober_changed(self, enabled: bool):
         # the StrategyPage already persisted the flag; push it to the live engine
@@ -2522,18 +2655,9 @@ class MainWindow(QWidget):
         if was_running:
             self.page_log.append(
                 "[strategy] " + tr("راه‌اندازی مجدد خودکار برای اعمال استراتژی جدید…"))
-            # mask the stop→start idle as "connecting" (bug #2), same as the
-            # config-switch restart above.
-            self._restarting = True
-            self.page_dashboard.set_status("connecting")
-            self.active_bar.set_status("connecting")
-            try:
-                self.engine.stop()
-            except Exception:
-                pass
-            self._restart_attempts = 0
-            self._restart_started = False
-            self._restart_when_idle()
+            # mask the stop→start idle as "connecting" (bug #2) + watchdog, same
+            # as the config-switch restart above.
+            self._begin_restart()
             Toast.show_message(
                 self,
                 tr("استراتژی «{name}» اعمال شد — اتصال بازنشانی شد").format(name=name),
