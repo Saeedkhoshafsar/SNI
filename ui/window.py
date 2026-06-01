@@ -822,7 +822,10 @@ class ProfilesPage(QWidget):
         # profiles currently pinging or queued (by identity) — used to skip
         # double-firing the same config and to map results back to a row.
         self._inline_pending: list[tuple[int, object]] = []   # (job_id, profile)
-        self._inline_queue: list[object] = []                 # profiles waiting
+        self._inline_queue: list[tuple[object, str]] = []     # (profile, mode) waiting
+        # per-profile measurement mode for the items currently in flight:
+        # "delay" (real-delay ping) or "download" (sustained speed test).
+        self._inline_modes: dict[int, str] = {}               # job_id -> mode
         # Completed ping results, keyed by a stable profile key so they SURVIVE
         # a refresh()/row-rebuild (bug: "بعد از پینگ هر کاری کنم پینگ‌ها میرن").
         # refresh() re-applies these to the rebuilt rows; only a fresh ping (or
@@ -911,7 +914,9 @@ class ProfilesPage(QWidget):
         self.btn_select_all = _tool("check_all", "Ghost", "انتخاب همه")
         self.btn_clear_sel = _tool("uncheck_all", "Ghost", "لغو انتخاب")
         self.btn_ping_all_rows = _tool("ping", "Ghost",
-                                       "پینگ همه (هم‌زمان روی هر ردیف)")
+                                       "پینگ واقعی همه (تأخیر — v2rayNG)")
+        self.btn_speed_all_rows = _tool("download", "Ghost",
+                                        "تست سرعت دانلود همه (مطمئن‌تر، اتصال مدت‌دار)")
         self.btn_ping_selected = _tool("broadcast", "Ghost",
                                        "پینگ کانفیگ‌های انتخاب‌شده")
         self.btn_copy_selected = _tool("link", "Ghost",
@@ -924,7 +929,8 @@ class ProfilesPage(QWidget):
             tools.addWidget(b)
         sep = QFrame(); sep.setObjectName("ToolSep"); sep.setFixedWidth(1)
         tools.addWidget(sep)
-        for b in (self.btn_ping_all_rows, self.btn_ping_selected,
+        for b in (self.btn_ping_all_rows, self.btn_speed_all_rows,
+                  self.btn_ping_selected,
                   self.btn_copy_selected, self.btn_edit):
             tools.addWidget(b)
         tools.addStretch(1)
@@ -958,6 +964,7 @@ class ProfilesPage(QWidget):
         self.list.currentRowChanged.connect(self._row_changed)
         self.list.itemDoubleClicked.connect(lambda *_: self._edit_selected())
         self.btn_ping_all_rows.clicked.connect(self._ping_all_inline)
+        self.btn_speed_all_rows.clicked.connect(self._speed_all_inline)
         # #7: bulk-selection wiring
         self.btn_select_all.clicked.connect(self._select_all)
         self.btn_clear_sel.clicked.connect(self._clear_selection)
@@ -1076,7 +1083,7 @@ class ProfilesPage(QWidget):
 
     def _restore_pinging_rows(self) -> None:
         pending_profiles = [p for _, p in getattr(self, "_inline_pending", [])]
-        pending_profiles += list(getattr(self, "_inline_queue", []))
+        pending_profiles += [p for p, _ in getattr(self, "_inline_queue", [])]
         if not pending_profiles:
             return
         for i, prof in enumerate(self._store.profiles):
@@ -1395,15 +1402,18 @@ class ProfilesPage(QWidget):
         """True if this exact profile already has a queued / running ping."""
         if any(p is prof for _, p in self._inline_pending):
             return True
-        if any(p is prof for p in self._inline_queue):
+        if any(p is prof for p, _ in self._inline_queue):
             return True
         return False
 
-    def _enqueue_ping(self, prof) -> None:
-        """Queue a profile for an inline ping (de-duplicated)."""
+    def _enqueue_ping(self, prof, mode: str = "delay") -> None:
+        """Queue a profile for an inline measurement (de-duplicated).
+
+        ``mode`` is "delay" (real-delay ping) or "download" (speed test).
+        """
         if prof is None or self._profile_pending(prof):
             return
-        self._inline_queue.append(prof)
+        self._inline_queue.append((prof, mode))
 
     def _ping_row(self, row: int):
         """Ping a single profile and show the result inline on its row.
@@ -1445,6 +1455,26 @@ class ProfilesPage(QWidget):
             self._toast(tr("هیچ پروفایلی برای پینگ نیست"), "warn")
             return
         self._toast(tr("در حال پینگ همهٔ سرورها …"), "info")
+        self._enqueue_all_inline("delay")
+
+    def _speed_all_inline(self):
+        """Queue a DOWNLOAD speed test on every row (v2rayNG-style).
+
+        A sustained download is far more reliable than a one-shot delay ping —
+        a config that can't actually carry traffic simply won't stream bytes,
+        so fast false-negatives (the user's "first configs ping red") are much
+        less likely.
+        """
+        if self._engine is None:
+            self._toast(tr("موتور در دسترس نیست"), "err")
+            return
+        if not self._store.profiles:
+            self._toast(tr("هیچ پروفایلی برای تست نیست"), "warn")
+            return
+        self._toast(tr("در حال تست سرعت دانلود همهٔ سرورها …"), "info")
+        self._enqueue_all_inline("download")
+
+    def _enqueue_all_inline(self, mode: str):
         rows = getattr(self, "_rows", [])
         for row, prof in enumerate(self._store.profiles):
             if self._profile_pending(prof):
@@ -1454,7 +1484,7 @@ class ProfilesPage(QWidget):
                     rows[row].set_pinging()
                 except RuntimeError:
                     pass
-            self._enqueue_ping(prof)
+            self._enqueue_ping(prof, mode)
         self._pump_ping_queue()
 
     def _pump_ping_queue(self) -> None:
@@ -1468,10 +1498,12 @@ class ProfilesPage(QWidget):
             pass
         while (self._inline_queue
                and len(self._inline_pending) < self._PING_MAX_CONCURRENCY):
-            prof = self._inline_queue.pop(0)
+            prof, mode = self._inline_queue.pop(0)
             self._inline_job_seq += 1
             job_id = self._inline_job_seq
-            worker = InlinePingWorker(self._engine, prof, parent=self)
+            self._inline_modes[job_id] = mode
+            worker = InlinePingWorker(self._engine, prof, parent=self,
+                                      mode=mode)
             worker.result.connect(
                 lambda text, kind, jid=job_id:
                     self._inline_ping_done(jid, text, kind))
@@ -1535,6 +1567,7 @@ class ProfilesPage(QWidget):
                 pass
         self._inline_pending = [
             (jid, p) for jid, p in self._inline_pending if jid != job_id]
+        self._inline_modes.pop(job_id, None)
         # a slot just freed up — start the next queued ping
         self._pump_ping_queue()
 
@@ -1557,6 +1590,7 @@ class ProfilesPage(QWidget):
                 pass
         self._inline_jobs = {}
         self._inline_pending = []
+        self._inline_modes = {}
 
     def _emit_selection(self):
         if self.on_selection_changed:
@@ -1578,10 +1612,11 @@ class InlinePingWorker(QThread):
 
     result = Signal(str, str)
 
-    def __init__(self, engine, profile, parent=None):
+    def __init__(self, engine, profile, parent=None, mode="delay"):
         super().__init__(parent)
         self._engine = engine
         self._profile = profile
+        self._mode = mode  # "delay" (real-delay ping) or "download" (speed)
 
     def run(self):  # pragma: no cover - exercised via Qt smoke, not unit
         # Bug #1 — make the ping HONEST.
@@ -1651,6 +1686,26 @@ class InlinePingWorker(QThread):
         # exactly that — chaining the spoofer underneath for spoof configs, so
         # the decoy-SNI injection is in the path just like a real connect. One
         # code path now serves relay / xhttp / spoof / plain configs identically.
+
+        # --- DOWNLOAD speed test mode (sustained connection) ---------------
+        # The more reliable test the user asked for: pull real bytes through
+        # the config's core for a window and report throughput. A route that
+        # can't carry traffic simply won't stream — no fast false-negative.
+        if self._mode == "download":
+            try:
+                ok, mbps, _detail = self._engine.measure_profile_download(
+                    self._profile, duration=8.0)
+            except Exception as exc:
+                self.result.emit(tr("خطا: {exc}").format(exc=exc), "err")
+                return
+            if ok and mbps is not None:
+                self.result.emit(
+                    tr("⇩ {mbps:.1f} Mbps (دانلود)").format(mbps=mbps), "ok")
+                return
+            self.result.emit(tr("✖ دانلودی انجام نشد"), "err")
+            return
+
+        # --- REAL delay mode (default) -------------------------------------
         try:
             ok, ms, _detail = self._engine.measure_profile_delay(
                 self._profile, timeout=15.0)

@@ -891,32 +891,96 @@ class EnginePingTest(unittest.TestCase):
         self.assertIsNone(ms)
         self.assertIsInstance(detail, str)
 
+    def test_measure_profile_download_failsoft_when_no_core(self):
+        """The new download speed test must also never raise; with no xray it
+        returns an honest (False, None, detail)."""
+        ctrl = EngineController({})
+        ok, mbps, detail = ctrl.measure_profile_download(
+            self._profile("h"), duration=0.2)
+        self.assertFalse(ok)
+        self.assertIsNone(mbps)
+        self.assertIsInstance(detail, str)
+
+    def test_measure_profile_download_reports_throughput(self):
+        """When a temporary core is up and bytes stream through it, the helper
+        returns megabits/second computed from bytes/elapsed."""
+        ctrl = EngineController({})
+
+        # fake _spawn_measure_core to hand back a fake opener that streams a
+        # fixed payload, so we exercise the throughput math deterministically.
+        class _Resp:
+            def __init__(self):
+                self._chunks = [b"x" * 65536] * 8 + [b""]  # ~512 KiB then EOF
+                self._i = 0
+            def getcode(self):
+                return 200
+            def read(self, _n=0):
+                c = self._chunks[self._i] if self._i < len(self._chunks) else b""
+                self._i += 1
+                return c
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        class _Opener:
+            def open(self, _req, timeout=None):
+                return _Resp()
+
+        saved = EngineController._spawn_measure_core
+        EngineController._spawn_measure_core = (
+            lambda self, profile, **k: (_Opener(), lambda: None, None))
+        try:
+            ok, mbps, detail = ctrl.measure_profile_download(
+                self._profile("h"), duration=1.0)
+            self.assertTrue(ok)
+            self.assertIsNotNone(mbps)
+            self.assertGreater(mbps, 0.0)
+        finally:
+            EngineController._spawn_measure_core = saved
+
+    def test_measure_profile_download_red_when_no_bytes(self):
+        """If the stream yields nothing through every URL, report honest red."""
+        ctrl = EngineController({})
+
+        class _Opener:
+            def open(self, _req, timeout=None):
+                raise OSError("connection refused")
+
+        saved = EngineController._spawn_measure_core
+        EngineController._spawn_measure_core = (
+            lambda self, profile, **k: (_Opener(), lambda: None, None))
+        try:
+            ok, mbps, detail = ctrl.measure_profile_download(
+                self._profile("h"), duration=0.5)
+            self.assertFalse(ok)
+            self.assertIsNone(mbps)
+        finally:
+            EngineController._spawn_measure_core = saved
+
+    def test_wait_proxy_ready_times_out_on_dead_port(self):
+        """The readiness poll (race fix) returns False quickly for a dead port
+        instead of blocking, so a broken core can't hang the batch."""
+        import time
+        ctrl = EngineController({})
+        t0 = time.time()
+        # port 1 is privileged/unbound in the sandbox → never accepts
+        ready = ctrl._wait_proxy_ready(1, timeout=0.6)
+        self.assertFalse(ready)
+        self.assertLess(time.time() - t0, 2.0)
+
     def test_measure_profile_delay_returns_real_delay_through_core(self):
         """When the temporary core comes up and the request succeeds,
         measure_profile_delay returns the real round-trip delay — mirroring how
         v2rayNG times a request through the config's own outbound. An ordinary
         (non-spoof) config goes through the stable v2rayNG-style path."""
-        import core.engine as eng_mod
-        from core.xray_manager import XrayManager
-
         ctrl = EngineController({})
 
-        # fake a temporary core that "starts" and binds a known http port
-        class _FakeXray:
-            http_port = 51999
-            socks_port = 51998
-            is_available = True
-            def start(self):
-                return True
-            def stop(self):
-                pass
-
-        saved_xm = eng_mod.__dict__.get("XrayManager", None)
-        # patch the late import target used inside measure_profile_delay
-        import core.xray_manager as xm
-        saved_real = xm.XrayManager
-        xm.XrayManager = lambda *a, **k: _FakeXray()
-        # ordinary config → stable v2rayNG-style delay path is used
+        # fake the (now shared) core-spawn helper to hand back a dummy opener;
+        # ordinary config → stable v2rayNG-style delay path is used.
+        saved_spawn = EngineController._spawn_measure_core
+        EngineController._spawn_measure_core = (
+            lambda self, profile, **k: (object(), lambda: None, None))
         saved_probe = EngineController._v2ray_style_delay
         EngineController._v2ray_style_delay = (
             lambda self, opener, per_timeout, attempts=2: (True, 64.0, "ok"))
@@ -926,7 +990,7 @@ class EnginePingTest(unittest.TestCase):
             self.assertTrue(ok)
             self.assertAlmostEqual(ms, 64.0)
         finally:
-            xm.XrayManager = saved_real
+            EngineController._spawn_measure_core = saved_spawn
             EngineController._v2ray_style_delay = saved_probe
 
     def test_v2ray_style_delay_keeps_best_of_attempts(self):

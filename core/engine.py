@@ -48,6 +48,18 @@ TrafficCb = Callable[[int, int, float, float], None]  # up_bytes, down_bytes, up
 class EngineController:
     """Owns the spoofer + xray lifecycle for one connection."""
 
+    # Serialise the *startup* of throwaway measurement cores. The user saw the
+    # FIRST configs in a batch ping a fast false-red: when "ping all" fires it
+    # spins up several temporary xray cores in the same instant, and they race
+    # for free ports (two workers can grab the same port before either binds)
+    # and saturate CPU so the core isn't ready when the fetch runs. v2rayNG
+    # avoids this with a fixed worker pool + fully isolated cores. We can't
+    # change Qt's thread pool from here, but we CAN make the fragile part —
+    # picking ports + launching the core — atomic across all probes, which
+    # removes the port-collision race entirely. The fetch itself still runs
+    # concurrently, so throughput is unchanged.
+    _MEASURE_START_LOCK = threading.Lock()
+
     def __init__(self, config: dict[str, Any] | None = None):
         self.config: dict[str, Any] = dict(config or {})
         self.profile: Optional[Profile] = None
@@ -428,6 +440,128 @@ class EngineController:
         attempts = max(1, int(samples))
         return self._live_proxy_ping_verified(opener, per_timeout, attempts)
 
+    # --- shared: spin up a throwaway measurement core (race-free) ----------
+    #
+    # Both the REAL-delay and DOWNLOAD-speed tests need the same thing: a
+    # temporary xray core (chained under a temporary spoofer for spoof configs)
+    # bound to a local http proxy, ready to carry a request. This helper does
+    # exactly that and — crucially — serialises the fragile port-pick + launch
+    # under ``_MEASURE_START_LOCK`` so a "ping all" burst can't make two probes
+    # grab the same port (the cause of the first-configs fast false-red). It
+    # then *polls* the core for readiness instead of a blind fixed sleep, with a
+    # short retry, so a core under CPU load during a burst still gets a fair
+    # chance before we judge it. Returns ``(opener, cleanup, err)`` — exactly
+    # one of ``opener`` / ``err`` is set; ``cleanup()`` tears everything down.
+    def _spawn_measure_core(self, profile, *, ready_timeout: float = 6.0):
+        import time
+        import urllib.request
+
+        try:
+            from core.xray_manager import XrayManager, find_free_port
+        except Exception as exc:  # pragma: no cover - import guard
+            return (None, None, f"xray unavailable: {exc}")
+
+        spoofer = None
+        xray = None
+
+        def cleanup():
+            for obj in (xray, spoofer):
+                if obj is not None:
+                    try:
+                        obj.stop()
+                    except Exception:
+                        pass
+
+        try:
+            is_spoof = bool(getattr(profile, "is_spoof_config", False))
+            # --- atomic section: pick ports + start spoofer + start core -----
+            # Holding the lock only around the launch (not the network I/O)
+            # keeps probes concurrent while removing the port-collision race.
+            with self._MEASURE_START_LOCK:
+                socks_port = find_free_port()
+                http_port = find_free_port(socks_port + 1)
+                spoof_port = None
+                if is_spoof:
+                    spoof_port = find_free_port(
+                        int(getattr(profile, "dial_port", 0) or 40443))
+                    connect_ip = (getattr(profile, "spoof_connect_ip", "")
+                                  or "").strip()
+                    connect_port = int(
+                        getattr(profile, "spoof_connect_port", 0)
+                        or (443 if getattr(profile, "is_tls", False) else 80))
+                    fake_sni = (getattr(profile, "spoof_fake_sni", "")
+                                or "").strip()
+                    try:
+                        from main import ProxyServer
+                    except Exception as exc:
+                        return (None, None, f"spoofer unavailable: {exc}")
+                    spoofer = ProxyServer({
+                        "LISTEN_HOST": "127.0.0.1",
+                        "LISTEN_PORT": spoof_port,
+                        "CONNECT_IP": connect_ip,
+                        "CONNECT_PORT": connect_port,
+                        "FAKE_SNI": fake_sni,
+                        "gaming_mode": False,
+                    })
+                    try:
+                        spoofer.bypass_method = self._choose_bypass_method(
+                            connect_ip, connect_port)
+                    except Exception:
+                        pass
+                    if spoofer.start() is False:
+                        return (None, None,
+                                getattr(spoofer, "_start_error", None)
+                                or "spoofer failed to start")
+
+                xray = XrayManager(
+                    profile,
+                    socks_port=socks_port,
+                    http_port=http_port,
+                    spoof_port=spoof_port,
+                    gaming_mode=False,
+                    listen="127.0.0.1",
+                )
+                if not xray.is_available:
+                    cleanup()
+                    return (None, None, "xray.exe not found")
+                if xray.start() is False:
+                    cleanup()
+                    return (None, None, "core failed to start (config broken)")
+            # --- end atomic section -----------------------------------------
+
+            real_http = int(getattr(xray, "http_port", http_port) or http_port)
+            proxy = f"http://127.0.0.1:{real_http}"
+            handler = urllib.request.ProxyHandler(
+                {"http": proxy, "https": proxy})
+            opener = urllib.request.build_opener(handler)
+
+            # Poll for readiness instead of a blind sleep: under a ping-all
+            # burst the core may need a beat to bind + finish its first
+            # handshake. We give it up to ``ready_timeout`` to accept a local
+            # TCP connection on the proxy port before handing it to the caller.
+            if not self._wait_proxy_ready(real_http, ready_timeout):
+                # not fatal — some cores accept late; the caller's own request
+                # retries will still get a fair shot. Give a tiny grace nap.
+                time.sleep(0.4)
+            return (opener, cleanup, None)
+        except Exception as exc:  # never raise into the UI
+            cleanup()
+            return (None, None, f"{type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _wait_proxy_ready(port: int, timeout: float) -> bool:
+        """Poll a local TCP port until it accepts a connection (core bound)."""
+        import socket
+        import time
+        deadline = time.time() + max(0.5, float(timeout))
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", int(port)), 0.4):
+                    return True
+            except Exception:
+                time.sleep(0.15)
+        return False
+
     # --- v2rayNG-style REAL delay for an *inactive* profile -----------------
     #
     # The honest truth (the user's repeated bug reports — AYYILDIZ7 pinged red
@@ -456,84 +590,14 @@ class EngineController:
         self-contained: it binds its own free ports and always tears the
         temporary core (and spoofer, if any) down before returning.
         """
-        import time
-        import urllib.request
-
+        is_spoof = bool(getattr(profile, "is_spoof_config", False))
+        # spin the throwaway core up race-free (shared startup lock) and poll
+        # for readiness instead of a blind sleep.
+        opener, cleanup, err = self._spawn_measure_core(
+            profile, ready_timeout=max(4.0, float(timeout) / 2.0))
+        if opener is None:
+            return (False, None, err or "core failed to start (config broken)")
         try:
-            from core.xray_manager import XrayManager, find_free_port
-        except Exception as exc:  # pragma: no cover - import guard
-            return (False, None, f"xray unavailable: {exc}")
-
-        # never disturb a live tunnel: if the engine is currently running, the
-        # caller should use live_proxy_ping for the active config instead.
-        socks_port = find_free_port()
-        http_port = find_free_port(socks_port + 1)
-
-        spoofer = None
-        xray = None
-        try:
-            is_spoof = bool(getattr(profile, "is_spoof_config", False))
-            spoof_port = None
-            if is_spoof:
-                # bring up a throwaway spoofer exactly like a real connect would,
-                # so the decoy-SNI injection (the whole point of a spoof config)
-                # is in the path — otherwise the real SNI would be DPI-blocked
-                # and a working config would falsely measure red.
-                spoof_port = find_free_port(
-                    int(getattr(profile, "dial_port", 0) or 40443))
-                connect_ip = (getattr(profile, "spoof_connect_ip", "")
-                              or "").strip()
-                connect_port = int(getattr(profile, "spoof_connect_port", 0)
-                                   or (443 if getattr(profile, "is_tls", False)
-                                       else 80))
-                fake_sni = (getattr(profile, "spoof_fake_sni", "") or "").strip()
-                try:
-                    from main import ProxyServer
-                except Exception as exc:
-                    return (False, None, f"spoofer unavailable: {exc}")
-                spoofer = ProxyServer({
-                    "LISTEN_HOST": "127.0.0.1",
-                    "LISTEN_PORT": spoof_port,
-                    "CONNECT_IP": connect_ip,
-                    "CONNECT_PORT": connect_port,
-                    "FAKE_SNI": fake_sni,
-                    "gaming_mode": False,
-                })
-                # pick a sane bypass method without disturbing engine state
-                try:
-                    spoofer.bypass_method = self._choose_bypass_method(
-                        connect_ip, connect_port)
-                except Exception:
-                    pass
-                if spoofer.start() is False:
-                    return (False, None,
-                            getattr(spoofer, "_start_error", None)
-                            or "spoofer failed to start")
-
-            xray = XrayManager(
-                profile,
-                socks_port=socks_port,
-                http_port=http_port,
-                spoof_port=spoof_port,
-                gaming_mode=False,
-                listen="127.0.0.1",
-            )
-            if not xray.is_available:
-                return (False, None, "xray.exe not found")
-            if xray.start() is False:
-                # a bad/broken config makes xray exit immediately → honest red,
-                # which is EXACTLY what we want for the sabotaged vls-cf-xhttp.
-                return (False, None, "core failed to start (config broken)")
-
-            # let the temporary core finish binding + the first handshake.
-            # v2rayNG keeps a warm keep-alive client and just retries, so a
-            # generous warm-up here removes the "first ping is red" flap.
-            time.sleep(1.5)
-            real_http = int(getattr(xray, "http_port", http_port) or http_port)
-            proxy = f"http://127.0.0.1:{real_http}"
-            handler = urllib.request.ProxyHandler(
-                {"http": proxy, "https": proxy})
-            opener = urllib.request.build_opener(handler)
             # v2rayNG uses a 12 s overall client timeout; give each attempt a
             # solid slice (never the old timeout/2 that starved slow configs).
             per_timeout = max(6.0, float(timeout) / 2.0)
@@ -550,12 +614,80 @@ class EngineController:
         except Exception as exc:  # never raise into the UI
             return (False, None, f"{type(exc).__name__}: {exc}")
         finally:
-            for obj in (xray, spoofer):
-                if obj is not None:
-                    try:
-                        obj.stop()
-                    except Exception:
-                        pass
+            if cleanup is not None:
+                cleanup()
+
+    # --- v2rayNG-style DOWNLOAD speed test (sustained connection) -----------
+    #
+    # The user's insight: a real-delay 204 ping can answer "too fast" and flap,
+    # because it's a single tiny request. v2rayNG also offers a DOWNLOAD test
+    # that opens a SUSTAINED connection and pulls real bytes for a window, then
+    # reports throughput. That's far harder to fake-pass: a config that only
+    # reaches the CDN edge or has a dead inner route can't actually stream data,
+    # and a transiently-slow-to-warm config gets the whole window to prove
+    # itself instead of being judged on one cold packet. We mirror that: fetch a
+    # sizeable file THROUGH the config's own core for up to ``duration`` seconds
+    # and measure bytes/second.
+    _DOWNLOAD_TEST_URLS = (
+        # Cloudflare's speed endpoint streams an arbitrary number of bytes and
+        # is reachable worldwide; the count is the byte size.
+        "https://speed.cloudflare.com/__down?bytes=10000000",
+        # Fallback: a stable multi-MB object.
+        "https://speed.hetzner.de/100MB.bin",
+    )
+
+    def measure_profile_download(self, profile, *, duration: float = 8.0,
+                                 max_bytes: int = 12_000_000):
+        """Measure a profile's DOWNLOAD throughput the v2rayNG way.
+
+        Opens a sustained download THROUGH the config's own temporary core for
+        up to ``duration`` seconds (or ``max_bytes``), then returns
+        ``(ok, mbps: float|None, detail)`` where ``mbps`` is megabits/second.
+        Far more resistant to fast false-negatives than a one-shot delay ping,
+        because a non-working route simply can't stream bytes. Fully fail-soft.
+        """
+        import time
+
+        opener, cleanup, err = self._spawn_measure_core(
+            profile, ready_timeout=6.0)
+        if opener is None:
+            return (False, None, err or "core failed to start (config broken)")
+        try:
+            for url in self._DOWNLOAD_TEST_URLS:
+                req = self._dl_request(url)
+                t0 = time.time()
+                total = 0
+                try:
+                    with opener.open(req, timeout=max(6.0, duration + 4.0)) as resp:
+                        code = resp.getcode()
+                        if code not in (200, 206):
+                            continue
+                        deadline = t0 + float(duration)
+                        while time.time() < deadline and total < max_bytes:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+                    continue
+                dt = max(time.time() - t0, 0.001)  # avoid div-by-zero
+                if total > 0:
+                    mbps = (total * 8.0) / dt / 1_000_000.0
+                    return (True, round(mbps, 2),
+                            f"{total // 1024} KiB in {dt:.2f}s")
+            return (False, None, err or "no data through tunnel")
+        except Exception as exc:  # never raise into the UI
+            return (False, None, f"{type(exc).__name__}: {exc}")
+        finally:
+            if cleanup is not None:
+                cleanup()
+
+    @staticmethod
+    def _dl_request(url: str):
+        import urllib.request
+        return urllib.request.Request(
+            url, headers={"User-Agent": "SNISpoofer-speedtest"})
 
     # --- body-verified live tunnel probes (bug: "fake" green ping) ----------
     #

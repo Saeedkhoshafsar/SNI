@@ -82,6 +82,11 @@ _GLYPHS: dict[str, str] = {
         '<circle cx="12" cy="12" r="1.8"/>'
     ),
     "check": '<path d="M4 12.5 L9.5 18 L20 6"/>',
+    "download": (
+        '<path d="M12 3 v11"/>'
+        '<path d="M7.5 10 L12 14.5 L16.5 10"/>'
+        '<path d="M4 19 h16"/>'
+    ),
     "search": (
         '<circle cx="10.5" cy="10.5" r="6.5"/>'
         '<path d="M15.5 15.5 L21 21"/>'

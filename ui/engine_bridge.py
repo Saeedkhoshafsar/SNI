@@ -98,6 +98,20 @@ class EngineBridge(QObject):
         except Exception as exc:
             return (False, None, f"{type(exc).__name__}: {exc}")
 
+    def measure_profile_download(self, profile, *, duration: float = 8.0,
+                                 max_bytes: int = 12_000_000):
+        """v2rayNG-style DOWNLOAD speed test for an inactive profile.
+
+        Streams real bytes THROUGH the config's own temporary core for a window
+        and returns ``(ok, mbps|None, detail)``. Far more resistant to fast
+        false-negatives than a one-shot delay ping.
+        """
+        try:
+            return self.controller.measure_profile_download(
+                profile, duration=duration, max_bytes=max_bytes)
+        except Exception as exc:
+            return (False, None, f"{type(exc).__name__}: {exc}")
+
     @property
     def is_running(self) -> bool:
         return self.controller.is_running
