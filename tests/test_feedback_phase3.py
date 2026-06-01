@@ -65,19 +65,24 @@ class PingTargetTest(unittest.TestCase):
         self.assertEqual(tgt.host, "real.example.com")
         self.assertEqual(tgt.port, 8443)
 
-    def test_spoof_config_pings_connect_ip_with_decoy_sni(self):
-        # #1: the honest offline test of a spoof config's bypass path is a TLS
-        # handshake to the *connect IP* the spoofer dials, presenting the
-        # **decoy** SNI it injects — NOT the real worker SNI directly (DPI would
-        # block that). So if the connect IP is censored, the TLS probe resets →
-        # honest red instead of a misleading green TCP-only ping.
+    def test_spoof_config_pings_connect_ip_with_REAL_sni(self):
+        # #C (false-positive ping fix): a spoof config must be validated against
+        # its **real** Worker route, not the decoy SNI. We still CONNECT to the
+        # CDN connect IP the spoofer dials, but we present the config's REAL SNI
+        # + Host header so the /cdn-cgi/trace / Worker check actually exercises
+        # *this* config. Pinging with the decoy SNI (www.hcaptcha.com) made every
+        # config — broken or working — go green, because any live Cloudflare IP
+        # answers TLS+trace for any SNI. Now a dead Worker honestly fails.
         prof = _profile("spoof", addr="127.0.0.1", port=40443,
                         sni="worker.example.workers.dev", security="tls")
         self.assertTrue(prof.is_spoof_config)
         tgt = target_from_profile(prof)
         self.assertEqual(tgt.host, prof.spoof_connect_ip)
         self.assertEqual(tgt.port, prof.spoof_connect_port)
-        self.assertEqual(tgt.server_name, prof.spoof_fake_sni)
+        # real SNI/Host, NOT the decoy — this is the whole point of the fix
+        self.assertEqual(tgt.server_name, "worker.example.workers.dev")
+        self.assertNotEqual(tgt.server_name, prof.spoof_fake_sni)
+        self.assertEqual(tgt.host_header, "worker.example.workers.dev")
         self.assertTrue(tgt.tls)
 
 

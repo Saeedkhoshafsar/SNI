@@ -527,7 +527,21 @@ class EngineController:
             self._set_status(STATUS_ERROR)
             self._xray = None
             return
-        self._xray.start()
+        # honour the real launch result — xray exits within ms on a bad config
+        # or a port-bind conflict. The previous code ignored start()'s outcome
+        # and ALWAYS logged "✓ اتصال برقرار شد" + turned on the system proxy,
+        # so a dead tunnel looked connected while every request silently failed
+        # (the user's "healthy configs don't connect" bug). Now: only report
+        # success when xray is genuinely up.
+        ok = bool(self._xray.start())
+        if not ok or not getattr(self._xray, "is_running", False):
+            self._core_log(
+                "✗ اتصال برقرار نشد — هستهٔ xray اجرا نشد یا بلافاصله بسته شد. "
+                "لاگ‌های [هسته xray] بالا را بررسی کنید (تداخل پورت "
+                "10808/10809، کانفیگ نامعتبر یا فایل geoip/geosite غایب).")
+            self.stop()                 # tear down + reset status to IDLE
+            self._set_status(STATUS_ERROR)
+            return
 
         self._maybe_enable_system_proxy(True)
         self._set_status(STATUS_ACTIVE)
@@ -535,6 +549,12 @@ class EngineController:
         # spin up the live-usage poller (issue #3): reads xray's cumulative
         # byte counters and turns them into the dashboard's traffic graph.
         self._start_stats_poller()
+        # actively verify the tunnel really carries traffic (not just that the
+        # process is alive) when self-test is on — same honest probe the spoof
+        # path uses, so a config that loads but can't reach its server is
+        # reported red instead of a misleading green.
+        if self.config.get("self_test", True):
+            threading.Thread(target=self._self_test_chain, daemon=True).start()
 
     def _start_stats_poller(self) -> None:
         """Poll xray's StatsService and emit live traffic for plain configs (#3).
@@ -735,7 +755,15 @@ class EngineController:
             if not self._xray.is_available:
                 self._core_log("هشدار: xray.exe یافت نشد — فقط spoofer اجرا می‌شود")
             else:
-                self._xray.start()
+                ok = bool(self._xray.start())
+                if not ok or not getattr(self._xray, "is_running", False):
+                    self._core_log(
+                        "✗ هستهٔ xray اجرا نشد یا بلافاصله بسته شد — اتصال "
+                        "برقرار نشد. لاگ‌های [هسته xray] بالا را بررسی کنید "
+                        "(تداخل پورت 10808/10809 یا کانفیگ نامعتبر).")
+                    self.stop()
+                    self._set_status(STATUS_ERROR)
+                    return
 
         # --- 4. optionally point the OS system proxy at our local HTTP port ---
         self._maybe_enable_system_proxy(chain_spoofer)
@@ -768,6 +796,25 @@ class EngineController:
             threading.Thread(target=self._self_test_chain,
                              daemon=True).start()
 
+    def _effective_ports(self) -> tuple[int, int]:
+        """The (socks, http) ports that are ACTUALLY in use right now.
+
+        ``XrayManager.start()`` may switch off the configured 10808/10809 to a
+        free port when a stale listener still holds them. The system proxy and
+        the self-test MUST point at those *real* bound ports, not the configured
+        defaults — otherwise we enable the OS proxy on a dead port (10809) while
+        xray actually listens on e.g. 61483, so every request fails with
+        ``WinError 10053`` / ``SSL UNEXPECTED_EOF`` even though the tunnel is up.
+        This was the cause of "ordinary configs don't connect" in the latest log.
+        """
+        socks = int(self.config.get("socks_port", 10808))
+        http = int(self.config.get("http_port", 10809))
+        xray = self._xray
+        if xray is not None:
+            socks = int(getattr(xray, "socks_port", socks) or socks)
+            http = int(getattr(xray, "http_port", http) or http)
+        return socks, http
+
     def _maybe_enable_system_proxy(self, use_core: bool) -> None:
         """Set the Windows system proxy → local HTTP port, if requested.
 
@@ -785,7 +832,9 @@ class EngineController:
         try:
             from core.system_proxy import SystemProxy, is_windows
             host = "127.0.0.1"
-            port = int(self.config.get("http_port", 10809))
+            # use the REAL bound http port (see _effective_ports), not the
+            # configured default which xray may have abandoned on a conflict.
+            port = self._effective_ports()[1]
             if self._system_proxy_factory is not None:
                 sp = self._system_proxy_factory()
             else:
@@ -817,7 +866,9 @@ class EngineController:
         if self._status != STATUS_ACTIVE:
             return  # already stopped / errored — nothing to test
 
-        http_port = int(self.config.get("http_port", 10809))
+        # probe the REAL bound http port (xray may have moved off 10809 on a
+        # port conflict); testing the configured default would hit a dead port.
+        socks_port, http_port = self._effective_ports()
         proxy = f"http://127.0.0.1:{http_port}"
         # 204 endpoints are tiny and return no body — ideal for a liveness probe
         test_url = "https://www.gstatic.com/generate_204"
@@ -838,7 +889,7 @@ class EngineController:
                     f"[self-test] ✓ مسیر داخلی سالم است (HTTP {code}، {dt}ms). "
                     f"تونل کار می‌کند — اگر مرورگرتان باز نمی‌کند یعنی پروکسی "
                     f"سیستم/مرورگر روی 127.0.0.1:{http_port} (یا SOCKS "
-                    f"{self.config.get('socks_port', 10808)}) تنظیم نشده.")
+                    f"{socks_port}) تنظیم نشده.")
             else:
                 self._log(f"[self-test] ⚠ پاسخ غیرمنتظره HTTP {code} — مسیر "
                           f"کامل برقرار نشد.", )

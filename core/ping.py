@@ -289,22 +289,35 @@ def target_from_profile(profile) -> Target:
     is_ws = transport in ("ws", "websocket", "httpupgrade")
     if getattr(profile, "is_spoof_config", False):
         # Spoof configs dial *our* loopback spoofer, which forwards to a fixed
-        # CDN IP while injecting a **decoy** SNI to beat DPI. The honest offline
-        # test of the bypass path is therefore: a TLS handshake to that same
-        # connect IP presenting the *decoy* SNI (exactly what the spoofer does).
-        # If the connect IP is blocked, that handshake resets → honest red.
+        # CDN IP while injecting a **decoy** SNI to beat DPI.
+        #
+        # The OLD honest-test pinged that connect IP presenting the **decoy**
+        # SNI (e.g. ``www.hcaptcha.com``) + the decoy Host header. That is wrong:
+        # a `/cdn-cgi/trace` to ANY live Cloudflare anycast IP answers 200 for
+        # ANY SNI, so EVERY spoof config — working or broken — went green. That
+        # is exactly the user's "both broken and healthy configs ping positive"
+        # bug: we only proved the CDN edge is alive, never that *this config's*
+        # Worker actually routes.
+        #
+        # The honest test must validate the **real config endpoint**: connect to
+        # the CDN edge but present the config's REAL SNI (the workers.dev /
+        # pages.dev host) and send the REAL Host header + path. Cloudflare routes
+        # by the inner SNI/Host, so a dead Worker, wrong host or unrouteable
+        # path now fails the trace/Worker check → honest red — while a genuinely
+        # working config still answers. The decoy SNI is purely a DPI-evasion
+        # detail on the wire and is irrelevant to whether the config *works*.
         connect_ip = getattr(profile, "spoof_connect_ip", "") or host
         connect_port = getattr(profile, "spoof_connect_port", 0) or (
             443 if is_tls else port)
-        fake_sni = getattr(profile, "spoof_fake_sni", "") or server_name
+        real_sni = (getattr(profile, "sni", "") or getattr(profile, "host", "")
+                    or server_name)
+        real_host = (getattr(profile, "host", "") or real_sni)
         host = connect_ip
         port = int(connect_port)
-        server_name = fake_sni
-        # the decoy SNI is also the Host the spoofer presents to DPI; a ws
-        # upgrade check would target the wrong (decoy) host, so skip it here —
-        # the edge HTTP check on the decoy SNI is the honest spoof-path test.
-        host_header = fake_sni
-        is_ws = False
+        server_name = real_sni
+        host_header = real_host
+        # keep the real transport so a ws/xhttp config is validated against its
+        # real path on the real edge route (already set above from the profile).
     return Target(label=str(label), host=host, port=port,
                   server_name=str(server_name or ""), tls=is_tls,
                   host_header=str(host_header or ""), path=str(path or "/"),
@@ -512,10 +525,33 @@ def probe_strategies(
     if probe_fn is None:
         from . import prober as _prober_mod
         sni = getattr(target, "server_name", "") or ""
+        host_header = getattr(target, "host_header", "") or sni
+        tpath = getattr(target, "path", "/") or "/"
+        is_ws = bool(getattr(target, "is_ws", False))
         if getattr(target, "tls", False):
-            def probe_fn(cand, host, port, timeout, _sni=sni):  # noqa: E306
-                return _prober_mod.tls_probe(
-                    cand, host, port, timeout, server_name=_sni)
+            # #C: a bare TLS handshake (``tls_probe``) is NOT enough for a
+            # CDN-fronted config — every Cloudflare anycast IP answers TLS for
+            # *any* SNI, so a broken Worker still "connected". Validate the REAL
+            # edge route instead: TLS with the real SNI + a real
+            # ``/cdn-cgi/trace`` carrying the real Host header (and, for ws, a
+            # real Upgrade on the real path). Only a genuinely working config's
+            # edge answers, so broken configs honestly fail every strategy.
+            from .cf_scanner import cf_ip_probe, ProbeSpec, OK as _CF_OK
+            from .prober import ProbeResult as _PR, OK, RST, TIMEOUT, ERROR
+
+            def probe_fn(cand, host, port, timeout,  # noqa: E306
+                         _sni=sni, _h=host_header, _p=tpath, _ws=is_ws):
+                spec = ProbeSpec(
+                    port=int(port),
+                    server_name=(_sni or host or "").strip().strip("[]"),
+                    host=(_h or _sni or host or "").strip(),
+                    path=_p or "/", is_ws=bool(_ws), is_tls=True)
+                res = cf_ip_probe(host, spec, timeout)
+                outcome = {"ok": OK, "rst": RST, "timeout": TIMEOUT,
+                           "error": ERROR}.get(res.outcome, ERROR)
+                return _PR(cand, outcome,
+                           latency_ms=float(getattr(res, "latency_ms", 0.0)),
+                           detail=getattr(res, "detail", ""))
         else:
             # Non-TLS target → a bare TCP connect is the honest test. Resolve
             # the symbol lazily through the module so a monkeypatched
