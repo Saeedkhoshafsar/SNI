@@ -640,36 +640,120 @@ class EngineController:
     # real connect) + a body-verified GET. This is the same machinery
     # ``_start_core_only`` / the spoofer path already use, just torn down right
     # after the measurement.
-    def measure_profile_delay(self, profile, *, timeout: float = 12.0):
-        """Measure a profile's REAL delay the v2rayNG way (temporary core).
+    # --- per-config measurement budgets, modeled on v2rayN -----------------
+    #
+    # The user's two reports, reconciled:
+    #   (a) a DEAD config must NOT hang ~30-60 s grinding every fallback.
+    #   (b) a SPOOF config is slow to ESTABLISH — it needs time to warm the
+    #       decoy-SNI / relay path before it can answer a real ping; a flat
+    #       5-6 s cap kills working spoof configs before they get going.
+    #
+    # v2rayN (2dust/v2rayN, ConnectionHandler.GetRealPingTime + SpeedtestService
+    # .RunRealPingAsync) solves exactly this and is our model:
+    #   * after starting the core it waits a fixed ``Task.Delay(1000)`` (1 s)
+    #     warm-up BEFORE the first ping — the path gets time to come up.
+    #   * the ping itself has a 10 s budget SHARED across its 2 attempts (one
+    #     CancellationTokenSource for the whole call), keeping the min.
+    #   * crucially, whatever FAILS the first pass is automatically RE-TESTED
+    #     (RunRealPingBatchAsync → lstFailed) with a smaller/again pass before
+    #     being declared dead — a slow-to-establish config gets a real 2nd shot.
+    #
+    # We mirror that with TWO budgets (spoof gets a longer one + a warm-up +
+    # one automatic retry; ordinary configs stay fast) so (a) and (b) are both
+    # satisfied: healthy spoof configs are given enough time to wake up, dead
+    # ones still bail in seconds instead of a minute.
+    DELAY_DEADLINE_S: float = 6.0          # ordinary configs (fast)
+    DELAY_DEADLINE_SPOOF_S: float = 12.0   # spoof: longer — slow to establish
+    # fixed warm-up before the first probe (mirrors v2rayN's Task.Delay(1000)).
+    DELAY_WARMUP_S: float = 0.0            # ordinary: ready-poll is enough
+    DELAY_WARMUP_SPOOF_S: float = 1.2      # spoof: let the decoy path come up
+
+    def measure_profile_delay(self, profile, *, timeout: float = 12.0,
+                              deadline: Optional[float] = None):
+        """Measure a profile's REAL delay the v2rayN way (temporary core).
 
         Returns ``(ok: bool, latency_ms: float|None, detail: str)``. Works for
         ANY config — relay/xhttp/spoof/plain — because the request travels the
         config's genuine outbound, not a hand-rolled probe. Fully fail-soft and
         self-contained: it binds its own free ports and always tears the
         temporary core (and spoofer, if any) down before returning.
+
+        The wall-clock ``deadline`` (seconds) caps a *single* attempt. It
+        defaults to :attr:`DELAY_DEADLINE_S` for ordinary configs and the
+        longer :attr:`DELAY_DEADLINE_SPOOF_S` for spoof configs — because spoof
+        configs are slow to ESTABLISH and a too-tight cap false-reds working
+        ones. Spoof configs additionally get ONE automatic retry (v2rayN's
+        failed-part retest) so a slow wake-up doesn't decide the verdict, while
+        a genuinely dead config still bails in seconds, not a minute.
         """
         is_spoof = bool(getattr(profile, "is_spoof_config", False))
+        if deadline is not None:
+            wall = float(deadline)
+        else:
+            wall = (self.DELAY_DEADLINE_SPOOF_S if is_spoof
+                    else self.DELAY_DEADLINE_S)
+        # spoof configs get one automatic second chance (slow-to-establish);
+        # ordinary configs are judged on a single fast pass.
+        attempts_total = 2 if is_spoof else 1
+        last = (False, None, "")
+        for attempt in range(attempts_total):
+            ok, ms, detail = self._measure_profile_delay_once(
+                profile, timeout=timeout, wall=wall, is_spoof=is_spoof)
+            if ok:
+                return (ok, ms, detail)
+            last = (ok, ms, detail)
+        return last
+
+    def _measure_profile_delay_once(self, profile, *, timeout, wall, is_spoof):
+        """One full delay measurement (fresh temporary core) bounded by ``wall``
+        seconds of wall-clock. Returns ``(ok, ms|None, detail)``."""
+        import time
+
+        t_start = time.time()
+        end_by = t_start + float(wall)
+
         # spin the throwaway core up race-free (shared startup lock) and poll
-        # for readiness instead of a blind sleep.
+        # for readiness — but never let core startup alone eat the whole budget
+        # (a config whose core won't bind in time is just as useless as one
+        # whose route is dead). Spoof gets a bigger share of the longer budget.
+        ready_frac = 0.7 if is_spoof else 0.6
+        ready_budget = max(1.5, min(wall * ready_frac, float(timeout) / 2.0))
         opener, cleanup, err = self._spawn_measure_core(
-            profile, ready_timeout=max(4.0, float(timeout) / 2.0))
+            profile, ready_timeout=ready_budget)
         if opener is None:
             return (False, None, err or "core failed to start (config broken)")
         try:
-            # v2rayNG uses a 12 s overall client timeout; give each attempt a
-            # solid slice (never the old timeout/2 that starved slow configs).
-            per_timeout = max(6.0, float(timeout) / 2.0)
+            # v2rayN waits a fixed 1 s warm-up AFTER the core is up, BEFORE the
+            # first ping, so a slow-to-establish path (spoof/relay) isn't judged
+            # on a cold first packet. We do the same — but never spend warm-up
+            # we can't afford within the wall-clock.
+            warm = (self.DELAY_WARMUP_SPOOF_S if is_spoof
+                    else self.DELAY_WARMUP_S)
+            warm = max(0.0, min(warm, (end_by - time.time()) - 1.0))
+            if warm > 0:
+                time.sleep(warm)
+
+            # remaining wall-clock budget after startup + warm-up; if we've
+            # already blown it, this config is too slow → dead.
+            remaining = end_by - time.time()
+            if remaining <= 0.2:
+                return (False, None,
+                        f"بیش از {wall:.0f} ثانیه طول کشید (کند/خراب)")
+            # the ping budget is the remaining wall-clock, SHARED across its 2
+            # attempts (exactly like v2rayN's single CancellationTokenSource).
+            per_timeout = max(1.5, min(remaining, float(timeout) / 2.0))
             if is_spoof:
                 # Spoof configs dial a fixed Cloudflare anycast IP, so a bare
                 # 204 can be answered by the CF edge even when the inner route
                 # is dead (false-green). Keep the stricter body-verified probe
                 # ONLY for these — it's the one case where 204 lies.
-                return self._live_proxy_ping_verified(opener, per_timeout, 2)
-            # Ordinary configs (relay/xhttp/plain): use v2rayNG's exact stable
+                return self._live_proxy_ping_verified(
+                    opener, per_timeout, 2, end_by=end_by)
+            # Ordinary configs (relay/xhttp/plain): use v2rayN's exact stable
             # algorithm — fixed 204 URL, 200/204 == ok, 2-attempt best-of. This
             # is what stops the working-config green↔red flapping.
-            return self._v2ray_style_delay(opener, per_timeout, attempts=2)
+            return self._v2ray_style_delay(
+                opener, per_timeout, attempts=2, end_by=end_by)
         except Exception as exc:  # never raise into the UI
             return (False, None, f"{type(exc).__name__}: {exc}")
         finally:
@@ -705,24 +789,66 @@ class EngineController:
         "https://speed.hetzner.de/100MB.bin",
     )
 
+    # Per-config download budgets, modeled on v2rayN (same reasoning as the
+    # delay path): a dead config must bail in seconds, but a SPOOF config is
+    # slow to establish and needs a real warm-up + a longer window + a second
+    # chance before being called dead. Ordinary configs stay fast.
+    DOWNLOAD_DEADLINE_S: float = 8.0          # ordinary configs
+    DOWNLOAD_DEADLINE_SPOOF_S: float = 16.0   # spoof: slow to establish
+
     def measure_profile_download(self, profile, *, duration: float = 8.0,
-                                 max_bytes: int = 12_000_000):
-        """Measure a profile's DOWNLOAD throughput the v2rayNG way.
+                                 max_bytes: int = 12_000_000,
+                                 deadline: Optional[float] = None):
+        """Measure a profile's DOWNLOAD throughput the v2rayN way.
 
         Opens a sustained download THROUGH the config's own temporary core for
         up to ``duration`` seconds (or ``max_bytes``), then returns
         ``(ok, mbps: float|None, detail)`` where ``mbps`` is megabits/second.
         Far more resistant to fast false-negatives than a one-shot delay ping,
         because a non-working route simply can't stream bytes. Fully fail-soft.
+
+        The wall-clock ``deadline`` (seconds) caps a *single* attempt. It
+        defaults to :attr:`DOWNLOAD_DEADLINE_S` for ordinary configs and the
+        longer :attr:`DOWNLOAD_DEADLINE_SPOOF_S` for spoof configs (slow to
+        establish). Spoof configs additionally get ONE automatic retry so a
+        slow wake-up doesn't false-red a working server, while a genuinely
+        dead config still bails fast instead of hanging for a minute.
         """
+        is_spoof = bool(getattr(profile, "is_spoof_config", False))
+        if deadline is not None:
+            wall = float(deadline)
+        else:
+            wall = (self.DOWNLOAD_DEADLINE_SPOOF_S if is_spoof
+                    else self.DOWNLOAD_DEADLINE_S)
+        attempts_total = 2 if is_spoof else 1
+        last = (False, None, "")
+        for attempt in range(attempts_total):
+            ok, mbps, detail = self._measure_profile_download_once(
+                profile, duration=duration, max_bytes=max_bytes,
+                wall=wall, is_spoof=is_spoof)
+            if ok:
+                return (ok, mbps, detail)
+            last = (ok, mbps, detail)
+        return last
+
+    def _measure_profile_download_once(self, profile, *, duration, max_bytes,
+                                       wall, is_spoof):
+        """One full download measurement (fresh temporary core) bounded by
+        ``wall`` seconds of wall-clock. Returns ``(ok, mbps|None, detail)``."""
         import time
 
-        is_spoof = bool(getattr(profile, "is_spoof_config", False))
+        end_by = time.time() + float(wall)
+        # never let the per-stream window exceed the overall budget.
+        stream_window = max(1.0, min(float(duration), wall))
+
         # spoof/relay configs need a longer warm-up: their first handshake
         # through the decoy-SNI path / relay hop is slower to establish, and a
         # download started too early simply errors (the cause of the always-red
-        # spoof download). Give them more readiness budget.
-        ready = 9.0 if is_spoof else 6.0
+        # spoof download). Give them more readiness budget — but never more than
+        # the overall wall-clock allows (a config that can't even bind in time
+        # is useless).
+        ready = (9.0 if is_spoof else 6.0)
+        ready = max(1.5, min(ready, wall * 0.6))
         opener, cleanup, err = self._spawn_measure_core(
             profile, ready_timeout=ready)
         if opener is None:
@@ -737,21 +863,34 @@ class EngineController:
             best = None
             last_err = err
             for url in self._DOWNLOAD_TEST_URLS:
+                # out of wall-clock budget → stop trying further fallback URLs.
+                if time.time() >= end_by:
+                    last_err = last_err or "deadline"
+                    break
                 # two attempts per URL (v2rayNG-style) so a slow-to-warm route
                 # gets a fair second shot before we move on.
                 for attempt in range(2):
+                    # hard guard: don't start an attempt we can't finish in time.
+                    remaining = end_by - time.time()
+                    if remaining <= 0.3:
+                        last_err = last_err or "deadline"
+                        break
                     req = self._dl_request(url)
                     t0 = time.time()
                     total = 0
                     try:
-                        with opener.open(
-                                req, timeout=max(8.0, duration + 5.0)) as resp:
+                        # per-request timeout is bounded by the remaining budget.
+                        req_timeout = max(1.0, min(stream_window + 2.0, remaining))
+                        with opener.open(req, timeout=req_timeout) as resp:
                             code = resp.getcode()
                             if code not in (200, 206):
                                 last_err = f"HTTP {code}"
                                 continue
-                            deadline = t0 + float(duration)
-                            while time.time() < deadline and total < max_bytes:
+                            # stream until the per-config window OR the overall
+                            # wall-clock deadline, whichever comes first.
+                            deadline_stream = min(t0 + stream_window, end_by)
+                            while (time.time() < deadline_stream
+                                   and total < max_bytes):
                                 chunk = resp.read(65536)
                                 if not chunk:
                                     break
@@ -859,10 +998,15 @@ class EngineController:
         "https://www.google.com/generate_204",
     )
 
-    def _v2ray_style_delay(self, opener, per_timeout, attempts=2):
+    def _v2ray_style_delay(self, opener, per_timeout, attempts=2,
+                           *, end_by=None):
         """Measure delay exactly the v2rayNG way: fixed 204 URL, 200/204 ok,
         N attempts keeping the minimum (best-of). Returns ``(ok, ms|None,
         detail)``. This is the *stable* path for ordinary configs.
+
+        ``end_by`` (optional ``time.time()`` deadline) caps total wall-clock:
+        once a real round-trip is in hand we return immediately, and we stop
+        spending attempts past the deadline so a dead config can't hang.
         """
         import time
         import urllib.request
@@ -874,11 +1018,19 @@ class EngineController:
         # url == "" default + our extra resilience for blocked gstatic).
         for url in self._V2RAY_DELAY_URLS:
             for _ in range(max(1, int(attempts))):
+                # hard wall-clock guard: never start a request we can't finish
+                # inside the overall budget — a slow/dead config is useless.
+                if end_by is not None and time.time() >= end_by:
+                    last_detail = last_detail or "deadline"
+                    break
+                req_timeout = per_timeout
+                if end_by is not None:
+                    req_timeout = max(0.5, min(per_timeout, end_by - time.time()))
                 req = urllib.request.Request(
                     url, headers={"User-Agent": "SNISpoofer-ping"})
                 t0 = time.time()
                 try:
-                    with opener.open(req, timeout=per_timeout) as resp:
+                    with opener.open(req, timeout=req_timeout) as resp:
                         code = resp.getcode()
                         # drain the (tiny/empty) body so the connection can be
                         # cleanly reused for the next keep-alive attempt.
@@ -898,11 +1050,15 @@ class EngineController:
                 # primary URL already gave us a real round-trip; no need to
                 # also hammer the fallback.
                 break
+            # out of wall-clock budget → stop trying further fallback URLs.
+            if end_by is not None and time.time() >= end_by:
+                break
         if min_ms is not None:
             return (True, round(min_ms, 1), "ok")
         return (False, None, last_detail or "no response")
 
-    def _live_proxy_ping_verified(self, opener, per_timeout, attempts):
+    def _live_proxy_ping_verified(self, opener, per_timeout, attempts,
+                                  *, end_by=None):
         """Probe the live tunnel, requiring a real body-verified fetch.
 
         Returns ``(ok, latency_ms|None, detail)``. ``ok`` is True only if at
@@ -910,6 +1066,10 @@ class EngineController:
         through the proxy. Empty-204 endpoints contribute a latency sample but
         never, on their own, count as success — so a tunnel that merely reaches
         the CDN edge (the sabotaged-spoof "fake ping") is correctly reported red.
+
+        ``end_by`` (optional ``time.time()`` deadline) hard-caps total
+        wall-clock: spoof configs that can't body-verify within the budget are
+        declared dead immediately rather than churning every fallback endpoint.
         """
         import time
         import urllib.request
@@ -923,13 +1083,21 @@ class EngineController:
         rounds = max(attempts, 1)
         idx = 0
         while idx < max(rounds, len(endpoints)) and not (verified and best is not None):
+            # hard wall-clock guard: a broken spoof config must not eat the
+            # whole minute hopping fallback endpoints.
+            if end_by is not None and time.time() >= end_by:
+                last_detail = last_detail or "deadline"
+                break
             url, marker = endpoints[idx % len(endpoints)]
             idx += 1
+            req_timeout = per_timeout
+            if end_by is not None:
+                req_timeout = max(0.5, min(per_timeout, end_by - time.time()))
             req = urllib.request.Request(
                 url, headers={"User-Agent": "SNISpoofer-ping"})
             t0 = time.time()
             try:
-                with opener.open(req, timeout=per_timeout) as resp:
+                with opener.open(req, timeout=req_timeout) as resp:
                     code = resp.getcode()
                     body = b""
                     if marker:

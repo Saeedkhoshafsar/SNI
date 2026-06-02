@@ -1,31 +1,52 @@
-"""Cloudflare clean-IP scanner (issue #3).
+"""Cloudflare clean-IP scanner — SenPaiScanner engine, ported into this app.
 
-Goal (mirrors the referenced ``MatinSenPai/SenPaiScanner`` project, but built
-*into* this app so it can run against a config the user already imported):
+This module is a **faithful Python port of ``MatinSenPai/SenPaiScanner``** (Go),
+brought in as the *core* of our "اسکن IP تمیز" feature at the user's request.
+The proven two-phase design is preserved exactly:
 
-Given a reference :class:`core.profile.Profile`, sweep a pool of Cloudflare
-edge IPs and report which ones actually work *for that config* — i.e. a clean
-IP that answers a real TLS handshake (carrying the config's SNI) on the config's
-port with acceptable latency. The user then picks one / several / all of the
-clean IPs and the app produces new profiles that are byte-identical to the
-original except their ``address`` is swapped to the clean IP.
+**Phase 1 — connectivity probe** (:func:`cf_ip_probe`, ported from
+``internal/prober/prober.go``):
+    * Several tries per IP with **SNI rotation** + small **jitter** between
+      tries (so the sweep doesn't look like a scanner and DPI black-holing of a
+      single SNI can't sink an otherwise good IP).
+    * Three modes — ``ModeTCP`` (bare connect), ``ModeTLS`` (handshake only),
+      ``ModeHTTP`` (full ``GET /cdn-cgi/trace`` → must see a real Cloudflare
+      ``colo=``/CF-Ray). HTTP mode optionally measures a **download sample** and
+      runs a **WebSocket probe** (2 s idle hold to detect DPI RSTs + a real WS
+      upgrade that must elicit an ``HTTP/`` response).
+    * Per-try latencies feed honest stats — :class:`IPResult` exposes loss /
+      avg / min / max / jitter and an :meth:`IPResult.is_healthy` mirroring
+      ``internal/result/result.go``'s ``IsHealthy``.
 
-Design (consistent with ``core/ping.py`` / ``core/prober.py``)
---------------------------------------------------------------
-* **UI-agnostic, no Qt.** Plain dataclasses + optional ``on_log`` / ``on_result``
-  / ``should_stop`` callbacks. A Qt layer marshals those onto the GUI thread.
+**Phase 2 — Xray end-to-end validation** (:mod:`core.cf_xray_validator`, ported
+from ``internal/xraytest/runner.go``):
+    * For the IPs that pass Phase 1, build the **real** Xray config for the
+      reference profile with the candidate IP swapped in, start the bundled
+      ``xray.exe`` on a private SOCKS port, then send genuine traffic through
+      the proxy (TTFB via ``cp.cloudflare.com/cdn-cgi/trace`` + a download
+      throughput sample). Only IPs that actually carry the user's config
+      end-to-end survive — this is what makes SenPaiScanner trustworthy and is
+      now part of our scanner too.
+
+Design (unchanged, consistent with ``core/ping.py`` / ``core/prober.py``)
+-------------------------------------------------------------------------
+* **UI-agnostic, no Qt.** Plain dataclasses + optional ``on_log`` /
+  ``on_result`` / ``should_stop`` callbacks.
 * **Network is injectable.** The per-IP probe is a callable with a real stdlib
-  default (:func:`tls_ip_probe`), so the whole sweep / ranking logic runs
-  deterministically headless in tests with a fake probe and no sockets.
+  default, so the sweep / ranking logic runs deterministically headless in
+  tests with a fake probe and no sockets.
 * **Bounded & cancellable.** A thread pool with a hard cap, an overall result
   limit, and a cooperative ``should_stop`` so a long scan never runs away.
 
-The IP pool comes from Cloudflare's published ranges (``cf_ip_pool``), expanded
-and shuffled so the scan samples the whole anycast space rather than one block.
+The IP pool comes from Cloudflare's published ranges (``cf_ip_pool``), sampled
+round-robin and shuffled so the scan covers the whole anycast space.
 """
 from __future__ import annotations
 
+import base64 as _b64
 import ipaddress
+import math
+import os as _os
 import random
 import socket
 import ssl
@@ -40,7 +61,8 @@ from typing import Callable, List, Optional, Sequence
 #  Cloudflare published IPv4 ranges (https://www.cloudflare.com/ips-v4)
 # ---------------------------------------------------------------------------
 # Kept inline so the scanner works fully offline. These are the public,
-# well-known Cloudflare anycast ranges the front IPs live in.
+# well-known Cloudflare anycast ranges the front IPs live in. (Mirrors
+# ``internal/ipsrc/ranges_v4.txt`` from SenPaiScanner.)
 CLOUDFLARE_IPV4_CIDRS: tuple[str, ...] = (
     "173.245.48.0/20",
     "103.21.244.0/22",
@@ -60,38 +82,147 @@ CLOUDFLARE_IPV4_CIDRS: tuple[str, ...] = (
 )
 
 
-# probe outcome
+# Well-known Cloudflare hostnames used as SNI values. Rotating the SNI between
+# tries reduces the chance of DPI black-holing a specific name (ported verbatim
+# from SenPaiScanner's ``sniHostnames``). ``speed.cloudflare.com`` leads because
+# it also serves the ``/__down`` speed endpoint used by the download probe.
+SNI_HOSTNAMES: tuple[str, ...] = (
+    "speed.cloudflare.com",
+    "www.cloudflare.com",
+    "cloudflare.com",
+    "1.1.1.1.cdn.cloudflare.net",
+    "blog.cloudflare.com",
+)
+
+
+# Probe modes (mirror prober.Mode in Go).
+MODE_TCP = "tcp"
+MODE_TLS = "tls"
+MODE_HTTP = "http"
+
+
+# probe outcome (kept for backward compatibility with the old API + the UI).
 OK = "ok"
 RST = "rst"
 TIMEOUT = "timeout"
 ERROR = "error"
 
 
+# A genuine Cloudflare edge answers /cdn-cgi/trace with a body containing a
+# ``colo=`` marker, and stamps a ``CF-Ray`` header. Either proves a live edge.
+_CF_TRACE_PATH = "/cdn-cgi/trace"
+_SPEED_DOWN_PATH = "/__down?bytes={n}"
+
+
+# ---------------------------------------------------------------------------
+#  result model
+# ---------------------------------------------------------------------------
+
 @dataclass
 class IPResult:
-    """The result of probing one candidate IP for one config."""
+    """The full measurement for one candidate IP (mirrors ``result.Result``).
+
+    The legacy single-shot fields (``outcome`` / ``latency_ms`` / ``detail``)
+    are kept so existing callers/tests keep working: ``outcome`` is the *summary*
+    outcome (OK when the IP is healthy), and ``latency_ms`` is the average of the
+    successful tries. The richer per-try data lives in :attr:`latencies` and the
+    Cloudflare-edge facts (``tls_ok`` / ``colo`` / ``http_status`` / ``ws_ok`` /
+    ``throughput``).
+    """
 
     ip: str
-    outcome: str = ERROR          # OK / RST / TIMEOUT / ERROR
-    latency_ms: float = 0.0
+    outcome: str = ERROR          # OK / RST / TIMEOUT / ERROR (summary)
+    latency_ms: float = 0.0       # average successful latency (back-compat)
     detail: str = ""
 
+    # --- rich, per-IP statistics (Phase 1) ---
+    port: int = 443
+    mode: str = MODE_HTTP
+    latencies_ms: List[float] = field(default_factory=list)  # 0 == failed try
+    tls_ok: bool = False
+    ws_ok: bool = False
+    require_ws: bool = False
+    http_status: int = 0
+    colo: str = ""
+    throughput_bps: float = 0.0   # bytes/sec from the Phase-1 download sample
+    speed_tested: bool = False
+
+    # --- Phase 2 (real Xray end-to-end validation) ---
+    xray_validated: bool = False  # an Xray validation was attempted
+    xray_ok: bool = False         # the config carried real traffic end-to-end
+    xray_latency_ms: float = 0.0  # TTFB through the proxy
+    xray_throughput_bps: float = 0.0  # download throughput through the proxy
+
+    # ------------------------------------------------------------------
     @property
     def ok(self) -> bool:
         return self.outcome == OK
+
+    # -- statistics (ported from result.go) ----------------------------
+    def loss(self) -> float:
+        """Packet-loss percentage across the tries (0–100)."""
+        if not self.latencies_ms:
+            return 100.0
+        failed = sum(1 for l in self.latencies_ms if l <= 0)
+        return failed / len(self.latencies_ms) * 100.0
+
+    def avg(self) -> float:
+        """Mean of the *successful* latencies (ms); 0 when none succeeded."""
+        good = [l for l in self.latencies_ms if l > 0]
+        return sum(good) / len(good) if good else 0.0
+
+    def best(self) -> float:
+        good = [l for l in self.latencies_ms if l > 0]
+        return min(good) if good else 0.0
+
+    def worst(self) -> float:
+        return max(self.latencies_ms) if self.latencies_ms else 0.0
+
+    def jitter(self) -> float:
+        """Standard deviation of the successful latencies (ms)."""
+        good = [l for l in self.latencies_ms if l > 0]
+        if len(good) < 2:
+            return 0.0
+        mean = sum(good) / len(good)
+        var = sum((l - mean) ** 2 for l in good) / len(good)
+        return math.sqrt(var)
+
+    def is_healthy(self) -> bool:
+        """True when the mode's success criteria are met (mirrors IsHealthy).
+
+        A failed try records latency 0; a timeout must never count as success.
+        For HTTP mode the IP must be a real Cloudflare edge (TLS where the port
+        isn't 80, a 2xx/3xx status, a non-empty ``colo``), and — when a speed
+        sample or WS probe was *required* — those must also have passed.
+        """
+        if self.loss() >= 50.0 or self.avg() <= 0.0:
+            return False
+        if self.mode == MODE_HTTP:
+            if self.port != 80 and not self.tls_ok:
+                return False
+            if self.http_status < 200 or self.http_status >= 400:
+                return False
+            if not self.colo:
+                return False
+            if self.speed_tested and self.throughput_bps <= 0:
+                return False
+            if self.require_ws and not self.ws_ok:
+                return False
+            return True
+        if self.mode == MODE_TLS:
+            return self.tls_ok
+        return True  # tcp
 
 
 @dataclass(frozen=True)
 class ProbeSpec:
     """What a clean IP must satisfy *for this specific config*.
 
-    A bare TLS handshake is **not** a valid test (the bug the user hit): every
-    Cloudflare anycast IP completes a TLS handshake with *any* SNI because the
-    edge always answers — so the old probe reported dozens of "clean" IPs in a
-    few seconds that didn't actually work. Mirroring ``MatinSenPai/SenPaiScanner``
-    we instead require a **real HTTP response from the Cloudflare edge** and,
-    for WebSocket configs, a successful WS upgrade carrying the config's Host /
-    path — exactly the transport the proxy will use.
+    A bare TLS handshake is **not** a valid test: every Cloudflare anycast IP
+    completes a TLS handshake with *any* SNI, so SenPaiScanner (and now us)
+    require a **real HTTP response from the Cloudflare edge** (``/cdn-cgi/trace``
+    carrying a ``colo``) and, for WebSocket configs, a successful WS upgrade on
+    the config's Host + path.
 
     Fields
     ------
@@ -100,8 +231,11 @@ class ProbeSpec:
     host        : HTTP ``Host`` header (ws/h2 host → the Worker hostname).
     path        : ws / xhttp path the config uses (validated on WS upgrade).
     is_ws       : require a WebSocket upgrade (config ``type=ws``/httpupgrade).
-    is_tls      : whether the transport is wrapped in TLS (almost always True
-                  behind Cloudflare; a plain-HTTP edge check is used if False).
+    is_tls      : whether the transport is wrapped in TLS (CDN default True).
+    tries       : connectivity attempts per IP (SNI rotates each try).
+    mode        : ``tcp`` | ``tls`` | ``http`` (http = full edge validation).
+    speed_bytes : optional HTTP download sample size; 0 disables it.
+    require_ws  : require a successful WebSocket probe for HTTP health.
     """
 
     port: int = 443
@@ -110,162 +244,108 @@ class ProbeSpec:
     path: str = "/"
     is_ws: bool = False
     is_tls: bool = True
+    tries: int = 4
+    mode: str = MODE_HTTP
+    speed_bytes: int = 0
+    require_ws: bool = False
 
 
 # (ip, spec, timeout) -> IPResult
 ProbeFn = Callable[[str, "ProbeSpec", float], IPResult]
 
 
-# A working Cloudflare edge answers /cdn-cgi/trace with a body containing the
-# colo marker ``fl=`` and ``h=``. A blocked / black-holed / non-CF host either
-# resets, times out, or returns something without these markers.
-_CF_TRACE_PATH = "/cdn-cgi/trace"
-
+# ---------------------------------------------------------------------------
+#  Phase 1 — connectivity probe (ported from prober.go)
+# ---------------------------------------------------------------------------
 
 def cf_ip_probe(ip: str, spec: "ProbeSpec",
                 timeout: float) -> IPResult:  # pragma: no cover - needs net
-    """Validate *ip* as a clean Cloudflare edge **for this config**.
+    """Run a full Phase-1 measurement session against *ip* (port ``spec.port``).
 
-    Two-stage, real validation (no more false greens):
-
-    1. **Edge liveness** — open TLS to ``ip:port`` presenting the config SNI,
-       send a real HTTP/1.1 ``GET /cdn-cgi/trace`` with the config Host header,
-       and require a ``200`` whose body carries Cloudflare's ``fl=`` colo marker.
-       This proves the IP is a *live, unblocked* Cloudflare edge that will route
-       the config's hostname — something a bare TLS handshake never proved.
-    2. **WebSocket reachability** (only when ``spec.is_ws``) — send a WS
-       ``Upgrade`` request on the config's path/host and require ``101`` (or a
-       Cloudflare ``4xx`` that still proves the WS layer is reachable through
-       this edge). A ws config that can't upgrade here is *not* clean.
-
-    Latency is the time to the first successful response. Any reset / timeout /
-    missing-marker outcome is reported honestly so the IP is dropped.
+    Faithful port of ``prober.Probe``: it runs ``spec.tries`` attempts, rotating
+    the SNI and adding a little jitter between tries, then folds the per-try
+    results into a single :class:`IPResult` whose summary ``outcome`` is ``OK``
+    iff the result is healthy for the chosen mode. Honest latency (the average of
+    the *successful* tries) is reported; failed tries record 0.
     """
-    start = time.monotonic()
-    sni = (spec.server_name or spec.host or "").strip().strip("[]")
-    host_hdr = (spec.host or sni or ip).strip()
+    res = IPResult(ip=ip, port=spec.port, mode=spec.mode,
+                   require_ws=spec.require_ws)
+    if spec.mode == MODE_HTTP and spec.speed_bytes > 0:
+        res.speed_tested = True
 
-    sock = _open_socket(ip, spec.port, timeout)
-    if isinstance(sock, IPResult):
-        return sock  # connect-stage failure already classified
-    # The HONEST latency number is the TCP connect RTT to the edge — NOT the sum
-    # of every validation stage. The trace + (for ws) one or two extra
-    # connect/TLS/upgrade round-trips below are PASS/FAIL checks, so folding
-    # their time into the reported latency made a ws / relay config (AYYILDIZ:
-    # connect→TLS→trace→connect→TLS→ws→connect→TLS→ws-root) report 2000-5000ms
-    # even though its real RTT is well under a second — exactly the "ویتوری زیر
-    # ۱۰۰۰ ولی ما بالای ۳۰۰۰" complaint. Capture the connect RTT here and report
-    # THAT on success; the later stages only decide ok/fail.
-    connect_ms = (time.monotonic() - start) * 1000.0
+    tries = max(1, int(spec.tries))
+    for i in range(tries):
+        sni = spec.server_name
+        if not sni and spec.mode == MODE_HTTP:
+            sni = "speed.cloudflare.com"
+        elif not sni:
+            sni = random.choice(SNI_HOSTNAMES)
 
-    stream = sock
-    try:
-        if spec.is_tls:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            try:
-                stream = ctx.wrap_socket(sock, server_hostname=sni or ip)
-            except socket.timeout:
-                _safe_close(sock)
-                return IPResult(ip, TIMEOUT, detail="tls handshake timeout")
-            except ssl.SSLError as exc:
-                # a TLS *alert* means the edge spoke TLS but rejected us — that
-                # is NOT proof the config works (the old code wrongly counted it
-                # as clean). Treat as unreachable for this config.
-                _safe_close(sock)
-                return IPResult(ip, ERROR,
-                                detail=f"tls rejected: {exc.__class__.__name__}")
-            except OSError as exc:
-                _safe_close(sock)
-                return IPResult(ip, ERROR, detail=f"tls error: {exc}")
+        lat = 0.0
+        tls_ok = False
+        http_status = 0
+        colo = ""
+        throughput = 0.0
 
-        # --- stage 1: HTTP trace — prove it's a live Cloudflare edge ---
-        ok, detail = _http_trace_ok(stream, host_hdr, timeout)
-        if not ok:
-            _safe_close(stream)
-            return IPResult(ip, ERROR, detail=detail)
+        if spec.mode == MODE_TCP:
+            lat = _probe_tcp(ip, spec.port, timeout)
+        elif spec.mode == MODE_TLS:
+            lat, tls_ok = _probe_tls(ip, spec.port, sni, timeout)
+        else:  # MODE_HTTP
+            lat, tls_ok, http_status, colo, throughput, ws_ok = _probe_http(
+                ip, spec.port, sni, timeout, spec.speed_bytes,
+                spec.host, spec.path, spec.is_ws or spec.require_ws,
+                spec.is_tls)
+            if ws_ok:
+                res.ws_ok = True
 
-        # --- stage 2: WebSocket upgrade for ws/httpupgrade configs ---
-        if spec.is_ws:
-            # the trace consumed the first connection; open a fresh one for the
-            # upgrade so half-read state can't confuse it.
-            ws_sock = _open_socket(ip, spec.port, timeout)
-            if isinstance(ws_sock, IPResult):
-                _safe_close(stream)
-                return ws_sock
-            ws_stream = ws_sock
-            if spec.is_tls:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                try:
-                    ws_stream = ctx.wrap_socket(ws_sock,
-                                                server_hostname=sni or ip)
-                except OSError as exc:
-                    _safe_close(ws_sock)
-                    _safe_close(stream)
-                    return IPResult(ip, ERROR, detail=f"ws tls: {exc}")
-            ws_ok, ws_detail = _ws_upgrade_ok(
-                ws_stream, host_hdr, spec.path or "/", timeout)
-            _safe_close(ws_stream)
-            if not ws_ok:
-                # Relay / tunnel-style paths (the user's "AYYILDIZ" config:
-                # ``/stars/http://user:pass@vps.webtun.xyz:2087``) instruct the
-                # Worker to immediately open a *backend* tunnel to another VPS.
-                # A bare, unauthenticated WS probe on such a path is frequently
-                # reset or 5xx'd by the relay logic — even though the config
-                # works end-to-end with a real authenticated client. That false
-                # red is exactly the bug: a long relay path pinged red while the
-                # config connected fine.
-                #
-                # When the real path is a relay path (it embeds a nested URL),
-                # the honest thing to validate is whether the WS layer reaches a
-                # *live Cloudflare edge for this Host* at all — so we retry the
-                # upgrade on the root path ``/``. The edge answering a WS handshake
-                # (101, or a CF 4xx) on ``/`` proves the host route is live; the
-                # nested relay backend is the config's business, not ours.
-                if _is_relay_path(spec.path or "/"):
-                    ws_sock2 = _open_socket(ip, spec.port, timeout)
-                    if not isinstance(ws_sock2, IPResult):
-                        ws_stream2 = ws_sock2
-                        if spec.is_tls:
-                            ctx = ssl.create_default_context()
-                            ctx.check_hostname = False
-                            ctx.verify_mode = ssl.CERT_NONE
-                            try:
-                                ws_stream2 = ctx.wrap_socket(
-                                    ws_sock2, server_hostname=sni or ip)
-                            except OSError:
-                                ws_stream2 = None
-                                _safe_close(ws_sock2)
-                        if ws_stream2 is not None:
-                            ws_ok, ws_detail = _ws_upgrade_ok(
-                                ws_stream2, host_hdr, "/", timeout,
-                                relaxed=True)
-                            _safe_close(ws_stream2)
-                if not ws_ok:
-                    _safe_close(stream)
-                    return IPResult(ip, ERROR, detail=ws_detail)
+        res.latencies_ms.append(lat)
+        if tls_ok:
+            res.tls_ok = True
+        if http_status:
+            res.http_status = http_status
+        if colo:
+            res.colo = colo
+        if throughput > 0:
+            res.throughput_bps = throughput
 
-        # report the TCP connect RTT (true network latency), not the cumulative
-        # multi-stage validation time — see the note at the connect above.
-        _safe_close(stream)
-        kind = "ws+edge" if spec.is_ws else "edge"
-        return IPResult(ip, OK, latency_ms=connect_ms, detail=f"{kind} ok")
-    except socket.timeout:
-        _safe_close(stream)
-        return IPResult(ip, TIMEOUT, detail="response timeout")
-    except ConnectionResetError:
-        _safe_close(stream)
-        return IPResult(ip, RST, detail="reset during probe")
-    except OSError as exc:
-        _safe_close(stream)
-        return IPResult(ip, ERROR, detail=str(exc))
+        # small jitter between tries (10–60ms) to avoid looking like a scanner
+        if i < tries - 1:
+            time.sleep((random.randint(10, 60)) / 1000.0)
+
+    # summarise
+    res.latency_ms = res.avg()
+    healthy = res.is_healthy()
+    if healthy:
+        res.outcome = OK
+        kind = "ws+edge" if (spec.is_ws or spec.require_ws) else "edge"
+        bits = [f"{kind} ok"]
+        if res.colo:
+            bits.append(f"colo={res.colo}")
+        if res.speed_tested and res.throughput_bps > 0:
+            bits.append(f"{_fmt_speed(res.throughput_bps)}")
+        res.detail = "  ".join(bits)
+    else:
+        # classify the failure for the UI / tests
+        if all(l <= 0 for l in res.latencies_ms):
+            res.outcome = TIMEOUT
+            res.detail = "no successful try"
+        elif spec.mode == MODE_HTTP and not res.colo:
+            res.outcome = ERROR
+            res.detail = "not a live cf edge (no colo)"
+        elif spec.require_ws and not res.ws_ok:
+            res.outcome = ERROR
+            res.detail = "ws upgrade refused"
+        elif res.speed_tested and res.throughput_bps <= 0:
+            res.outcome = ERROR
+            res.detail = "edge ok but download stalled"
+        else:
+            res.outcome = ERROR
+            res.detail = res.detail or "unhealthy"
+    return res
 
 
 # Back-compat shim — older callers / tests may still import ``tls_ip_probe``.
-# It now delegates to the honest edge probe so behaviour is consistent.
 def tls_ip_probe(ip: str, port: int, server_name: str,
                  timeout: float) -> IPResult:  # pragma: no cover - needs net
     return cf_ip_probe(
@@ -273,114 +353,374 @@ def tls_ip_probe(ip: str, port: int, server_name: str,
                       host=server_name, is_tls=True), timeout)
 
 
-def _open_socket(ip: str, port: int, timeout: float):  # pragma: no cover - net
-    """Connect a raw TCP socket; return it or a classified failure IPResult."""
-    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    raw.settimeout(timeout)
+def _probe_tcp(ip: str, port: int,
+               timeout: float) -> float:  # pragma: no cover - needs net
+    """Raw TCP connect time in ms; 0 on failure."""
+    start = time.monotonic()
     try:
-        raw.connect((ip, port))
+        with socket.create_connection((ip, port), timeout=timeout):
+            return (time.monotonic() - start) * 1000.0
+    except OSError:
+        return 0.0
+
+
+def _probe_tls(ip: str, port: int, sni: str,
+               timeout: float) -> tuple[float, bool]:  # pragma: no cover - net
+    """TLS handshake time in ms + whether it succeeded."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    except (ValueError, AttributeError):
+        pass
+    start = time.monotonic()
+    try:
+        raw = socket.create_connection((ip, port), timeout=timeout)
+    except OSError:
+        return 0.0, False
+    try:
+        raw.settimeout(timeout)
+        tls = ctx.wrap_socket(raw, server_hostname=sni or ip)
+        lat = (time.monotonic() - start) * 1000.0
+        _safe_close(tls)
+        return lat, True
+    except (ssl.SSLError, socket.timeout, OSError):
+        _safe_close(raw)
+        return 0.0, False
+
+
+def _probe_http(ip: str, port: int, sni: str, timeout: float, speed_bytes: int,
+                ws_host: str, ws_path: str, run_ws: bool,
+                is_tls: bool):  # pragma: no cover - needs net
+    """Full HTTP edge check (port-forced to *ip*) + optional speed/WS probes.
+
+    Returns ``(latency_ms, tls_ok, http_status, colo, throughput_bps, ws_ok)``.
+    Mirrors ``prober.probeHTTP``: a real ``GET /cdn-cgi/trace`` must come back
+    2xx/3xx with a non-empty ``colo`` before we bother with the speed/WS probes.
+    """
+    sock = _open_socket(ip, port, timeout)
+    if sock is None:
+        return 0.0, False, 0, "", 0.0, False
+
+    stream = sock
+    tls_ok = False
+    try:
+        if is_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            try:
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            except (ValueError, AttributeError):
+                pass
+            try:
+                stream = ctx.wrap_socket(sock, server_hostname=sni or ip)
+                tls_ok = True
+            except (ssl.SSLError, socket.timeout, OSError):
+                _safe_close(sock)
+                return 0.0, False, 0, "", 0.0, False
+
+        host_hdr = sni  # trace is fetched against the rotating SNI host
+        start = time.monotonic()
+        status, headers, body = _http_get(stream, _CF_TRACE_PATH, host_hdr,
+                                           timeout, max_bytes=4096)
+        lat = (time.monotonic() - start) * 1000.0
+        _safe_close(stream)
+
+        if status == 0:
+            return 0.0, tls_ok, 0, "", 0.0, False
+
+        colo = _parse_colo_trace(body) or _parse_colo_ray(
+            headers.get("cf-ray", ""))
+
+        throughput = 0.0
+        ws_ok = False
+        if 200 <= status < 400 and colo:
+            if speed_bytes > 0:
+                throughput = _probe_download(ip, port, timeout, speed_bytes,
+                                             is_tls)
+            if speed_bytes > 0 or run_ws:
+                ws_ok = _probe_websocket(ip, port, sni, ws_host, ws_path,
+                                         timeout, is_tls)
+        return lat, tls_ok, status, colo, throughput, ws_ok
+    except (socket.timeout, ConnectionResetError, OSError):
+        _safe_close(stream)
+        return 0.0, tls_ok, 0, "", 0.0, False
+
+
+def _probe_websocket(ip: str, port: int, sni: str, host: str, path: str,
+                     timeout: float,
+                     is_tls: bool) -> bool:  # pragma: no cover - needs net
+    """WebSocket reachability probe (faithful port of ``probeWebSocket``).
+
+    Two checks:
+
+      1. **Idle hold** — after the TLS handshake, hold the connection idle for
+         up to 2 s *without* sending data. Some DPI boxes RST long-lived TLS
+         tunnels that send no early data; if the socket dies during the hold the
+         probe fails. A read *timeout* here is expected (the server only speaks
+         after the upgrade), so only a real error (RST/EOF) fails the probe.
+      2. **Upgrade** — send a WebSocket ``Upgrade`` request and require that *any*
+         HTTP response arrives (even 400/404 — that still proves the WS bytes
+         reached the Cloudflare edge). If DPI drops the upgrade, no ``HTTP/``
+         line comes back and the probe fails.
+
+    TLS verification is skipped here because ``_probe_http`` already validated
+    the certificate for this IP on the same edge.
+    """
+    if timeout <= 0:
+        timeout = 5.0
+    deadline = time.monotonic() + timeout
+    if not host:
+        host = sni
+    path = _normalize_ws_path(path)
+
+    raw = _open_socket(ip, port, timeout)
+    if raw is None:
+        return False
+    conn = raw
+    try:
+        if is_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            try:
+                conn = ctx.wrap_socket(raw, server_hostname=sni or ip)
+            except (ssl.SSLError, socket.timeout, OSError):
+                _safe_close(raw)
+                return False
+
+        # Phase 1: idle hold (detect DPI that RSTs idle TLS tunnels).
+        idle_hold = 2.0
+        remaining = deadline - time.monotonic()
+        if remaining < 2 * idle_hold:
+            idle_hold = max(0.0, remaining / 2)
+        conn.settimeout(max(0.05, idle_hold))
+        try:
+            chunk = conn.recv(1)
+            # An EOF (empty) during the idle hold means the edge closed on us.
+            if chunk == b"":
+                _safe_close(conn)
+                return False
+        except socket.timeout:
+            pass  # EXPECTED — the server speaks only after the upgrade
+        except (ConnectionResetError, OSError):
+            _safe_close(conn)
+            return False
+
+        # Phase 2: send the WebSocket upgrade and require an HTTP response.
+        key = _b64.b64encode(_os.urandom(16)).decode("ascii")
+        ws_req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"User-Agent: senpaiscanner/1.0\r\n"
+            f"\r\n"
+        ).encode("ascii", "ignore")
+
+        write_to = max(0.05, min(timeout / 2, deadline - time.monotonic()))
+        conn.settimeout(write_to)
+        try:
+            conn.sendall(ws_req)
+        except (socket.timeout, ConnectionResetError, OSError):
+            _safe_close(conn)
+            return False
+
+        read_to = max(0.05, min(timeout / 3, deadline - time.monotonic()))
+        conn.settimeout(read_to)
+        try:
+            resp = conn.recv(1024)
+        except (socket.timeout, ConnectionResetError, OSError):
+            _safe_close(conn)
+            return False
+        _safe_close(conn)
+        if not resp:
+            return False
+        return b"HTTP/" in resp
+    except OSError:
+        _safe_close(conn)
+        return False
+
+
+def _probe_download(ip: str, port: int, timeout: float, sample_bytes: int,
+                    is_tls: bool) -> float:  # pragma: no cover - needs net
+    """Fetch a small sample from speed.cloudflare.com (port-forced to *ip*).
+
+    Returns bytes/sec, 0 on failure. Faithful port of ``probeDownload``: it
+    catches IPs that handshake cleanly then stall on real data.
+    """
+    if sample_bytes <= 0:
+        return 0.0
+    sock = _open_socket(ip, port, timeout)
+    if sock is None:
+        return 0.0
+    stream = sock
+    try:
+        if is_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            try:
+                stream = ctx.wrap_socket(
+                    sock, server_hostname="speed.cloudflare.com")
+            except (ssl.SSLError, socket.timeout, OSError):
+                _safe_close(sock)
+                return 0.0
+        path = _SPEED_DOWN_PATH.format(n=sample_bytes)
+        start = time.monotonic()
+        status, _, body = _http_get(stream, path, "speed.cloudflare.com",
+                                    timeout, max_bytes=sample_bytes,
+                                    read_full=True)
+        _safe_close(stream)
+        if status < 200 or status >= 400:
+            return 0.0
+        n = len(body)
+        elapsed = time.monotonic() - start
+        if n <= 0 or elapsed <= 0:
+            return 0.0
+        return n / elapsed
+    except (socket.timeout, ConnectionResetError, OSError):
+        _safe_close(stream)
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+#  raw socket / HTTP helpers
+# ---------------------------------------------------------------------------
+
+def _open_socket(ip: str, port: int,
+                 timeout: float):  # pragma: no cover - needs net
+    """Connect a raw TCP socket; return it or ``None`` on failure."""
+    try:
+        raw = socket.create_connection((ip, port), timeout=timeout)
+        raw.settimeout(timeout)
         return raw
-    except socket.timeout:
-        _safe_close(raw)
-        return IPResult(ip, TIMEOUT, detail="connect timeout")
-    except ConnectionResetError:
-        _safe_close(raw)
-        return IPResult(ip, RST, detail="connection reset")
-    except OSError as exc:
-        _safe_close(raw)
-        return IPResult(ip, ERROR, detail=str(exc))
+    except OSError:
+        return None
 
 
-def _http_trace_ok(stream, host: str,
-                   timeout: float):  # pragma: no cover - needs net
-    """Send GET /cdn-cgi/trace and verify a live Cloudflare-edge response.
+def _http_get(stream, path: str, host: str, timeout: float,
+              max_bytes: int = 4096,
+              read_full: bool = False):  # pragma: no cover - needs net
+    """Send ``GET path`` and read the response.
 
-    Returns ``(ok, detail)``. ``ok`` is True only when the edge returns a
-    real HTTP response that carries Cloudflare's trace markers (``fl=`` colo +
-    ``h=`` host) — the signature of a genuine, unblocked edge that will serve
-    this hostname. Anything else (no response, 5xx with no markers, garbage) is
-    rejected.
+    Returns ``(status, headers_lower, body)``. When *read_full* is True we read
+    up to *max_bytes* of body (used by the download sampler); otherwise we stop
+    as soon as we have the headers plus a little body (enough to spot the colo).
     """
     req = (
-        f"GET {_CF_TRACE_PATH} HTTP/1.1\r\n"
+        f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
-        f"User-Agent: Mozilla/5.0\r\n"
+        f"User-Agent: senpaiscanner/1.0\r\n"
         f"Accept: */*\r\n"
         f"Connection: close\r\n\r\n"
     ).encode("ascii", "ignore")
     try:
         stream.sendall(req)
-    except OSError as exc:
-        return False, f"send failed: {exc}"
-    data = _read_response(stream, timeout, max_bytes=4096)
+    except OSError:
+        return 0, {}, ""
+
+    data = _read_response(stream, timeout, max_bytes=max_bytes,
+                          read_full=read_full)
     if not data:
-        return False, "empty response"
+        return 0, {}, ""
     text = data.decode("latin-1", "ignore")
     head, _, body = text.partition("\r\n\r\n")
-    status_ok = head.startswith("HTTP/1.1 200") or head.startswith("HTTP/1.0 200")
-    # Cloudflare edge marker. ``fl=`` is the edge/colo id; ``h=`` echoes Host.
-    has_marker = ("fl=" in body) or ("fl=" in text and "h=" in text)
-    if status_ok and has_marker:
-        return True, "cf edge trace ok"
-    # Some Cloudflare endpoints front a Worker that 404s /cdn-cgi/trace but the
-    # ``server: cloudflare`` header still proves a live edge that routes Host.
-    if "server: cloudflare" in text.lower():
-        return True, "cf edge (server header)"
-    return False, "not a live cf edge (no trace marker)"
+    lines = head.split("\r\n")
+    status = 0
+    if lines and lines[0].startswith("HTTP/"):
+        parts = lines[0].split(" ", 2)
+        if len(parts) >= 2 and parts[1].isdigit():
+            status = int(parts[1])
+    headers = {}
+    for ln in lines[1:]:
+        k, sep, v = ln.partition(":")
+        if sep:
+            headers[k.strip().lower()] = v.strip()
+    return status, headers, body
 
 
-def _ws_upgrade_ok(stream, host: str, path: str,
-                   timeout: float, relaxed: bool = False):  # pragma: no cover - needs net
-    """Send a WebSocket upgrade and verify the edge accepts/routes it.
-
-    Returns ``(ok, detail)``. ``101 Switching Protocols`` is a clean pass. A
-    Cloudflare ``4xx`` (e.g. the Worker rejecting an unauthenticated upgrade)
-    *with* a cloudflare server header still proves the WS path reaches a live
-    edge for this Host, so it counts — what we're rejecting is the IP that
-    can't carry a WS handshake to this hostname at all.
-
-    ``relaxed`` (relay revalidation on ``/``): also accept any genuine
-    Cloudflare-edge response (e.g. a plain 2xx/3xx) as proof the host route is
-    live, since a relay Worker often serves a landing page instead of upgrading.
-    """
-    import base64 as _b64
-    import os as _os
-
-    key = _b64.b64encode(_os.urandom(16)).decode("ascii")
-    req = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        f"Upgrade: websocket\r\n"
-        f"Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        f"Sec-WebSocket-Version: 13\r\n"
-        f"User-Agent: Mozilla/5.0\r\n\r\n"
-    ).encode("ascii", "ignore")
+def _read_response(stream, timeout: float, max_bytes: int = 4096,
+                   read_full: bool = False):  # pragma: no cover - needs net
+    """Read up to *max_bytes* of an HTTP response, bounded by *timeout*."""
     try:
-        stream.sendall(req)
-    except OSError as exc:
-        return False, f"ws send failed: {exc}"
-    data = _read_response(stream, timeout, max_bytes=2048)
-    if not data:
-        return False, "ws no response"
-    text = data.decode("latin-1", "ignore")
-    if text.startswith("HTTP/1.1 101") or text.startswith("HTTP/1.0 101"):
-        return True, "ws upgrade 101"
-    is_cf = "server: cloudflare" in text.lower() or "cf-ray" in text.lower()
-    # a Cloudflare 4xx still means the WS path reached a live edge for this Host
-    if is_cf and (" 400" in text[:16] or " 401" in text[:16]
-                  or " 403" in text[:16] or " 404" in text[:16]
-                  or " 426" in text[:16]):
-        return True, "ws reachable (cf 4xx)"
-    # relay/tunnel paths: a bare unauthenticated upgrade on the nested-URL path
-    # is routinely answered by the Worker with a plain 2xx/3xx (it serves its
-    # landing page) rather than 101 — yet the host route IS live through this
-    # edge. When the caller flags this as a relay revalidation we accept ANY
-    # genuine Cloudflare-edge response as proof the WS layer reaches the host.
-    if relaxed and is_cf:
-        return True, "ws reachable (cf edge, relay-relaxed)"
-    return False, "ws upgrade refused"
+        stream.settimeout(timeout)
+    except OSError:
+        pass
+    chunks = []
+    total = 0
+    deadline = time.monotonic() + timeout
+    while total < max_bytes and time.monotonic() < deadline:
+        try:
+            chunk = stream.recv(min(8192, max_bytes - total))
+        except (socket.timeout, OSError):
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if not read_full:
+            joined = b"".join(chunks)
+            if b"\r\n\r\n" in joined and total > 200:
+                break
+    return b"".join(chunks)
 
+
+def _parse_colo_trace(body: str) -> str:
+    """Extract the ``colo=`` field from a /cdn-cgi/trace body."""
+    for line in body.split("\n"):
+        line = line.rstrip("\r")
+        if line.startswith("colo="):
+            return line[len("colo="):].strip()
+    return ""
+
+
+def _parse_colo_ray(ray: str) -> str:
+    """Extract a 3-letter colo code from a ``CF-Ray`` header value."""
+    parts = (ray or "").split("-")
+    if len(parts) < 2:
+        return ""
+    colo = parts[-1].strip()
+    if len(colo) < 3:
+        return ""
+    return colo[:3].upper()
+
+
+def _normalize_ws_path(path: str) -> str:
+    if not path:
+        return "/"
+    if not path.startswith("/"):
+        return "/" + path
+    return path
+
+
+def _fmt_speed(bps: float) -> str:
+    """Human-readable throughput (e.g. ``3.2 MB/s``)."""
+    if bps <= 0:
+        return "—"
+    units = ("B/s", "KB/s", "MB/s", "GB/s")
+    val = float(bps)
+    i = 0
+    while val >= 1024 and i < len(units) - 1:
+        val /= 1024.0
+        i += 1
+    return f"{val:.1f} {units[i]}"
+
+
+def _safe_close(sock) -> None:
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+#  relay-path / Cloudflare-host helpers (kept for compatibility)
+# ---------------------------------------------------------------------------
 
 def _is_relay_path(path: str) -> bool:
     """True for Worker *relay* paths that embed a nested backend URL.
@@ -389,16 +729,15 @@ def _is_relay_path(path: str) -> bool:
     ``/stars/http://user:pass@vps.webtun.xyz:2087`` — the Worker reads the
     embedded URL and tunnels to that backend. A bare, unauthenticated WS probe
     on such a path is often reset/refused by the relay even when the config
-    works, so the prober treats these paths leniently (re-validating on ``/``).
+    works end-to-end (which is exactly why Phase 2's real Xray validation is the
+    authoritative check for these configs).
     """
     p = (path or "").lower()
     return ("http://" in p) or ("https://" in p) or ("@" in p and ":" in p)
 
 
 # Hostnames that are *always* fronted by Cloudflare — a bare TLS handshake to
-# them proves nothing about whether the specific Worker/Pages route works (the
-# anycast edge answers TLS for any SNI). These must be validated by the edge
-# probe only, never by a TLS-handshake latency fallback.
+# them proves nothing about whether the specific Worker/Pages route works.
 _CLOUDFLARE_HOST_SUFFIXES: tuple[str, ...] = (
     ".pages.dev",
     ".workers.dev",
@@ -411,21 +750,12 @@ _CLOUDFLARE_HOST_SUFFIXES: tuple[str, ...] = (
 def is_cloudflare_host(host: str) -> bool:
     """True when *host* is served by Cloudflare's anycast edge.
 
-    Used to decide whether a bare TLS-handshake latency is *honest* evidence
-    that a config works. For a Cloudflare-fronted host it is NOT — every anycast
-    IP completes a TLS handshake for any SNI, so a broken Worker/Pages route
-    still "handshakes" (the 电信-SIN-07 / AYYILDIZ false-green). For such hosts
-    only the real edge probe (trace + ws upgrade) may decide green. A direct
-    (non-CF) VPS, by contrast, only answers TLS when it is genuinely alive, so
-    the fallback stays meaningful there.
-
     Accepts an IP literal (checked against the published Cloudflare ranges) or a
     hostname (checked against well-known Cloudflare suffixes).
     """
     h = (host or "").strip().strip("[]").lower()
     if not h:
         return False
-    # IP literal → is it inside a published Cloudflare range?
     try:
         addr = ipaddress.ip_address(h)
         for cidr in CLOUDFLARE_IPV4_CIDRS:
@@ -437,50 +767,12 @@ def is_cloudflare_host(host: str) -> bool:
         return False
     except ValueError:
         pass
-    # hostname → known Cloudflare-fronted suffix
     return any(h == s.lstrip(".") or h.endswith(s)
                for s in _CLOUDFLARE_HOST_SUFFIXES)
 
 
-def _read_response(stream, timeout: float,
-                   max_bytes: int = 4096):  # pragma: no cover - needs net
-    """Read up to *max_bytes* of an HTTP response (until headers+a bit of body).
-
-    Stops as soon as we have the status line plus enough body to look for the
-    Cloudflare markers, or when the peer closes / times out. Bounded so a
-    chunked/streaming Worker can't hang the probe.
-    """
-    stream.settimeout(timeout)
-    chunks = []
-    total = 0
-    deadline = time.monotonic() + timeout
-    while total < max_bytes and time.monotonic() < deadline:
-        try:
-            chunk = stream.recv(min(2048, max_bytes - total))
-        except socket.timeout:
-            break
-        except OSError:
-            break
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-        joined = b"".join(chunks)
-        # once we have headers + a little body, the markers (if any) are present
-        if b"\r\n\r\n" in joined and total > 200:
-            break
-    return b"".join(chunks)
-
-
-def _safe_close(sock) -> None:
-    try:
-        sock.close()
-    except OSError:
-        pass
-
-
 # ---------------------------------------------------------------------------
-#  IP pool generation
+#  IP pool generation (ported from ipsrc.go)
 # ---------------------------------------------------------------------------
 
 def cf_ip_pool(count: int = 512,
@@ -503,14 +795,12 @@ def cf_ip_pool(count: int = 512,
         return []
     out: List[str] = []
     seen: set[str] = set()
-    # round-robin across networks so no single big block dominates the sample
     guard = count * 20  # avoid an infinite loop on tiny pools
     i = 0
     while len(out) < count and guard > 0:
         net = networks[i % len(networks)]
         i += 1
         guard -= 1
-        # random host inside this network (skip network/broadcast for /<31)
         size = net.num_addresses
         if size <= 2:
             host_int = int(net.network_address)
@@ -535,8 +825,14 @@ class ScanConfig:
 
     The ``port`` / ``server_name`` / ``host`` / ``path`` / ``is_ws`` / ``is_tls``
     fields describe exactly what a clean IP must satisfy *for the config being
-    tested* — they feed straight into the :class:`ProbeSpec` so the validation
-    is config-accurate (no more false greens from a bare TLS handshake).
+    tested* — they feed straight into the :class:`ProbeSpec`.
+
+    SenPaiScanner extras
+    --------------------
+    tries       : Phase-1 connectivity attempts per IP (SNI rotates each try).
+    mode        : ``tcp`` | ``tls`` | ``http`` (http = full edge validation).
+    speed_bytes : Phase-1 download sample size (0 disables the speed probe).
+    require_ws  : require a successful WebSocket probe for HTTP health.
     """
 
     port: int = 443
@@ -545,17 +841,24 @@ class ScanConfig:
     path: str = "/"              # ws/xhttp path
     is_ws: bool = False          # require a real WebSocket upgrade
     is_tls: bool = True          # transport wrapped in TLS (CDN default)
-    timeout: float = 3.0          # per-IP probe timeout (seconds)
+    timeout: float = 5.0          # per-IP probe timeout (seconds)
     concurrency: int = 64         # parallel probes
     max_candidates: int = 512     # how many IPs to sample/test
     max_results: int = 20         # stop after this many clean IPs found
     max_latency_ms: float = 0.0   # 0 = no cap; else drop slower-than IPs
+    # --- SenPaiScanner Phase-1 tunables ---
+    tries: int = 4
+    mode: str = MODE_HTTP
+    speed_bytes: int = 0
+    require_ws: bool = False
 
     def to_spec(self) -> "ProbeSpec":
         return ProbeSpec(
             port=self.port, server_name=self.server_name,
             host=self.host or self.server_name, path=self.path or "/",
-            is_ws=self.is_ws, is_tls=self.is_tls)
+            is_ws=self.is_ws, is_tls=self.is_tls, tries=self.tries,
+            mode=self.mode, speed_bytes=self.speed_bytes,
+            require_ws=self.require_ws or self.is_ws)
 
 
 @dataclass
@@ -569,9 +872,9 @@ class ScanReport:
 
     @property
     def clean(self) -> List[IPResult]:
-        """Clean IPs sorted fastest-first."""
+        """Clean IPs sorted best-first (lowest avg latency)."""
         return sorted((r for r in self.results if r.ok),
-                      key=lambda r: r.latency_ms)
+                      key=lambda r: (r.latency_ms or r.avg() or 1e9))
 
 
 class CFScanner:
@@ -579,13 +882,18 @@ class CFScanner:
 
     Parameters
     ----------
-    probe_fn     : per-IP probe (injectable). Default real :func:`cf_ip_probe`.
+    probe_fn     : per-IP Phase-1 probe (injectable). Default :func:`cf_ip_probe`.
                    Signature ``(ip, spec, timeout) -> IPResult``. Tests inject a
                    deterministic fake.
     on_log       : optional ``str -> None`` progress callback.
     on_result    : optional ``IPResult -> None`` fired for each clean hit as it
                    is found (lets the UI stream results live).
     should_stop  : optional ``() -> bool`` polled to cancel the scan early.
+    on_phase     : optional ``str -> None`` fired when the scan advances phases.
+    on_progress  : optional ``(tested, total, found, last_ip, last_ok) -> None``
+                   fired after **every** probe completes — even failed ones —
+                   so the UI can show a live "X / Y" counter + progress bar and
+                   the user never wonders whether the scan is stuck.
     """
 
     def __init__(
@@ -595,17 +903,37 @@ class CFScanner:
         on_log: Optional[Callable[[str], None]] = None,
         on_result: Optional[Callable[[IPResult], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        on_phase: Optional[Callable[[str], None]] = None,
+        on_progress: Optional[
+            Callable[[int, int, int, str, bool], None]] = None,
     ) -> None:
         self.probe_fn = probe_fn
         self._on_log = on_log
         self._on_result = on_result
         self._should_stop = should_stop
+        self._on_phase = on_phase
+        self._on_progress = on_progress
         self._stop_flag = threading.Event()
 
     def _log(self, msg: str) -> None:
         if self._on_log:
             try:
                 self._on_log(msg)
+            except Exception:
+                pass
+
+    def _phase(self, msg: str) -> None:
+        if self._on_phase:
+            try:
+                self._on_phase(msg)
+            except Exception:
+                pass
+
+    def _progress(self, tested: int, total: int, found: int,
+                  last_ip: str, last_ok: bool) -> None:
+        if self._on_progress:
+            try:
+                self._on_progress(tested, total, found, last_ip, last_ok)
             except Exception:
                 pass
 
@@ -624,7 +952,7 @@ class CFScanner:
 
     def scan(self, cfg: ScanConfig,
              ips: Optional[Sequence[str]] = None) -> ScanReport:
-        """Run the sweep. Blocking — call on a worker thread.
+        """Run the Phase-1 sweep. Blocking — call on a worker thread.
 
         *ips* lets the caller supply an explicit candidate list (tests / custom
         pools); otherwise a fresh Cloudflare sample of ``cfg.max_candidates`` is
@@ -636,10 +964,13 @@ class CFScanner:
         if not candidates or not (0 < cfg.port < 65536):
             self._log("اسکن لغو شد — لیست IP یا پورت نامعتبر است")
             return report
-        ws_note = " · WS" if cfg.is_ws else ""
-        self._log(f"شروع اسکن {len(candidates)} IP کلودفلر روی پورت "
-                  f"{cfg.port} (SNI: {cfg.server_name or '—'}{ws_note}) …")
+        ws_note = " · WS" if (cfg.is_ws or cfg.require_ws) else ""
+        self._phase("phase1")
+        self._log(f"فاز ۱ — پروب اتصال {len(candidates)} IP کلودفلر روی پورت "
+                  f"{cfg.port} (SNI: {cfg.server_name or '—'}{ws_note}, "
+                  f"تلاش: {cfg.tries}) …")
 
+        total = len(candidates)
         workers = max(1, min(int(cfg.concurrency), 256))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
@@ -653,29 +984,36 @@ class CFScanner:
                         break
                     res = fut.result()
                     report.tested += 1
+                    found = len([r for r in report.results if r.ok])
                     if res is None:
+                        # cancelled probe — still tick the progress bar
+                        self._progress(report.tested, total, found, "", False)
                         continue
-                    if res.ok and self._accept(res, cfg):
+                    accepted = res.ok and self._accept(res, cfg)
+                    if accepted:
                         report.results.append(res)
+                        found += 1
+                        extra = f" · {res.detail}" if res.detail else ""
                         self._log(f"✓ IP تمیز: {res.ip} "
-                                  f"({res.latency_ms:.0f}ms)")
+                                  f"({res.latency_ms:.0f}ms{extra})")
                         if self._on_result:
                             try:
                                 self._on_result(res)
                             except Exception:
                                 pass
-                        if (cfg.max_results > 0
-                                and len([r for r in report.results if r.ok])
-                                >= cfg.max_results):
-                            report.stopped_early = True
-                            break
+                    # always report progress so the UI shows live activity
+                    self._progress(report.tested, total, found,
+                                   res.ip, accepted)
+                    if (accepted and cfg.max_results > 0
+                            and found >= cfg.max_results):
+                        report.stopped_early = True
+                        break
             finally:
-                # don't wait on the remaining probes once we've decided to stop
                 for fut in futures:
                     fut.cancel()
 
         clean = report.clean
-        self._log(f"اسکن تمام شد — {len(clean)} IP تمیز از "
+        self._log(f"فاز ۱ تمام شد — {len(clean)} IP تمیز از "
                   f"{report.tested} IP آزمایش‌شده پیدا شد")
         return report
 
@@ -702,10 +1040,8 @@ def scan_config_from_profile(profile, **overrides) -> ScanConfig:
 
     The clean IP must answer on the *same port* the config dials, accept the
     *same SNI* the config presents, and — for a WebSocket config — carry a WS
-    upgrade on the config's Host + path. We pull all of that from the profile so
-    the validation matches what the real session needs (mirroring SenPaiScanner:
-    a ws config is only "clean" on an IP where the WS upgrade actually reaches
-    the edge). ``overrides`` tweak any field (timeout / concurrency / limits).
+    upgrade on the config's Host + path. ``overrides`` tweak any field
+    (timeout / concurrency / limits / tries / speed_bytes …).
     """
     port = int(getattr(profile, "port", 0) or 443)
     sni = (getattr(profile, "sni", "") or getattr(profile, "host", "")
@@ -716,7 +1052,8 @@ def scan_config_from_profile(profile, **overrides) -> ScanConfig:
     is_ws = transport in ("ws", "websocket", "httpupgrade")
     is_tls = bool(getattr(profile, "is_tls", True))
     cfg = ScanConfig(port=port, server_name=str(sni), host=str(host),
-                     path=str(path), is_ws=is_ws, is_tls=is_tls)
+                     path=str(path), is_ws=is_ws, is_tls=is_tls,
+                     require_ws=is_ws)
     for k, v in overrides.items():
         if hasattr(cfg, k) and v is not None:
             setattr(cfg, k, v)
@@ -738,7 +1075,5 @@ def profile_with_ip(profile, ip: str, *, suffix: str = ""):
     base_remark = data.get("remark", "") or "config"
     tag = suffix or f"CF {ip}"
     data["remark"] = f"{base_remark} · {tag}"
-    # the raw share link no longer matches the swapped address; clear it so the
-    # profile is regenerated cleanly on export.
     data["raw"] = ""
     return Profile.from_dict(data)

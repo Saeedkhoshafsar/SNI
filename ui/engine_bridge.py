@@ -95,29 +95,34 @@ class EngineBridge(QObject):
         except Exception as exc:
             return (False, None, f"{type(exc).__name__}: {exc}")
 
-    def measure_profile_delay(self, profile, *, timeout: float = 12.0):
+    def measure_profile_delay(self, profile, *, timeout: float = 12.0,
+                              deadline=None):
         """v2rayNG-style REAL delay for an inactive profile (temporary core).
 
         Spins the config's own outbound up on throwaway ports, fetches a
         body-verified URL through it, returns ``(ok, latency_ms|None, detail)``.
+        ``deadline`` (seconds) hard-caps the whole measurement so a broken
+        config is declared dead in a few seconds, not after a minute.
         """
         try:
             return self.controller.measure_profile_delay(
-                profile, timeout=timeout)
+                profile, timeout=timeout, deadline=deadline)
         except Exception as exc:
             return (False, None, f"{type(exc).__name__}: {exc}")
 
     def measure_profile_download(self, profile, *, duration: float = 8.0,
-                                 max_bytes: int = 12_000_000):
+                                 max_bytes: int = 12_000_000, deadline=None):
         """v2rayNG-style DOWNLOAD speed test for an inactive profile.
 
         Streams real bytes THROUGH the config's own temporary core for a window
         and returns ``(ok, mbps|None, detail)``. Far more resistant to fast
-        false-negatives than a one-shot delay ping.
+        false-negatives than a one-shot delay ping. ``deadline`` (seconds)
+        hard-caps the whole test so a dead config can't hang for a minute.
         """
         try:
             return self.controller.measure_profile_download(
-                profile, duration=duration, max_bytes=max_bytes)
+                profile, duration=duration, max_bytes=max_bytes,
+                deadline=deadline)
         except Exception as exc:
             return (False, None, f"{type(exc).__name__}: {exc}")
 
