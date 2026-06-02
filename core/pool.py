@@ -58,6 +58,16 @@ FAILOVER_THRESHOLD: int = 3
 FAILOVER_WINDOW: float = 30.0
 
 
+# --- background-optimiser promotion policy (redesign) -----------------------
+# The optimiser only swaps the live route for a candidate that is *strictly*
+# better. A healthy incumbent gets a margin advantage so tiny probe jitter never
+# triggers churn (the "suddenly good / suddenly bad" complaint). A candidate
+# must beat the incumbent's loss by at least this margin AND have been probed
+# enough times to be trustworthy.
+PROMOTE_MARGIN: float = 0.15          # candidate.loss must be ≥ this lower
+PROMOTE_MIN_PROBES: int = 3           # min probes before a candidate is trusted
+
+
 # ---------------------------------------------------------------------------
 # Default real probe (stdlib only; not exercised in sandbox tests)
 # ---------------------------------------------------------------------------
@@ -842,6 +852,70 @@ class ConnectionManager:
     def report_success(self, ps: PairStats) -> None:
         """Notify the tracker that a connection on ``ps`` succeeded."""
         self.tracker.record_success(ps.ip)
+
+    # ------------------------------------------------------------------
+    # Background-optimiser interface (redesign)
+    # ------------------------------------------------------------------
+
+    def best_candidate(self) -> Optional[PairStats]:
+        """Return the single best *stable* pair the optimiser has found, or None.
+
+        "Best" = alive, probed enough times to be trusted, not currently in
+        rapid-failover, and lowest combined-loss. This is what the engine's
+        promoter compares against the live route. We never return an unprobed or
+        dead pair — promoting one of those would just reintroduce the cold-pool
+        TimeoutError problem.
+        """
+        best: Optional[PairStats] = None
+        for ps in self.explorer.stable_stats():
+            if ps.probes_sent < PROMOTE_MIN_PROBES:
+                continue
+            if self.tracker.should_failover(ps.ip):
+                continue
+            if best is None or ps.combined_loss_rate < best.combined_loss_rate:
+                best = ps
+        return best
+
+    def lookup_pair(self, ip: str, sni: str) -> Optional[PairStats]:
+        """Return the :class:`PairStats` for an (ip, sni) if it lives in the pool."""
+        return self.explorer.stats.get((ip, sni))
+
+    def find_better_route(
+        self,
+        current_ip: str,
+        current_sni: str,
+        *,
+        current_healthy: bool,
+    ) -> Optional[PairStats]:
+        """Two-mode promotion decision used by the engine's background promoter.
+
+        * **Healthy incumbent** (``current_healthy=True``): only return a
+          candidate that beats the current route's combined-loss by at least
+          :data:`PROMOTE_MARGIN` — a conservative upgrade that ignores jitter so
+          a working route is never disturbed for a marginal gain.
+
+        * **Broken incumbent** (``current_healthy=False``): the current route is
+          failing, so return the best stable candidate *as soon as one exists*
+          (emergency replacement) — anything trusted is better than a route that
+          doesn't work. This is the "no working single route ⇒ swap in the first
+          good thing, then keep upgrading" case.
+
+        Returns ``None`` when no swap is warranted.
+        """
+        cand = self.best_candidate()
+        if cand is None:
+            return None
+        # never "upgrade" to the route we're already on
+        if cand.ip == current_ip and cand.sni == current_sni:
+            return None
+        if not current_healthy:
+            return cand
+        # healthy incumbent → require a strict margin over the current route
+        cur = self.lookup_pair(current_ip, current_sni)
+        cur_loss = cur.combined_loss_rate if (cur is not None and cur.probed) else 0.0
+        if cand.combined_loss_rate <= cur_loss - PROMOTE_MARGIN:
+            return cand
+        return None
 
 
 # ---------------------------------------------------------------------------

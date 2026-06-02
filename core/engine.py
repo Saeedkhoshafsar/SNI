@@ -80,6 +80,11 @@ class EngineController:
         self._prober = None           # core.prober.AutoProber (when enabled)
         self._resilience = None       # core.resilience.ResilienceController
         self.conn_manager = None      # core.pool.ConnectionManager (multi-IP/SNI)
+        self._promoter_thread = None  # background route-promoter (redesign)
+        self._promoter_stop = None    # threading.Event for the promoter loop
+        # Optional callback the UI sets so the engine can persist a newly-found
+        # best route into config.json (per-config best-result persistence).
+        self.on_save_config = None
         self._system_proxy = None     # core.system_proxy.SystemProxy (when on)
         self._spoof_port: Optional[int] = None
         self._status = STATUS_IDLE
@@ -1337,6 +1342,18 @@ class EngineController:
         """
         # stop / forget any pool from a previous session first
         self._stop_pool()
+        # REDESIGN: the pool is a background optimiser. If the user turned the
+        # optimiser checkbox off, we run the single fixed route only — no pool,
+        # no testing at all.
+        try:
+            opt_on = self.config.get("POOL_OPTIMIZE_ENABLED", True)
+        except Exception:
+            opt_on = True
+        if not opt_on:
+            self._spoof_log("بهینه‌ساز مسیر خاموش است — فقط مسیر تکیِ ثابت "
+                            "استفاده می‌شود (بدون تست).")
+            self.conn_manager = None
+            return
         try:
             from core.pool import build_connection_manager
 
@@ -1357,8 +1374,9 @@ class EngineController:
             self.conn_manager = mgr
             n_pairs = len(mgr.explorer.stats)
             self._spoof_log(
-                f"استخر مسیرها فعال شد: {n_pairs} مسیر (IP×SNI) — "
-                f"بررسی سلامت هر {int(mgr.interval)} ثانیه، انتخاب وزن‌دار.")
+                f"بهینه‌ساز مسیر فعال شد: {n_pairs} مسیر (IP×SNI) در پس‌زمینه "
+                f"تست می‌شوند (هر {int(mgr.interval)} ثانیه). اتصال با مسیر "
+                f"فعلی برقرار است؛ مسیر بهتر بدون قطع جایگزین می‌شود.")
             # start the background health loop (daemon thread; safe to stop()).
             mgr.start_health_loop()
         except Exception as exc:  # pool must never block Start
@@ -1367,6 +1385,7 @@ class EngineController:
 
     def _stop_pool(self) -> None:
         """Stop the route-pool health loop and forget the manager."""
+        self._stop_promoter()
         mgr = self.conn_manager
         if mgr is not None:
             try:
@@ -1374,6 +1393,128 @@ class EngineController:
             except Exception:
                 pass
         self.conn_manager = None
+
+    # ------------------------------------------------------------ optimiser
+    # Background route-promoter (redesign): watches pool probes and swaps the
+    # spoofer's live route losslessly when a strictly-better one is found.
+
+    def _config_identity(self) -> str:
+        """Stable per-config key for best-result persistence (mirrors store)."""
+        try:
+            ips = ",".join(sorted(set(
+                [str(x).strip() for x in (self.config.get("CONNECT_IPS") or [])
+                 if str(x).strip()]
+                or [str(self.config.get("CONNECT_IP", "")).strip()])))
+            snis = ",".join(sorted(set(
+                [str(x).strip() for x in (self.config.get("FAKE_SNIS") or [])
+                 if str(x).strip()]
+                or [str(self.config.get("FAKE_SNI", "")).strip()])))
+            port = self.config.get("CONNECT_PORT", 443)
+            return f"{ips}|{snis}|{port}"
+        except Exception:
+            return ""
+
+    def _load_best_default(self) -> dict | None:
+        """Return the saved best (IP, SNI) record for the current config, or None.
+
+        Only consulted when the optimiser is enabled — when off we honour the
+        user's fixed single route exactly as configured.
+        """
+        if not self.config.get("POOL_OPTIMIZE_ENABLED", True):
+            return None
+        store = self.config.get("POOL_BEST_RESULTS") or {}
+        if not isinstance(store, dict):
+            return None
+        rec = store.get(self._config_identity())
+        if isinstance(rec, dict) and rec.get("ip") and rec.get("sni"):
+            return rec
+        return None
+
+    def _save_best_result(self, ip: str, sni: str, loss: float) -> None:
+        """Persist the best (IP, SNI) for this config into the live config dict.
+
+        Writes back into ``self.config`` (the UI/store shares this dict) so the
+        next Start with the same config loads it as the default route. Best-effort.
+        """
+        ip = str(ip).strip()
+        sni = str(sni).strip()
+        if not ip or not sni:
+            return
+        try:
+            import time as _time
+            store = self.config.get("POOL_BEST_RESULTS")
+            if not isinstance(store, dict):
+                store = {}
+            key = self._config_identity()
+            prev = store.get(key)
+            if isinstance(prev, dict) and isinstance(prev.get("loss"), (int, float)):
+                if (prev.get("ip") == ip and prev.get("sni") == sni
+                        and float(loss) > float(prev["loss"])):
+                    loss = float(prev["loss"])
+            store[key] = {"ip": ip, "sni": sni, "loss": float(loss),
+                          "ts": _time.time()}
+            self.config["POOL_BEST_RESULTS"] = store
+            cb = getattr(self, "on_save_config", None)
+            if callable(cb):
+                cb()
+        except Exception:
+            pass
+
+    def _start_promoter(self) -> None:
+        """Start the background promoter daemon thread (no-op if no pool)."""
+        if self.conn_manager is None:
+            return
+        self._promoter_stop = threading.Event()
+        self._promoter_thread = threading.Thread(
+            target=self._run_promoter, name="snispf-promoter", daemon=True)
+        self._promoter_thread.start()
+
+    def _stop_promoter(self) -> None:
+        """Signal the promoter loop to exit (best-effort, non-blocking)."""
+        ev = getattr(self, "_promoter_stop", None)
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+
+    def _run_promoter(self) -> None:
+        """Background loop: swap the live route to a strictly-better one.
+
+        Two modes (see ConnectionManager.find_better_route):
+          * incumbent healthy → only swap on a strict margin (conservative).
+          * incumbent broken  → swap to the first good route (emergency), then
+            keep upgrading as better routes are found.
+        Each successful swap is persisted as this config's best so the next
+        connection starts from it.
+        """
+        mgr = self.conn_manager
+        proxy = self._proxy
+        if mgr is None or proxy is None:
+            return
+        ev = self._promoter_stop
+        # poll a bit faster than the health interval so improvements land soon
+        period = max(3.0, float(getattr(mgr, "interval", 30.0)) / 3.0)
+        while not ev.wait(period):
+            try:
+                cur_ip, cur_sni = proxy.current_route()
+                # Is the current route healthy? Use the per-IP failover tracker
+                # (rapid real-traffic failures) as the "broken" signal.
+                try:
+                    cur_healthy = not mgr.tracker.should_failover(cur_ip)
+                except Exception:
+                    cur_healthy = True
+                better = mgr.find_better_route(
+                    cur_ip, cur_sni, current_healthy=cur_healthy)
+                if better is None:
+                    continue
+                swapped = proxy.apply_route(better.ip, better.sni, pair=better)
+                if swapped:
+                    self._save_best_result(
+                        better.ip, better.sni, better.combined_loss_rate)
+            except Exception:
+                # never let the optimiser crash the session
+                continue
 
     def _start_core_only(self, epoch: int | None = None) -> None:
         """Plain Tunnel: run xray-core alone, connecting straight to the server.
@@ -1595,6 +1736,25 @@ class EngineController:
                 "این حالت از اسپوفر و درایور WinDivert استفاده می‌کند و "
                 "به دسترسی Administrator نیاز دارد.")
 
+        # --- 1b. per-config best-result default (redesign) ---
+        # If the optimiser previously found a best (IP, SNI) for THIS config,
+        # load it as the default route so we never search from scratch again —
+        # the best result of the last connection becomes the startup route. The
+        # explicit config CONNECT_IP / FAKE_SNI still wins if the user pinned one
+        # (we only override when the saved best differs and the config didn't
+        # force a specific value beyond the profile default).
+        try:
+            best = self._load_best_default()
+            if best is not None:
+                b_ip, b_sni = best.get("ip"), best.get("sni")
+                if b_ip and b_sni and (b_ip != connect_ip or b_sni != fake_sni):
+                    self._spoof_log(
+                        f"بهترین نتیجهٔ ذخیره‌شدهٔ این کانفیگ بارگذاری شد: "
+                        f"{b_ip} (SNI: {b_sni}) — به‌عنوان مسیر پیش‌فرض.")
+                    connect_ip, fake_sni = b_ip, b_sni
+        except Exception:
+            pass
+
         # --- 2. build + start the spoofer (main.ProxyServer) ---
         proxy_cfg = {
             "LISTEN_HOST": "127.0.0.1" if use_core
@@ -1627,10 +1787,21 @@ class EngineController:
         # hand the spoofer the resilience controller if it knows how to use one
         if self._resilience is not None and hasattr(self._proxy, "resilience"):
             self._proxy.resilience = self._resilience
-        # hand the spoofer the route pool (if any) — it picks (IP, SNI) per
-        # connection and feeds outcomes back so weak routes get drained.
+        # hand the spoofer the route pool (if any). REDESIGN: the pool no longer
+        # picks per-connection — the spoofer always uses its primary route
+        # (connect_ip/fake_sni, starting from the known-working single route).
+        # We just hand the manager over so real-traffic outcomes are scored, and
+        # we bind the primary route's PairStats (if it lives in the pool) so
+        # those outcomes attribute to the right pair. The background promoter
+        # (below) does the lossless swapping.
         if self.conn_manager is not None and hasattr(self._proxy, "conn_manager"):
             self._proxy.conn_manager = self.conn_manager
+            try:
+                ps = self.conn_manager.lookup_pair(connect_ip, fake_sni)
+                if ps is not None and hasattr(self._proxy, "_active_pair"):
+                    self._proxy._active_pair = ps
+            except Exception:
+                pass
         self._proxy.on_log = self._spoof_log
         self._proxy.on_status_change = self._on_proxy_status
         self._proxy.on_connection_count_change = self._emit_count
@@ -1652,6 +1823,15 @@ class EngineController:
             self.stop()
             self._set_status(STATUS_ERROR)
             return
+
+        # --- 2b. background route optimiser (redesign) ---
+        # The spoofer is up and serving on the primary route. Now start the
+        # promoter: it watches the pool's probes in the background and swaps in a
+        # strictly-better route *losslessly* (new connections only), persisting
+        # each improvement as this config's best. Gated on the POOL_OPTIMIZE
+        # checkbox — when off, no testing happens and the single fixed route is
+        # all we ever use.
+        self._start_promoter()
 
         # --- 3. chain xray core in front of the spoofer ---
         # Reached for spoof configs (127.0.0.1:40443 links) and the explicit

@@ -101,6 +101,11 @@ class ProxyServer:
         self.connect_ip = config["CONNECT_IP"]
         self.connect_port = config["CONNECT_PORT"]
         self.interface_ipv4 = get_default_interface_ipv4(self.connect_ip)
+        # Lock guarding live route swaps (apply_route). The background optimiser
+        # may swap connect_ip/fake_sni from another thread; new connections read
+        # them under this lock so the swap is atomic and lossless (in-flight
+        # connections keep the route they already captured).
+        self._route_lock = threading.Lock()
         self.data_mode = "tls"
         self.bypass_method = "wrong_seq"
         self.gaming_mode = config.get("gaming_mode", False)
@@ -136,12 +141,18 @@ class ProxyServer:
         self.resilience = None
 
         # optional multi-IP / multi-SNI route pool (core.pool.ConnectionManager)
-        # handed in by the engine. When present, every connection picks its
-        # (IP, SNI) from the pool's weighted-random picker instead of the fixed
-        # ``connect_ip`` / ``fake_sni``, and the outcome is fed back so the pool
-        # can drain degraded routes. ``None`` → legacy single-target behaviour
-        # (zero overhead). See core/pool.py + engine integration (7.7).
+        # handed in by the engine. REDESIGN: the pool is now a BACKGROUND
+        # optimiser only — it never picks the route per-connection. Every
+        # connection uses the current primary route (``connect_ip`` /
+        # ``fake_sni``), which starts as the known-working single route and is
+        # swapped *losslessly* by the engine's promoter (via ``apply_route``)
+        # only when the pool finds a strictly-better route. The forwarder still
+        # feeds real-traffic outcomes back to the pool so it can score routes.
         self.conn_manager = None
+        # The PairStats object for the currently-active primary route, if it
+        # lives in the pool. Set by ``apply_route`` so real-traffic outcomes are
+        # attributed to the right pair. ``None`` ⇒ score by (ip, sni) lookup.
+        self._active_pair = None
 
         # Startup handshake: ``start()`` blocks on this until the listen socket
         # is actually bound (or the bind failed). Without it the engine would
@@ -155,6 +166,48 @@ class ProxyServer:
         self.on_status_change = None
         self.on_connection_count_change = None
         self.on_traffic = None   # (up_bytes, down_bytes, up_bps, down_bps)
+
+    # ----------------------------------------------------------- route swapping
+
+    def apply_route(self, ip: str, sni, *, pair=None) -> bool:
+        """Atomically swap the primary route for **new** connections (lossless).
+
+        Called by the engine's background optimiser when it finds a strictly-
+        better route. In-flight connections are untouched — they already
+        captured the previous route under ``_route_lock`` — so the swap never
+        disconnects the user. Returns ``True`` if the route actually changed.
+
+        ``sni`` may be ``str`` or ``bytes``; it is normalised to ``bytes`` to
+        match :data:`fake_sni`. ``pair`` is the optional :class:`PairStats` for
+        the new route so subsequent real-traffic outcomes score the right pair.
+        """
+        ip = str(ip).strip()
+        if isinstance(sni, bytes):
+            sni_b = sni
+        else:
+            sni_b = str(sni).strip().encode()
+        if not ip or not sni_b:
+            return False
+        with self._route_lock:
+            if ip == self.connect_ip and sni_b == self.fake_sni:
+                # already on this route — just (re)bind the pair for scoring
+                self._active_pair = pair
+                return False
+            self.connect_ip = ip
+            self.fake_sni = sni_b
+            try:
+                self.interface_ipv4 = get_default_interface_ipv4(ip)
+            except Exception:
+                pass
+            self._active_pair = pair
+        self._log(f"[اسپوف SNI] مسیر فعال بدون قطع جابه‌جا شد → {ip} "
+                  f"(SNI: {sni_b.decode(errors='replace')})")
+        return True
+
+    def current_route(self):
+        """Return the current primary ``(ip, fake_sni_str)`` (thread-safe)."""
+        with self._route_lock:
+            return self.connect_ip, self.fake_sni.decode(errors="replace")
 
     # ---------------------------------------------------------------- helpers
 
@@ -287,24 +340,23 @@ class ProxyServer:
         # "connects in V2RayTun but not in our app" class of problems).
         cid = f"#{self._total_connections}"
 
-        # ── route-pool selection (7.7) ────────────────────────────────────
-        # If a ConnectionManager was handed in, pick the best (IP, SNI) pair
-        # for THIS connection (weighted-random, skipping IPs in failover). The
-        # pair's active counter is bumped now and released in ``finally``; the
-        # connection outcome is fed back so the pool can drain weak routes.
-        pair = None
-        active_ip = self.connect_ip
-        active_fake_sni = self.fake_sni
-        if self.conn_manager is not None:
+        # ── primary-route capture (redesign) ──────────────────────────────
+        # ALWAYS use the current primary route — the known-working single route
+        # the user gave us (or the saved per-config best), swapped losslessly by
+        # the background optimiser via ``apply_route``. We snapshot it under the
+        # route lock so a concurrent swap can't tear ip/sni apart, and an
+        # in-flight connection keeps the route it captured here. The pool no
+        # longer picks per-connection (that was the TimeoutError-flood bug); it
+        # only scores routes from the real-traffic outcome fed back below.
+        with self._route_lock:
+            active_ip = self.connect_ip
+            active_fake_sni = self.fake_sni
+            pair = self._active_pair
+        if pair is not None:
             try:
-                pair = self.conn_manager.pick_pair()
+                pair.acquire()
             except Exception:
                 pair = None
-            if pair is not None:
-                pair.acquire()
-                active_ip = pair.ip
-                active_fake_sni = pair.sni.encode() if isinstance(pair.sni, str) \
-                    else pair.sni
         # Pessimistic outcome: any early ``return`` (failed connect / injection)
         # leaves this True, so the route is scored as a failure. It is flipped
         # to False only once the relay actually moved download bytes back from

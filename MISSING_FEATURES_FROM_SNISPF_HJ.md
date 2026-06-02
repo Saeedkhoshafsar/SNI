@@ -336,3 +336,33 @@ chosen  = random.choices(pool, weights=weights, k=1)[0]
 
 با پیاده‌سازی استپ‌های بخش ۷، پروژه‌ی ما از یک «تک‌مسیر دستی» به یک «استخر چندمسیره‌ی
 خودترمیم‌شونده» ارتقا می‌یابد — دقیقاً همان جهشی که SNISPF-HJ نسبت به نسخه‌ی original کرد.
+
+---
+
+## ۱۰. بازطراحی (Phase 4) — استخر به‌عنوان «بهینه‌ساز پس‌زمینه»
+
+**انگیزه:** در Phase 3 استخر منبعِ *اصلی* انتخاب مسیر شد (`pick_pair()` در هر اتصال)،
+که مسیر تکیِ تأییدشده را با جفت‌های تصادفیِ سرد override می‌کرد → سیل `TimeoutError`.
+کاربر گزارش داد نسخه‌ی اصلی «اول تست می‌کند بعد سریع می‌شود» ولی مال ما «یهو خوب یهو خراب».
+
+**معماری جدید (مثل Make-Before-Break / Happy Eyeballs):**
+1. **اول با مسیر تکیِ تأییدشده وصل می‌شویم** — بدون تأخیر. استخر دیگر هرگز per-connection
+   مسیر را عوض نمی‌کند؛ هر اتصال از `connect_ip`/`fake_sni` فعلی استفاده می‌کند.
+2. **استخر فقط در پس‌زمینه تست می‌کند** (حلقه‌ی سلامت)؛ ترافیک زنده دست نمی‌خورد.
+3. **swap بدون قطع:** `ProxyServer.apply_route(ip, sni)` فقط مسیرِ اتصال‌های *جدید* را عوض
+   می‌کند (اتصال‌های در جریان مسیر خود را حفظ می‌کنند). promoter در engine آن را صدا می‌زند.
+4. **promoter دو-حالته** (`ConnectionManager.find_better_route`):
+   - مسیر فعلی سالم → فقط با برتری قطعی (`PROMOTE_MARGIN=0.15`) ارتقاء (محافظه‌کارانه).
+   - مسیر فعلی خراب → اولین مسیر سالم را فوراً جایگزین کن (اضطراری)، بعد ارتقاء ادامه دارد.
+5. **ذخیره‌ی per-config:** بهترین (IP، SNI) در `POOL_BEST_RESULTS` با کلیدِ `config_identity`
+   ذخیره و دفعه‌ی بعد به‌عنوان مسیر پیش‌فرض بارگذاری می‌شود (دیگر از صفر نمی‌گردیم).
+6. **چک‌باکس opt-in:** `POOL_OPTIMIZE_ENABLED` (پیش‌فرض روشن). خاموش = فقط مسیر تکیِ ثابت،
+   هیچ تستی انجام نمی‌شود.
+
+**فایل‌های تغییر یافته:** `core/config_store.py` (کلیدها + helperها + deepcopy defaults)،
+`main.py` (apply_route/current_route + حذف override)، `core/pool.py`
+(best_candidate/find_better_route/lookup_pair + PROMOTE_MARGIN)، `core/engine.py`
+(promoter + per-config best + gating)، `ui/window.py` (چک‌باکس + نمایش مسیر فعال/بهترین)،
+`ui/engine_bridge.py` (active_route/best_route در snapshot).
+
+**تست:** ۶۶۶ تست سبز (۲۸ تست جدید).

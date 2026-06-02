@@ -84,6 +84,23 @@ class EngineBridge(QObject):
                     snap["failover"] = tsnap
                     snap["blocked_ips"] = [r["ip"] for r in tsnap["ips"]
                                            if r["blocked"]]
+                # Redesign: surface the live active route + best candidate so the
+                # UI can show "active vs best found".
+                proxy = getattr(self.controller, "_proxy", None)
+                if proxy is not None and hasattr(proxy, "current_route"):
+                    try:
+                        ip, sni = proxy.current_route()
+                        snap["active_route"] = {"ip": ip, "sni": sni}
+                    except Exception:
+                        pass
+                try:
+                    best = mgr.best_candidate()
+                    if best is not None:
+                        snap["best_route"] = {
+                            "ip": best.ip, "sni": best.sni,
+                            "loss": best.combined_loss_rate}
+                except Exception:
+                    pass
                 return snap
             except Exception:
                 pass

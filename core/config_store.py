@@ -14,6 +14,7 @@ sane defaults rather than raising.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 from typing import Any
@@ -38,6 +39,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # broken — the pool simply stays disabled when there is only one pair.
     "CONNECT_IPS": [],            # list[str] of upstream IPs; [] ⇒ use CONNECT_IP
     "FAKE_SNIS": [],              # list[str] of fake SNIs; [] ⇒ use FAKE_SNI
+    # Background route optimiser (redesign). When True the pool runs *only* as a
+    # background optimiser: we always connect first with the known-working single
+    # route (CONNECT_IP / FAKE_SNI, or the saved per-config best), and the pool
+    # probes in the background — swapping in a strictly-better route losslessly
+    # (new connections only). When False the single fixed route is used and NO
+    # testing happens at all (the user is happy with the SNI they already found).
+    "POOL_OPTIMIZE_ENABLED": True,
+    # Per-config best (IP, SNI) results found by the optimiser. Keyed by a stable
+    # config-identity string (see ConfigStore.config_identity). Each value is
+    # {"ip": str, "sni": str, "loss": float, "ts": float}. On the next Start with
+    # the same config this is loaded as the DEFAULT route so we never search from
+    # scratch again — the best result of the last connection becomes the default.
+    "POOL_BEST_RESULTS": {},
     # Background health-check loop knobs (only active when the pool is enabled).
     "HEALTH_CHECK_INTERVAL": 30,  # seconds between health-check cycles (+ jitter)
     "HEALTH_CHECK_TIMEOUT": 3,    # per-probe TCP connect timeout (seconds)
@@ -91,7 +105,10 @@ class ConfigStore:
         self.config_path = os.path.join(self.runtime_dir, "config.json")
         self.profiles_path = os.path.join(self.runtime_dir, "profiles.json")
 
-        self.config: dict[str, Any] = dict(DEFAULT_CONFIG)
+        # deep-copy so each store gets its OWN copy of the mutable defaults
+        # (lists/dicts like POOL_BEST_RESULTS) — a shallow dict() would share
+        # those nested objects across every instance and leak state.
+        self.config: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
         self.profiles: list[Profile] = []
         self.selected_index: int = -1
 
@@ -107,12 +124,13 @@ class ConfigStore:
     def _load_config(self) -> None:
         data = _read_json(self.config_path)
         if isinstance(data, dict):
-            # merge over defaults so new keys always exist
-            merged = dict(DEFAULT_CONFIG)
+            # merge over defaults so new keys always exist (deep-copy defaults so
+            # mutable nested values are never shared across instances)
+            merged = copy.deepcopy(DEFAULT_CONFIG)
             merged.update(data)
             self.config = merged
         else:
-            self.config = dict(DEFAULT_CONFIG)
+            self.config = copy.deepcopy(DEFAULT_CONFIG)
 
     def save_config(self) -> None:
         _write_json(self.config_path, self.config)
@@ -166,6 +184,79 @@ class ConfigStore:
         reference ``build_connection_manager`` returning ``None``.
         """
         return len(self.connect_ips()) * len(self.fake_snis()) > 1
+
+    def pool_optimize_enabled(self) -> bool:
+        """True when the user has opted into background route-optimisation.
+
+        This is the redesign checkbox: when ``False`` the engine uses the single
+        fixed route (the saved per-config best, or CONNECT_IP / FAKE_SNI) and
+        spawns **no** background testing at all — for users happy with the SNI
+        they already found. When ``True`` the pool runs as a background optimiser
+        that only swaps in strictly-better routes, losslessly.
+        """
+        return bool(self.config.get("POOL_OPTIMIZE_ENABLED", True))
+
+    def config_identity(self) -> str:
+        """A stable key identifying the *current* config for best-result storage.
+
+        Best results are saved per-config so re-selecting the same config loads
+        its previously-found best route as the default. We key on the fake-SNI ↔
+        IP pairing universe (the part that actually determines which routes are
+        valid) plus the connect port, which is stable across restarts and does
+        not change just because the optimiser swapped the live route.
+        """
+        ips = ",".join(sorted(self.connect_ips()))
+        snis = ",".join(sorted(self.fake_snis()))
+        port = self.config.get("CONNECT_PORT", 443)
+        return f"{ips}|{snis}|{port}"
+
+    def best_result_for(self, identity: str | None = None) -> dict | None:
+        """Return the saved best ``{"ip","sni","loss","ts"}`` for a config, or None."""
+        key = identity if identity is not None else self.config_identity()
+        store = self.config.get("POOL_BEST_RESULTS") or {}
+        if not isinstance(store, dict):
+            return None
+        rec = store.get(key)
+        if isinstance(rec, dict) and rec.get("ip") and rec.get("sni"):
+            return rec
+        return None
+
+    def save_best_result(self, ip: str, sni: str, loss: float = 0.0,
+                         identity: str | None = None, ts: float | None = None,
+                         *, persist: bool = True) -> None:
+        """Persist the best (IP, SNI) found for a config so it becomes the default.
+
+        Only overwrites an existing record when the new ``loss`` is not worse
+        (``<=``) than the stored one, so a transient bad measurement never erases
+        a genuinely good saved route.
+        """
+        import time as _time
+        ip = str(ip).strip()
+        sni = str(sni).strip()
+        if not ip or not sni:
+            return
+        key = identity if identity is not None else self.config_identity()
+        store = self.config.get("POOL_BEST_RESULTS")
+        if not isinstance(store, dict):
+            store = {}
+        prev = store.get(key)
+        if isinstance(prev, dict) and isinstance(prev.get("loss"), (int, float)):
+            if float(loss) > float(prev["loss"]) and (prev.get("ip") == ip
+                                                      and prev.get("sni") == sni):
+                # same pair, but measured worse now — keep the better stored loss
+                loss = float(prev["loss"])
+        store[key] = {
+            "ip": ip,
+            "sni": sni,
+            "loss": float(loss),
+            "ts": float(ts) if ts is not None else _time.time(),
+        }
+        self.config["POOL_BEST_RESULTS"] = store
+        if persist:
+            try:
+                self.save_config()
+            except Exception:
+                pass
 
     # ---------------------------------------------------------------- profiles
 

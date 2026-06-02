@@ -60,9 +60,21 @@ class SettingsPagePoolTest(unittest.TestCase):
         self.assertEqual(page._pool_ip_list(), ["1.1.1.1", "2.2.2.2"])
 
     def test_hint_disabled_for_single_pair(self):
+        # redesign: a single defined route is no longer "disabled" — we connect
+        # with it first; the hint invites adding more for background testing.
         page = self._page()
         page.load_from({"CONNECT_IP": "1.1.1.1", "FAKE_SNI": "a.com"})
-        self.assertIn("غیرفعال", page.pool_hint.text())
+        self.assertIn("تنها یک مسیر", page.pool_hint.text())
+
+    def test_hint_optimize_off(self):
+        # redesign: when the optimiser checkbox is off, the hint says testing is
+        # off regardless of how many routes are defined.
+        page = self._page()
+        page.pool_ips.setPlainText("1.1.1.1\n2.2.2.2")
+        page.pool_snis.setPlainText("a.com\nb.com")
+        page.chk_pool_optimize.setChecked(False)
+        page._update_pool_hint()
+        self.assertIn("خاموش", page.pool_hint.text())
 
     def test_hint_enabled_and_counts_pairs(self):
         page = self._page()
@@ -74,12 +86,13 @@ class SettingsPagePoolTest(unittest.TestCase):
         self.assertIn("فعال", page.pool_hint.text())
 
     def test_hint_uses_singular_fallback_for_count(self):
-        # one pool IP + empty SNI list ⇒ falls back to single SNI ⇒ 1 route ⇒ disabled
+        # one pool IP + empty SNI list ⇒ falls back to single SNI ⇒ 1 route ⇒
+        # "single route" hint (connect first; add more to test in background).
         page = self._page()
         page.pool_ips.setPlainText("1.1.1.1")
         page.pool_snis.setPlainText("")
         page._update_pool_hint()
-        self.assertIn("غیرفعال", page.pool_hint.text())
+        self.assertIn("تنها یک مسیر", page.pool_hint.text())
 
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 not available")

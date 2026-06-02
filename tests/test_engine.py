@@ -1419,6 +1419,67 @@ class EnginePoolIntegrationTest(unittest.TestCase):
         c._build_pool("", 443, "")
         self.assertIsNone(c.conn_manager)
 
+    def test_optimize_off_builds_no_pool(self):
+        # redesign: checkbox OFF ⇒ single fixed route, no pool/testing even with
+        # multiple IPs/SNIs configured.
+        c = EngineController({
+            "CONNECT_IPS": ["1.1.1.1", "2.2.2.2"],
+            "FAKE_SNIS": ["a.com", "b.com"],
+            "POOL_OPTIMIZE_ENABLED": False,
+        })
+        c._build_pool("1.1.1.1", 443, "a.com")
+        self.assertIsNone(c.conn_manager)
+
+
+class EngineOptimiserPersistenceTest(unittest.TestCase):
+    """Per-config best-result persistence + promoter helpers (redesign)."""
+
+    def test_config_identity_stable_and_order_independent(self):
+        c = EngineController({
+            "CONNECT_IPS": ["1.1.1.1", "2.2.2.2"],
+            "FAKE_SNIS": ["a.com", "b.com"], "CONNECT_PORT": 443})
+        first = c._config_identity()
+        c.config["CONNECT_IPS"] = ["2.2.2.2", "1.1.1.1"]
+        c.config["FAKE_SNIS"] = ["b.com", "a.com"]
+        self.assertEqual(first, c._config_identity())
+
+    def test_save_and_load_best_default(self):
+        c = EngineController({"CONNECT_IP": "1.1.1.1", "FAKE_SNI": "a.com",
+                              "POOL_OPTIMIZE_ENABLED": True})
+        self.assertIsNone(c._load_best_default())
+        c._save_best_result("9.9.9.9", "best.com", 0.03)
+        rec = c._load_best_default()
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["ip"], "9.9.9.9")
+        self.assertEqual(rec["sni"], "best.com")
+
+    def test_load_best_default_none_when_optimize_off(self):
+        c = EngineController({"CONNECT_IP": "1.1.1.1", "FAKE_SNI": "a.com",
+                              "POOL_OPTIMIZE_ENABLED": False})
+        c._save_best_result("9.9.9.9", "best.com", 0.03)
+        # stored, but not consulted while the optimiser is off
+        self.assertIsNone(c._load_best_default())
+
+    def test_save_best_result_invokes_on_save_config(self):
+        c = EngineController({"CONNECT_IP": "1.1.1.1", "FAKE_SNI": "a.com"})
+        calls = []
+        c.on_save_config = lambda: calls.append(1)
+        c._save_best_result("9.9.9.9", "best.com", 0.03)
+        self.assertEqual(len(calls), 1)
+
+    def test_save_best_result_keeps_lower_loss(self):
+        c = EngineController({"CONNECT_IP": "1.1.1.1", "FAKE_SNI": "a.com",
+                              "POOL_OPTIMIZE_ENABLED": True})
+        c._save_best_result("9.9.9.9", "best.com", 0.02)
+        c._save_best_result("9.9.9.9", "best.com", 0.40)  # same pair, worse
+        self.assertAlmostEqual(c._load_best_default()["loss"], 0.02)
+
+    def test_start_promoter_noop_without_pool(self):
+        c = EngineController({})
+        c.conn_manager = None
+        c._start_promoter()       # must not raise / not create a thread
+        self.assertIsNone(c._promoter_thread)
+
 
 if __name__ == "__main__":
     unittest.main()

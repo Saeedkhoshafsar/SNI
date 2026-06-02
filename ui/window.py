@@ -475,6 +475,23 @@ class SettingsPage(QWidget):
         pool_title.setObjectName("Muted")
         form.addWidget(pool_title)
 
+        # Redesign: opt-in checkbox. When OFF the single fixed route (the saved
+        # best, or the SNI/IP above) is used with NO background testing at all.
+        # When ON the pool tests in the background and swaps in a strictly-better
+        # route losslessly. Default ON.
+        self.chk_pool_optimize = QCheckBox(tr("بهینه‌سازی مسیر در پس‌زمینه"))
+        self.chk_pool_optimize.setChecked(True)
+        form.addWidget(self.chk_pool_optimize)
+        opt_hint = QLabel(tr(
+            "روشن: اول با مسیر فعلی وصل می‌شویم، استخر در پس‌زمینه تست می‌کند و "
+            "مسیر بهتر را بدون قطع جایگزین می‌کند (بهترین نتیجه برای هر کانفیگ "
+            "ذخیره می‌شود).\nخاموش: فقط همان SNI/IP تکی ثابت می‌ماند، هیچ تستی "
+            "انجام نمی‌شود."))
+        opt_hint.setObjectName("Muted")
+        opt_hint.setWordWrap(True)
+        form.addWidget(opt_hint)
+        form.addSpacing(4)
+
         form.addWidget(self._field_label("IPهای استخر — هر خط یک IP"))
         self.pool_ips = QPlainTextEdit()
         self.pool_ips.setObjectName("PoolList")
@@ -499,6 +516,7 @@ class SettingsPage(QWidget):
         form.addWidget(self.pool_hint)
         self.pool_ips.textChanged.connect(self._update_pool_hint)
         self.pool_snis.textChanged.connect(self._update_pool_hint)
+        self.chk_pool_optimize.toggled.connect(self._update_pool_hint)
         self._update_pool_hint()
         form.addSpacing(6)
 
@@ -582,6 +600,8 @@ class SettingsPage(QWidget):
             "\n".join(str(x).strip() for x in pool_ips if str(x).strip()))
         self.pool_snis.setPlainText(
             "\n".join(str(x).strip() for x in pool_snis if str(x).strip()))
+        self.chk_pool_optimize.setChecked(
+            bool(cfg.get("POOL_OPTIMIZE_ENABLED", True)))
         self._update_pool_hint()
         self.chk_lan.setChecked(bool(cfg.get("allow_lan", False)))
         self._update_lan_hint(self.chk_lan.isChecked())
@@ -600,6 +620,7 @@ class SettingsPage(QWidget):
             "CONNECT_IP": self.connect_ip.text().strip(),
             "CONNECT_IPS": self._pool_ip_list(),
             "FAKE_SNIS": self._pool_sni_list(),
+            "POOL_OPTIMIZE_ENABLED": bool(self.chk_pool_optimize.isChecked()),
             "sni_ip_pairs": list(self._sni_ip_pairs),
             "allow_lan": self.chk_lan.isChecked(),
             "system_proxy": self.chk_system_proxy.isChecked(),
@@ -708,14 +729,19 @@ class SettingsPage(QWidget):
         eff_ips = len(ips) or 1
         eff_snis = len(snis) or 1
         pairs = eff_ips * eff_snis
-        if pairs <= 1:
+        optimize = self.chk_pool_optimize.isChecked()
+        if not optimize:
             self.pool_hint.setText(tr(
-                "استخر غیرفعال — حالت تک‌مسیره (همان IP/SNI بالا)؛ "
-                "بدون پایش پس‌زمینه."))
+                "بهینه‌سازی خاموش — فقط مسیر تکیِ ثابت استفاده می‌شود "
+                "(بدون تست پس‌زمینه)."))
+        elif pairs <= 1:
+            self.pool_hint.setText(tr(
+                "تنها یک مسیر تعریف شده — اول با همین وصل می‌شویم؛ برای جایگزینی "
+                "بدون قطع، چند IP/SNI اضافه کنید تا در پس‌زمینه تست شوند."))
         else:
             self.pool_hint.setText(tr(
-                "استخر فعال — {ips} IP × {snis} SNI = {pairs} مسیر؛ "
-                "هر ۳۰ ثانیه سلامت‌سنجی و انتخاب وزنی خودکار.").format(
+                "بهینه‌ساز فعال — {ips} IP × {snis} SNI = {pairs} مسیر در "
+                "پس‌زمینه تست می‌شوند؛ مسیر بهتر بدون قطع جایگزین می‌شود.").format(
                     ips=eff_ips, snis=eff_snis, pairs=pairs))
 
     def _field_label(self, t: str) -> QLabel:
@@ -2254,21 +2280,26 @@ class PoolPage(QWidget):
         self.lbl_counts.setObjectName("Faint")
         self.lbl_check = QLabel(tr("آخرین سلامت‌سنجی: —"))
         self.lbl_check.setObjectName("Faint")
+        # Redesign: live active route vs best candidate found by the optimiser.
+        self.lbl_route = QLabel(tr("مسیر فعال: —"))
+        self.lbl_route.setObjectName("Faint")
+        self.lbl_route.setWordWrap(True)
         # per-IP rapid-failover state (7.8): shows any IP currently blocked
         self.lbl_failover = QLabel(tr("بازیابی خودکار: —"))
         self.lbl_failover.setObjectName("Faint")
         self.lbl_failover.setWordWrap(True)
         self.lbl_help = QLabel(tr(
-            "وقتی بیش از یک IP یا SNI در «تنظیمات» وارد کنید، حاصل‌ضرب آن‌ها یک "
-            "استخر مسیر می‌سازد: هر مسیر در پس‌زمینه سلامت‌سنجی می‌شود و بهترین‌ها "
-            "با انتخاب وزنی (هرچه افت کمتر، شانس بیشتر) و بدون قطع اتصال‌های زنده "
-            "به‌کار می‌روند. اگر یک IP پشت‌سرهم خطا دهد، خودکار کنار گذاشته می‌شود. "
-            "اگر فقط یک مسیر باشد، استخر غیرفعال است."))
+            "اول با مسیر فعلی (که می‌دانیم وصل می‌شود) متصل می‌شویم؛ سپس استخر "
+            "چند-IP/چند-SNI در پس‌زمینه تست می‌کند و اگر مسیری «به‌روشنی بهتر» "
+            "پیدا کرد، آن را بدون قطع اتصال جایگزین می‌کند. بهترین نتیجه برای هر "
+            "کانفیگ ذخیره می‌شود تا دفعهٔ بعد از همان شروع کنیم. با تیکِ "
+            "«بهینه‌سازی مسیر در پس‌زمینه» در تنظیمات می‌توانید تست را خاموش کنید."))
         self.lbl_help.setObjectName("Faint")
         self.lbl_help.setWordWrap(True)
         sb.addWidget(self.lbl_state)
         sb.addWidget(self.lbl_counts)
         sb.addWidget(self.lbl_check)
+        sb.addWidget(self.lbl_route)
         sb.addWidget(self.lbl_failover)
         sb.addWidget(self.lbl_help)
         root.addWidget(summary)
@@ -2329,6 +2360,7 @@ class PoolPage(QWidget):
             self.lbl_state.setText(tr("استخر: غیرفعال (حالت تک‌مسیره)"))
             self.lbl_counts.setText(tr("مسیرها: —"))
             self.lbl_check.setText(tr("آخرین سلامت‌سنجی: —"))
+            self.lbl_route.setText(tr("مسیر فعال: —"))
             self.lbl_failover.setText(tr("بازیابی خودکار: —"))
             self.btn_export.setEnabled(False)
             self.tbl.setPlainText(tr(
@@ -2359,6 +2391,26 @@ class PoolPage(QWidget):
         else:
             self.lbl_check.setText(
                 tr("آخرین سلامت‌سنجی: {s} ثانیه پیش").format(s=int(secs)))
+
+        # Redesign: active route vs best candidate found by the optimiser.
+        active_route = snap.get("active_route") or {}
+        best_route = snap.get("best_route") or {}
+        if active_route.get("ip"):
+            txt = tr("مسیر فعال: {ip} (SNI: {sni})").format(
+                ip=active_route.get("ip"), sni=active_route.get("sni"))
+            if best_route.get("ip"):
+                same = (best_route.get("ip") == active_route.get("ip")
+                        and best_route.get("sni") == active_route.get("sni"))
+                if same:
+                    txt += tr(" — بهترین مسیر همین است ✓")
+                else:
+                    txt += tr(" · بهترین یافته‌شده: {ip} (SNI: {sni}، افت "
+                              "{loss:.0f}%)").format(
+                        ip=best_route.get("ip"), sni=best_route.get("sni"),
+                        loss=float(best_route.get("loss", 0.0)) * 100)
+            self.lbl_route.setText(txt)
+        else:
+            self.lbl_route.setText(tr("مسیر فعال: —"))
 
         # per-IP failover line (7.8): list any IP currently in rapid-failover.
         blocked = snap.get("blocked_ips") or []
@@ -2622,6 +2674,13 @@ class MainWindow(QWidget):
         i18n._lang = lang
         self.engine = EngineBridge(EngineController(self.store.config))
         self.engine.set_profile(self.store.selected_profile)
+        # Let the background optimiser persist a newly-found best route into
+        # config.json (per-config best-result persistence). The controller writes
+        # into the shared config dict, so saving the store flushes it to disk.
+        try:
+            self.engine.controller.on_save_config = self.store.save_config
+        except Exception:
+            pass
 
         self._palette = get_palette(self._theme)
         self.setObjectName("RootBackdrop")
