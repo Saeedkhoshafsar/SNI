@@ -549,5 +549,68 @@ class ExportHelpersTest(unittest.TestCase):
             export_routes(12345, os.path.join(self.dir, "z.txt"))
 
 
+# ---------------------------------------------------------------------------
+# Background-optimiser interface (redesign): best_candidate / find_better_route
+# ---------------------------------------------------------------------------
+
+class BackgroundOptimiserTest(unittest.TestCase):
+    def _mgr(self, combos, good):
+        mgr = ConnectionManager(combos, 443, probe_fn=_make_probe(good))
+        mgr.explorer.initial_explore()
+        mgr.pool.initialize()
+        return mgr
+
+    def test_best_candidate_returns_lowest_loss_stable(self):
+        combos = [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")]
+        # only 1.1.1.1 probes clean → it is the stable best
+        mgr = self._mgr(combos, ["1.1.1.1"])
+        best = mgr.best_candidate()
+        self.assertIsNotNone(best)
+        self.assertEqual(best.ip, "1.1.1.1")
+
+    def test_best_candidate_none_when_nothing_stable(self):
+        combos = [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")]
+        mgr = self._mgr(combos, [])  # nothing probes clean
+        self.assertIsNone(mgr.best_candidate())
+
+    def test_find_better_route_emergency_when_broken(self):
+        # current route broken ⇒ swap to first good route immediately
+        combos = [("1.1.1.1", "a.com"), ("9.9.9.9", "x.com")]
+        mgr = self._mgr(combos, ["1.1.1.1"])
+        better = mgr.find_better_route("9.9.9.9", "x.com",
+                                       current_healthy=False)
+        self.assertIsNotNone(better)
+        self.assertEqual(better.ip, "1.1.1.1")
+
+    def test_find_better_route_conservative_when_healthy(self):
+        # current route healthy and is itself the best ⇒ no swap
+        combos = [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")]
+        mgr = self._mgr(combos, ["1.1.1.1"])
+        # feed current route enough clean probes so it has a low loss
+        cur = mgr.lookup_pair("1.1.1.1", "a.com")
+        self.assertIsNotNone(cur)
+        better = mgr.find_better_route("1.1.1.1", "a.com",
+                                       current_healthy=True)
+        # candidate equals current (or no strict margin) ⇒ None
+        self.assertIsNone(better)
+
+    def test_find_better_route_never_returns_current(self):
+        combos = [("1.1.1.1", "a.com")]
+        mgr = ConnectionManager(combos + [("2.2.2.2", "b.com")], 443,
+                                probe_fn=_make_probe(["1.1.1.1"]))
+        mgr.explorer.initial_explore()
+        mgr.pool.initialize()
+        better = mgr.find_better_route("1.1.1.1", "a.com",
+                                       current_healthy=False)
+        if better is not None:
+            self.assertNotEqual((better.ip, better.sni), ("1.1.1.1", "a.com"))
+
+    def test_lookup_pair(self):
+        combos = [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")]
+        mgr = self._mgr(combos, ["1.1.1.1"])
+        self.assertIsNotNone(mgr.lookup_pair("1.1.1.1", "a.com"))
+        self.assertIsNone(mgr.lookup_pair("3.3.3.3", "z.com"))
+
+
 if __name__ == "__main__":
     unittest.main()

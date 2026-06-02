@@ -381,5 +381,71 @@ class ProxyStartupTest(unittest.TestCase):
         self.assertLessEqual(asyncio.run(_drive()), 2)
 
 
+class ApplyRouteTest(unittest.TestCase):
+    """Lossless live-route swapping (redesign)."""
+
+    def setUp(self):
+        self._saved = _install_pydivert_stub()
+        import main as main_mod
+        self.main = main_mod
+        self._saved_injector = main_mod.FakeTcpInjector
+        main_mod.FakeTcpInjector = _DummyInjector
+
+    def tearDown(self):
+        try:
+            self.main.FakeTcpInjector = self._saved_injector
+        except Exception:
+            pass
+        _restore_modules(self._saved)
+
+    def _srv(self):
+        return self.main.ProxyServer({
+            "LISTEN_HOST": "127.0.0.1",
+            "LISTEN_PORT": _free_port(),
+            "FAKE_SNI": "first.com",
+            "CONNECT_IP": "127.0.0.1",
+            "CONNECT_PORT": 443,
+            "gaming_mode": False,
+        })
+
+    def test_current_route_initial(self):
+        srv = self._srv()
+        ip, sni = srv.current_route()
+        self.assertEqual(ip, "127.0.0.1")
+        self.assertEqual(sni, "first.com")
+
+    def test_apply_route_changes_route(self):
+        srv = self._srv()
+        changed = srv.apply_route("9.9.9.9", "better.com")
+        self.assertTrue(changed)
+        ip, sni = srv.current_route()
+        self.assertEqual(ip, "9.9.9.9")
+        self.assertEqual(sni, "better.com")
+        # fake_sni is stored as bytes for the ClientHello maker
+        self.assertEqual(srv.fake_sni, b"better.com")
+
+    def test_apply_route_same_route_is_noop(self):
+        srv = self._srv()
+        self.assertFalse(srv.apply_route("127.0.0.1", "first.com"))
+
+    def test_apply_route_accepts_bytes_sni(self):
+        srv = self._srv()
+        self.assertTrue(srv.apply_route("9.9.9.9", b"bytes.com"))
+        self.assertEqual(srv.current_route()[1], "bytes.com")
+
+    def test_apply_route_rejects_blank(self):
+        srv = self._srv()
+        self.assertFalse(srv.apply_route("", "x.com"))
+        self.assertFalse(srv.apply_route("1.2.3.4", ""))
+        # route unchanged
+        self.assertEqual(srv.current_route(), ("127.0.0.1", "first.com"))
+
+    def test_apply_route_binds_pair(self):
+        srv = self._srv()
+        sentinel = object()
+        srv.apply_route("9.9.9.9", "better.com", pair=sentinel)
+        self.assertIs(srv._active_pair, sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -173,6 +173,72 @@ class ConfigStoreTest(unittest.TestCase):
         self.assertEqual(self.store.selected_index, -1)
         self.assertIsNone(self.store.selected_profile)
 
+    # -- background optimiser (redesign) --------------------------------
+
+    def test_pool_optimize_enabled_default_true(self):
+        self.assertTrue(self.store.pool_optimize_enabled())
+        self.store.set("POOL_OPTIMIZE_ENABLED", False)
+        self.assertFalse(self.store.pool_optimize_enabled())
+
+    def test_config_identity_stable(self):
+        self.store.update(CONNECT_IP="1.1.1.1", FAKE_SNI="a.com")
+        a = self.store.config_identity()
+        b = self.store.config_identity()
+        self.assertEqual(a, b)
+        # changing the SNI universe changes the identity
+        self.store.update(FAKE_SNIS=["a.com", "b.com"])
+        self.assertNotEqual(a, self.store.config_identity())
+
+    def test_config_identity_order_independent(self):
+        self.store.update(CONNECT_IPS=["1.1.1.1", "2.2.2.2"],
+                          FAKE_SNIS=["a.com", "b.com"])
+        first = self.store.config_identity()
+        self.store.update(CONNECT_IPS=["2.2.2.2", "1.1.1.1"],
+                          FAKE_SNIS=["b.com", "a.com"])
+        self.assertEqual(first, self.store.config_identity())
+
+    def test_save_and_load_best_result(self):
+        self.store.update(CONNECT_IP="1.1.1.1", FAKE_SNI="a.com")
+        self.assertIsNone(self.store.best_result_for())
+        self.store.save_best_result("9.9.9.9", "best.com", loss=0.05)
+        rec = self.store.best_result_for()
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["ip"], "9.9.9.9")
+        self.assertEqual(rec["sni"], "best.com")
+        self.assertAlmostEqual(rec["loss"], 0.05)
+
+    def test_best_result_persists_across_reload(self):
+        self.store.update(CONNECT_IP="1.1.1.1", FAKE_SNI="a.com")
+        self.store.save_best_result("9.9.9.9", "best.com", loss=0.02)
+        fresh = ConfigStore(runtime_dir=self.tmp)
+        fresh.update(CONNECT_IP="1.1.1.1", FAKE_SNI="a.com")
+        rec = fresh.best_result_for()
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["ip"], "9.9.9.9")
+
+    def test_save_best_result_keeps_better_loss(self):
+        self.store.update(CONNECT_IP="1.1.1.1", FAKE_SNI="a.com")
+        self.store.save_best_result("9.9.9.9", "best.com", loss=0.02)
+        # same pair measured worse later → keep the better stored loss
+        self.store.save_best_result("9.9.9.9", "best.com", loss=0.30)
+        self.assertAlmostEqual(self.store.best_result_for()["loss"], 0.02)
+
+    def test_save_best_result_ignores_blank(self):
+        self.store.update(CONNECT_IP="1.1.1.1", FAKE_SNI="a.com")
+        self.store.save_best_result("", "x.com", loss=0.01)
+        self.assertIsNone(self.store.best_result_for())
+
+    def test_best_results_keyed_per_config(self):
+        self.store.update(CONNECT_IP="1.1.1.1", FAKE_SNI="a.com")
+        id_a = self.store.config_identity()
+        self.store.save_best_result("9.9.9.9", "best.com", loss=0.05,
+                                    identity=id_a)
+        self.store.update(CONNECT_IP="2.2.2.2", FAKE_SNI="z.com")
+        # different config → no saved best yet
+        self.assertIsNone(self.store.best_result_for())
+        # the first config's best is still reachable by its identity
+        self.assertIsNotNone(self.store.best_result_for(id_a))
+
 
 if __name__ == "__main__":
     unittest.main()
