@@ -1362,5 +1362,63 @@ class EnginePingTest(unittest.TestCase):
             prober_mod.tcp_probe = saved
 
 
+class EnginePoolIntegrationTest(unittest.TestCase):
+    """The route-pool wiring on EngineController (7.7).
+
+    Exercises ``_build_pool`` / ``_stop_pool`` directly so we never need the
+    Windows-only ``main`` / ``pydivert`` import path. The health-loop thread is
+    a daemon; we stop it immediately so no real probing runs.
+    """
+
+    def test_single_target_builds_no_pool(self):
+        c = EngineController({"CONNECT_IP": "1.1.1.1", "FAKE_SNI": "a.com"})
+        c._build_pool("1.1.1.1", 443, "a.com")
+        try:
+            self.assertIsNone(c.conn_manager)
+        finally:
+            c._stop_pool()
+
+    def test_multi_target_builds_pool_and_starts_loop(self):
+        c = EngineController({
+            "CONNECT_IPS": ["1.1.1.1", "2.2.2.2"],
+            "FAKE_SNIS": ["a.com", "b.com"],
+        })
+        c._build_pool("1.1.1.1", 443, "a.com")
+        try:
+            self.assertIsNotNone(c.conn_manager)
+            # 2 IPs × 2 SNIs = 4 routes
+            self.assertEqual(len(c.conn_manager.explorer.stats), 4)
+            # the tracker is wired in for per-IP failover
+            self.assertTrue(hasattr(c.conn_manager, "tracker"))
+        finally:
+            c._stop_pool()
+        self.assertIsNone(c.conn_manager)
+
+    def test_folds_single_target_into_lists(self):
+        # only the legacy singular keys set, plus one extra SNI list entry →
+        # the resolved single target must be folded in as the fallback.
+        c = EngineController({"FAKE_SNIS": ["a.com", "b.com"]})
+        c._build_pool("9.9.9.9", 8443, "a.com")
+        try:
+            self.assertIsNotNone(c.conn_manager)
+            ips = {ps.ip for ps in c.conn_manager.explorer.all_stats()}
+            self.assertIn("9.9.9.9", ips)
+            self.assertEqual(c.conn_manager.explorer.port, 8443)
+        finally:
+            c._stop_pool()
+
+    def test_stop_pool_is_idempotent(self):
+        c = EngineController({})
+        c._stop_pool()        # nothing built yet — must be safe
+        c._stop_pool()
+        self.assertIsNone(c.conn_manager)
+
+    def test_build_pool_never_raises_on_bad_config(self):
+        c = EngineController({"CONNECT_IPS": None, "FAKE_SNIS": None})
+        # must degrade to single-target (None) without raising
+        c._build_pool("", 443, "")
+        self.assertIsNone(c.conn_manager)
+
+
 if __name__ == "__main__":
     unittest.main()

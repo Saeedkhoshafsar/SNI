@@ -135,6 +135,14 @@ class ProxyServer:
         # optional resilience controller handed in by the engine
         self.resilience = None
 
+        # optional multi-IP / multi-SNI route pool (core.pool.ConnectionManager)
+        # handed in by the engine. When present, every connection picks its
+        # (IP, SNI) from the pool's weighted-random picker instead of the fixed
+        # ``connect_ip`` / ``fake_sni``, and the outcome is fed back so the pool
+        # can drain degraded routes. ``None`` → legacy single-target behaviour
+        # (zero overhead). See core/pool.py + engine integration (7.7).
+        self.conn_manager = None
+
         # Startup handshake: ``start()`` blocks on this until the listen socket
         # is actually bound (or the bind failed). Without it the engine would
         # launch xray *before* the spoofer is listening on 40443, so xray's very
@@ -278,13 +286,41 @@ class ProxyServer:
         # shows the lifecycle of each spoofed connection (helps diagnose the
         # "connects in V2RayTun but not in our app" class of problems).
         cid = f"#{self._total_connections}"
+
+        # ── route-pool selection (7.7) ────────────────────────────────────
+        # If a ConnectionManager was handed in, pick the best (IP, SNI) pair
+        # for THIS connection (weighted-random, skipping IPs in failover). The
+        # pair's active counter is bumped now and released in ``finally``; the
+        # connection outcome is fed back so the pool can drain weak routes.
+        pair = None
+        active_ip = self.connect_ip
+        active_fake_sni = self.fake_sni
+        if self.conn_manager is not None:
+            try:
+                pair = self.conn_manager.pick_pair()
+            except Exception:
+                pair = None
+            if pair is not None:
+                pair.acquire()
+                active_ip = pair.ip
+                active_fake_sni = pair.sni.encode() if isinstance(pair.sni, str) \
+                    else pair.sni
+        # Pessimistic outcome: any early ``return`` (failed connect / injection)
+        # leaves this True, so the route is scored as a failure. It is flipped
+        # to False only once the relay actually moved download bytes back from
+        # the server, proving the route works. The single release happens in
+        # ``finally`` so every code path feeds the pool exactly once.
+        pair_failed = True
+
         try:
             loop = asyncio.get_running_loop()
             self._log_conn(f"[conn {cid}] از xray رسید ({addr[0]}:{addr[1]}) → "
-                           f"اتصال به {self.connect_ip}:{self.connect_port}")
+                           f"اتصال به {active_ip}:{self.connect_port}"
+                           + (f" (استخر: loss={pair.combined_loss_rate*100:.1f}%)"
+                              if pair is not None else ""))
 
             fake_data = ClientHelloMaker.get_client_hello_with(
-                os.urandom(32), os.urandom(32), self.fake_sni, os.urandom(32))
+                os.urandom(32), os.urandom(32), active_fake_sni, os.urandom(32))
 
             outgoing_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             outgoing_sock.setblocking(False)
@@ -293,7 +329,7 @@ class ProxyServer:
 
             src_port = outgoing_sock.getsockname()[1]
             fake_conn = FakeInjectiveConnection(
-                outgoing_sock, self.interface_ipv4, self.connect_ip,
+                outgoing_sock, self.interface_ipv4, active_ip,
                 src_port, self.connect_port, fake_data,
                 self.bypass_method, incoming_sock)
             self._fake_connections[fake_conn.id] = fake_conn
@@ -301,12 +337,12 @@ class ProxyServer:
             try:
                 await asyncio.wait_for(
                     loop.sock_connect(outgoing_sock,
-                                      (self.connect_ip, self.connect_port)),
+                                      (active_ip, self.connect_port)),
                     timeout=10)
             except Exception as exc:
                 fake_conn.monitor = False
                 self._fake_connections.pop(fake_conn.id, None)
-                self._log(f"[conn {cid}] اتصال به {self.connect_ip}:"
+                self._log(f"[conn {cid}] اتصال به {active_ip}:"
                           f"{self.connect_port} ناموفق: {exc}", "error")
                 return
 
@@ -407,12 +443,29 @@ class ProxyServer:
             up_n, down_n = self._up_bytes - up0, self._down_bytes - down0
             self._log_conn(f"[conn {cid}] رله پایان یافت (↑{up_n}B ↓{down_n}B)")
             self._note_relay_result(up_n, down_n)
+            # The route worked iff the server actually sent data back. An
+            # upload-only relay (down==0) means the CDN never replied — the
+            # same "dead relay" signal we warn on — so it counts as a failure
+            # for the pool (mirrors the reference forwarder's S→C check).
+            pair_failed = down_n <= 0
 
         except asyncio.CancelledError:
             pass
         except Exception:
             self._log(traceback.format_exc(), "error")
         finally:
+            # Feed the route outcome back to the pool exactly once (7.7).
+            if pair is not None and self.conn_manager is not None:
+                try:
+                    pair.release()
+                    if pair_failed:
+                        pair.record_real_packet(lost=True)
+                        self.conn_manager.report_failure(pair)
+                    else:
+                        pair.record_real_packet(lost=False)
+                        self.conn_manager.report_success(pair)
+                except Exception:
+                    pass
             self._update_conn_count(-1)
             for s in (incoming_sock, outgoing_sock):
                 if s:

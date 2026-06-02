@@ -77,6 +77,13 @@ class EngineBridge(QObject):
                 snap["enabled"] = True
                 snap["active"] = len(mgr.pool.active_pairs)
                 snap["seconds_since_check"] = mgr.seconds_since_check
+                # 7.8 — surface per-IP failover state from the tracker.
+                tracker = getattr(mgr, "tracker", None)
+                if tracker is not None:
+                    tsnap = tracker.snapshot()
+                    snap["failover"] = tsnap
+                    snap["blocked_ips"] = [r["ip"] for r in tsnap["ips"]
+                                           if r["blocked"]]
                 return snap
             except Exception:
                 pass

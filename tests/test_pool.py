@@ -13,13 +13,20 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import tempfile
+
 from core.pool import (
     PairStats,
     CombinationExplorer,
     ActivePool,
     ConnectionManager,
+    ConnectionTracker,
     build_connection_manager,
+    export_sni_list,
+    export_routes,
     _weighted_sample,
+    FAILOVER_THRESHOLD,
+    FAILOVER_WINDOW,
 )
 
 
@@ -363,6 +370,183 @@ class BuildConnectionManagerTest(unittest.TestCase):
         self.assertEqual(mgr.pool.slots, 5)
         self.assertAlmostEqual(mgr.explorer.loss_threshold, 0.33)
         self.assertAlmostEqual(mgr.explorer.dead_threshold, 0.66)
+
+
+class _FakeClock:
+    """A monotonic clock you can advance by hand for deterministic tests."""
+
+    def __init__(self, start=0.0):
+        self.t = float(start)
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += float(dt)
+
+
+# ---------------------------------------------------------------------------
+# ConnectionTracker (7.8 — per-IP rapid-failover)
+# ---------------------------------------------------------------------------
+
+class ConnectionTrackerTest(unittest.TestCase):
+    def setUp(self):
+        self.clock = _FakeClock()
+        self.t = ConnectionTracker(clock=self.clock)
+
+    def test_defaults_match_reference(self):
+        self.assertEqual(FAILOVER_THRESHOLD, 3)
+        self.assertEqual(FAILOVER_WINDOW, 30.0)
+
+    def test_failover_after_threshold(self):
+        ip = "1.1.1.1"
+        self.assertFalse(self.t.should_failover(ip))
+        for _ in range(FAILOVER_THRESHOLD - 1):
+            self.t.record_failure(ip)
+        self.assertFalse(self.t.should_failover(ip))
+        self.t.record_failure(ip)
+        self.assertTrue(self.t.should_failover(ip))
+
+    def test_record_failure_returns_live_count(self):
+        ip = "2.2.2.2"
+        self.assertEqual(self.t.record_failure(ip), 1)
+        self.assertEqual(self.t.record_failure(ip), 2)
+
+    def test_window_prunes_old_failures(self):
+        ip = "3.3.3.3"
+        for _ in range(FAILOVER_THRESHOLD):
+            self.t.record_failure(ip)
+        self.assertTrue(self.t.should_failover(ip))
+        # advance past the window — old failures should be pruned away
+        self.clock.advance(FAILOVER_WINDOW + 1)
+        self.assertFalse(self.t.should_failover(ip))
+        self.assertEqual(self.t.failure_count(ip), 0)
+
+    def test_success_clears_failures(self):
+        ip = "4.4.4.4"
+        for _ in range(FAILOVER_THRESHOLD):
+            self.t.record_failure(ip)
+        self.assertTrue(self.t.should_failover(ip))
+        self.t.record_success(ip)
+        self.assertFalse(self.t.should_failover(ip))
+        self.assertEqual(self.t.success_count(ip), 1)
+
+    def test_clear_and_reset(self):
+        self.t.record_failure("a")
+        self.t.record_success("a")
+        self.t.clear("a")
+        self.assertEqual(self.t.failure_count("a"), 0)
+        self.t.reset()
+        self.assertEqual(self.t.success_count("a"), 0)
+
+    def test_empty_ip_is_noop(self):
+        self.assertEqual(self.t.record_failure(""), 0)
+        self.assertFalse(self.t.should_failover(""))
+
+    def test_snapshot_shape(self):
+        for _ in range(FAILOVER_THRESHOLD):
+            self.t.record_failure("blocked")
+        self.t.record_success("good")
+        snap = self.t.snapshot()
+        self.assertEqual(snap["threshold"], FAILOVER_THRESHOLD)
+        ips = {r["ip"]: r for r in snap["ips"]}
+        self.assertTrue(ips["blocked"]["blocked"])
+        self.assertFalse(ips["good"]["blocked"])
+        self.assertEqual(ips["good"]["successes"], 1)
+
+
+# ---------------------------------------------------------------------------
+# ConnectionManager failover-aware picking + report_success (7.7/7.8)
+# ---------------------------------------------------------------------------
+
+class ManagerFailoverTest(unittest.TestCase):
+    def _mgr(self, good):
+        combos = [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")]
+        mgr = ConnectionManager(combos, 443, probe_fn=_make_probe(good))
+        mgr.explorer.initial_explore()
+        mgr.pool.initialize()
+        return mgr
+
+    def test_pick_skips_failed_ip(self):
+        mgr = self._mgr(["1.1.1.1", "2.2.2.2"])
+        # trip failover on 1.1.1.1 directly via the tracker
+        for _ in range(FAILOVER_THRESHOLD):
+            mgr.tracker.record_failure("1.1.1.1")
+        picks = [mgr.pick_pair().ip for _ in range(50)]
+        # the healthy route must dominate; the failed IP should be strongly
+        # avoided (the picker retries to skip failover IPs when alternatives
+        # remain, falling back only if every route is tripped).
+        self.assertIn("2.2.2.2", picks)
+        self.assertGreater(picks.count("2.2.2.2"), picks.count("1.1.1.1"))
+
+    def test_report_failure_feeds_tracker(self):
+        mgr = self._mgr(["1.1.1.1", "2.2.2.2"])
+        ps = mgr.pool.pick()
+        for _ in range(FAILOVER_THRESHOLD):
+            mgr.report_failure(ps)
+        self.assertTrue(mgr.tracker.should_failover(ps.ip))
+
+    def test_report_success_clears_tracker(self):
+        mgr = self._mgr(["1.1.1.1", "2.2.2.2"])
+        ps = mgr.pool.pick()
+        for _ in range(FAILOVER_THRESHOLD):
+            mgr.report_failure(ps)
+        self.assertTrue(mgr.tracker.should_failover(ps.ip))
+        mgr.report_success(ps)
+        self.assertFalse(mgr.tracker.should_failover(ps.ip))
+
+    def test_pick_falls_back_when_all_failed(self):
+        mgr = self._mgr(["1.1.1.1", "2.2.2.2"])
+        for ip in ("1.1.1.1", "2.2.2.2"):
+            for _ in range(FAILOVER_THRESHOLD):
+                mgr.tracker.record_failure(ip)
+        # every IP is in failover → pick_pair must still return *something*
+        self.assertIsNotNone(mgr.pick_pair())
+
+
+# ---------------------------------------------------------------------------
+# Export helpers (7.10)
+# ---------------------------------------------------------------------------
+
+class ExportHelpersTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_export_sni_list_dedupes_and_counts(self):
+        path = os.path.join(self.dir, "snis.txt")
+        n = export_sni_list(["a.com", "b.com", "a.com", "  ", ""], path)
+        self.assertEqual(n, 2)
+        body = open(path, encoding="utf-8").read()
+        self.assertIn("a.com", body)
+        self.assertIn("b.com", body)
+        self.assertIn("# Total: 2", body)
+
+    def test_export_sni_list_empty(self):
+        path = os.path.join(self.dir, "empty.txt")
+        n = export_sni_list([], path)
+        self.assertEqual(n, 0)
+        self.assertIn("# Total: 0", open(path, encoding="utf-8").read())
+
+    def test_export_routes_from_config(self):
+        path = os.path.join(self.dir, "routes.txt")
+        cfg = {"CONNECT_IPS": ["1.1.1.1", "2.2.2.2"],
+               "FAKE_SNIS": ["x.com", "y.com"]}
+        n = export_routes(cfg, path)
+        self.assertEqual(n, 4)
+        body = open(path, encoding="utf-8").read()
+        self.assertIn("1.1.1.1\tx.com", body)
+
+    def test_export_routes_from_manager(self):
+        path = os.path.join(self.dir, "routes2.txt")
+        combos = [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")]
+        mgr = ConnectionManager(combos, 443, probe_fn=_make_probe(["1.1.1.1"]))
+        mgr.explorer.initial_explore()
+        n = export_routes(mgr, path)
+        self.assertEqual(n, 2)
+
+    def test_export_routes_bad_arg(self):
+        with self.assertRaises(TypeError):
+            export_routes(12345, os.path.join(self.dir, "z.txt"))
 
 
 if __name__ == "__main__":

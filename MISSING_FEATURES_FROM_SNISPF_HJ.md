@@ -240,7 +240,7 @@ chosen  = random.choices(pool, weights=weights, k=1)[0]
 
 ## ۶.۵. وضعیت پیاده‌سازی (Progress)
 
-> به‌روزرسانی: ۲۰۲۶-۰۶-۰۲ — فاز ۱ (هسته‌ی استخر) پیاده شد.
+> به‌روزرسانی: ۲۰۲۶-۰۶-۰۲ — **فاز ۱ + ۲ + ۳ کامل شد** (همه‌ی استپ‌های ۷.۱ تا ۷.۱۰).
 
 | استپ | قابلیت | وضعیت | فایل |
 |---|---|---|---|
@@ -249,22 +249,31 @@ chosen  = random.choices(pool, weights=weights, k=1)[0]
 | ۷.۳ | `CombinationExplorer` (پروب TCP تزریق‌پذیر) | ✅ انجام شد | `core/pool.py` (`probe_fn` injectable برای تست headless) |
 | ۷.۴ | `ActivePool` + Weighted-Random `pick()` (`1/(loss+0.01)`) | ✅ انجام شد | `core/pool.py` |
 | ۷.۵ | `ConnectionManager` + حلقه‌ی Health-Check دیمن + `build_connection_manager` | ✅ انجام شد | `core/pool.py` (حلقه با `Event` قابل‌توقف + jitter) |
-| ۷.۶ | Graceful Rotation (`_draining` + شمارش اتصال فعال) | ✅ هسته آماده | `core/pool.py` (`acquire`/`release`/`refresh`) — اتصال به forwarder در فاز بعد |
-| ۷.۷ | یکپارچه‌سازی forwarder/engine (`pick_pair` per-connection) | ⏳ فاز بعد | `core/engine.py` |
-| ۷.۸ | `ConnectionTracker` (failover per-IP ۳/۳۰s) + semaphore | ⏳ فاز بعد | لایه‌ی forwarder, `core/resilience.py` |
-| ۷.۹ | UI: کارت «استخر مسیرها» + ورودی لیست IP/SNI در تنظیمات | ✅ انجام شد | `ui/window.py` (`PoolPage` + تب «استخر» در نوار کناری + ورودی `CONNECT_IPS`/`FAKE_SNIS` در `SettingsPage`) + `ui/engine_bridge.py` (`pool_summary`) |
-| ۷.۱۰ | تقویت Domain Checker (`export_sni_list`) | ⏳ فاز بعد | `core/cf_scanner.py` |
+| ۷.۶ | Graceful Rotation (`_draining` + شمارش اتصال فعال) | ✅ انجام شد | `core/pool.py` (`acquire`/`release`/`refresh`) — متصل به forwarder در ۷.۷ |
+| ۷.۷ | یکپارچه‌سازی forwarder/engine (`pick_pair` per-connection + ثبت موفقیت/شکست واقعی) | ✅ انجام شد | `main.py` (`ProxyServer._handle` انتخاب جفت per-connection + بازخورد نتیجه) + `core/engine.py` (`_build_pool`/`_stop_pool` + اتصال `conn_manager` به اسپوفر و توقف در `stop()`) |
+| ۷.۸ | `ConnectionTracker` (failover per-IP ۳/۳۰s) | ✅ انجام شد | `core/pool.py` (`ConnectionTracker` + `FAILOVER_THRESHOLD=3`/`FAILOVER_WINDOW=30`؛ `pick_pair` از IPهای trip‌شده عبور می‌کند، `report_failure/success` ردیاب را تغذیه می‌کنند) |
+| ۷.۹ | UI: کارت «استخر مسیرها» + ورودی لیست IP/SNI در تنظیمات | ✅ انجام شد | `ui/window.py` (`PoolPage` + تب «استخر» + ورودی `CONNECT_IPS`/`FAKE_SNIS` در `SettingsPage`) + `ui/engine_bridge.py` (`pool_summary`) + خط «بازیابی خودکار» و دکمه‌ی خروجی SNI |
+| ۷.۱۰ | تقویت Domain Checker (`export_sni_list`) | ✅ انجام شد | `core/pool.py` (`export_sni_list` + `export_routes`) + دکمه‌ی «خروجی فهرست SNI…» در `PoolPage` |
 
-**تست‌ها:** `tests/test_pool.py` + `tests/test_pool_ui.py` + افزوده‌ها در
+**تست‌ها:** `tests/test_pool.py` (۴۷ تست) + `tests/test_pool_ui.py` (۲۳ تست) +
+`tests/test_engine.py::EnginePoolIntegrationTest` (۵ تست) + افزوده‌ها در
 `tests/test_config_store.py` و `tests/test_window_fixes_ui.py` —
-کل ۶۰۶ تست سبز (به‌جز ۳ خطای از-قبل‌موجود و بی‌ربط در `test_scanner_ui.py`).
+**کل ۶۳۸ تست سبز، ۰ خطا، ۳ skip.**
 
-**UI:** تب جدید «استخر» در نوار کناری (`PoolPage`) وضعیت زنده‌ی هر مسیر (سالم/ضعیف/مرده،
-افت، اتصال‌های فعال، آخرین سلامت‌سنجی) را نشان می‌دهد؛ در صفحه‌ی «تنظیمات» دو کادر
-چندخطی برای وارد کردن لیست IPها و SNIها اضافه شد با راهنمای زنده‌ی «چند مسیر ساخته می‌شود».
+**UI:** تب «استخر» در نوار کناری (`PoolPage`) وضعیت زنده‌ی هر مسیر (سالم/ضعیف/مرده،
+افت، اتصال‌های فعال، آخرین سلامت‌سنجی) را نشان می‌دهد، به‌علاوه خط «بازیابی خودکار»
+که IPهای موقتاً کنارگذاشته‌شده (failover) را فهرست می‌کند، و دکمه‌ی «خروجی فهرست SNI…»
+برای ذخیره‌ی SNIهای فعلی در فایل متنی. در «تنظیمات» دو کادر چندخطی برای لیست IP/SNI
+با راهنمای زنده‌ی «چند مسیر ساخته می‌شود» وجود دارد.
+
+**یکپارچه‌سازی forwarder (۷.۷/۷.۸):** هر اتصال ورودی در `ProxyServer._handle` یک جفت
+`(IP, SNI)` از استخر می‌گیرد (انتخاب وزنی، با عبور از IPهای در حالت failover)، نتیجه‌ی
+واقعی (دانلود برگشتی = موفق، اتصال ناموفق/فقط-آپلود = شکست) به استخر و ردیاب بازخورد
+داده می‌شود تا مسیرهای ضعیف به‌آرامی drain شوند. موتور حلقه‌ی سلامت‌سنجی را در `Start`
+راه می‌اندازد و در `stop()` متوقف می‌کند.
 
 **سازگاری تک‌مسیره:** حفظ شد — `build_connection_manager` در حالت تک‌جفت `None` برمی‌گرداند و
-هیچ thread پس‌زمینه‌ای ساخته نمی‌شود؛ `pool_enabled()` هم همین را تضمین می‌کند.
+هیچ thread پس‌زمینه‌ای ساخته نمی‌شود؛ `conn_manager` در اسپوفر `None` می‌ماند و مسیر مستقیم قدیمی کار می‌کند.
 
 ---
 
