@@ -133,6 +133,12 @@ class ProxyServer:
         # log with 100+ active connections and nothing downloads" symptom).
         self._down_zero_streak = 0
         self._dead_relay_warned = False
+        # Rate-limit the "fake handshake timed out" error so a burst of stuck
+        # connections doesn't drown the log (the 22:02–22:07 flood). We collapse
+        # repeats within a short window into a single line with a count.
+        self._fake_fail_count = 0
+        self._fake_fail_last_log = 0.0
+        self._fake_fail_window = 4.0   # seconds
         # gentle concurrency guard so a failing fire-and-forget strategy can't
         # open an unbounded number of simultaneous dead connections.
         self._conn_gate = None  # asyncio.Semaphore, created on the loop
@@ -256,6 +262,42 @@ class ProxyServer:
 
     # how many consecutive upload-only (download==0) relays before we warn
     DEAD_RELAY_STREAK = 6
+
+    # How long to wait for the injector to confirm the fake ClientHello before
+    # giving up on a connection. Hard-won from the 22:02–22:07 log: the old 5 s
+    # wait was the cause of the violent throughput swings (1.6 MB → 3.4 KB). A
+    # genuine duplicate-ACK from the CDN comes back inside a single RTT (tens of
+    # ms); when it does NOT, the connection is already dead — blocking five whole
+    # seconds on it only freezes that xray stream (and the user's download) while
+    # xray waits, then retries. Failing fast (1.5 s) lets xray's mux abandon the
+    # stuck stream and immediately retry on a fresh connection that *does*
+    # handshake, which is exactly what smooths the speed back out. This does NOT
+    # touch pinging or ordinary (non-spoofed) configs — they never reach here.
+    FAKE_HANDSHAKE_TIMEOUT = 1.5
+
+    def _log_fake_fail(self, detail: str) -> None:
+        """Rate-limited error for a failed/timed-out fake handshake.
+
+        A stuck route can fail many connections per second; emitting one ERR
+        line each makes the log unreadable (the 22:02–22:07 flood). We instead
+        count them and surface at most one consolidated line per window, so the
+        user still sees the problem clearly without the noise.
+        """
+        import time as _t
+        now = _t.monotonic()
+        self._fake_fail_count += 1
+        if (now - self._fake_fail_last_log) < self._fake_fail_window:
+            return
+        n = self._fake_fail_count
+        self._fake_fail_count = 0
+        self._fake_fail_last_log = now
+        extra = f" ({n} مورد در چند ثانیه‌ی اخیر)" if n > 1 else ""
+        self._log(
+            f"دست‌دادن جعلی شکست/تایم‌اوت{extra} — {detail}. اگر سرعت "
+            f"نوسان دارد یعنی بخشی از اتصال‌ها برقرار می‌شوند و بخشی نه؛ "
+            f"یک استراتژی دیگر (مثل multi_fake یا fake_disorder) یا IP/SNI "
+            f"دیگری را امتحان کنید. مطمئن شوید WinDivert با دسترسی Admin اجرا شده.",
+            "error")
 
     def _note_relay_result(self, up_n: int, down_n: int) -> None:
         """Track dead relays (uploaded but never downloaded) and warn once (#5).
@@ -425,7 +467,8 @@ class ProxyServer:
                 await asyncio.sleep(random.uniform(0.001, 0.008))
 
                 try:
-                    await asyncio.wait_for(fake_conn.t2a_event.wait(), 5)
+                    await asyncio.wait_for(fake_conn.t2a_event.wait(),
+                                           self.FAKE_HANDSHAKE_TIMEOUT)
                     if fake_conn.t2a_msg == "unexpected_close":
                         raise ValueError("unexpected close")
                     if fake_conn.t2a_msg != "fake_data_ack_recv":
@@ -433,10 +476,8 @@ class ProxyServer:
                                   f"{fake_conn.t2a_msg}", "error")
                         return
                 except (asyncio.TimeoutError, ValueError) as exc:
-                    self._log(f"[conn {cid}] دست‌دادن جعلی شکست/تایم‌اوت "
-                              f"({type(exc).__name__}: {fake_conn.t2a_msg or exc}) "
-                              f"— آیا WinDivert/درایور نصب و با دسترسی Admin اجرا "
-                              f"شده؟", "error")
+                    self._log_fake_fail(
+                        f"{type(exc).__name__}: {fake_conn.t2a_msg or exc}")
                     return
                 finally:
                     fake_conn.monitor = False
@@ -461,7 +502,8 @@ class ProxyServer:
                     # this resolves in milliseconds rather than waiting out the
                     # full timeout. The timeout only triggers when WinDivert
                     # isn't actually intercepting (missing driver / not Admin).
-                    await asyncio.wait_for(fake_conn.t2a_event.wait(), 5)
+                    await asyncio.wait_for(fake_conn.t2a_event.wait(),
+                                           self.FAKE_HANDSHAKE_TIMEOUT)
                     if fake_conn.t2a_msg == "unexpected_close":
                         raise ValueError("unexpected close")
                     if fake_conn.t2a_msg != "fake_sent_no_ack" \
@@ -473,10 +515,8 @@ class ProxyServer:
                     # ClientHello so the DPI sees the decoy first.
                     await asyncio.sleep(random.uniform(0.004, 0.012))
                 except (asyncio.TimeoutError, ValueError) as exc:
-                    self._log(f"[conn {cid}] بسته‌ی جعلی تزریق نشد "
-                              f"({type(exc).__name__}: {fake_conn.t2a_msg or exc})"
-                              f" — آیا WinDivert/درایور نصب و با دسترسی Admin "
-                              f"اجرا شده؟", "error")
+                    self._log_fake_fail(
+                        f"{type(exc).__name__}: {fake_conn.t2a_msg or exc}")
                     return
                 finally:
                     fake_conn.monitor = False
