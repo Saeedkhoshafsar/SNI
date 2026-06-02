@@ -79,6 +79,7 @@ class EngineController:
         self._xray = None             # core.xray_manager.XrayManager
         self._prober = None           # core.prober.AutoProber (when enabled)
         self._resilience = None       # core.resilience.ResilienceController
+        self.conn_manager = None      # core.pool.ConnectionManager (multi-IP/SNI)
         self._system_proxy = None     # core.system_proxy.SystemProxy (when on)
         self._spoof_port: Optional[int] = None
         self._status = STATUS_IDLE
@@ -1322,6 +1323,58 @@ class EngineController:
             self._log(f"تاب‌آوری راه‌اندازی نشد ({exc}) — بدون آن ادامه می‌دهیم")
             self._resilience = None
 
+    def _build_pool(self, connect_ip: str, connect_port: int,
+                    fake_sni: str) -> None:
+        """Construct the multi-IP / multi-SNI route pool for this session (7.7).
+
+        Reads ``CONNECT_IPS`` / ``FAKE_SNIS`` (with the resolved single
+        ``connect_ip`` / ``fake_sni`` folded in as fallbacks) and builds a
+        :class:`core.pool.ConnectionManager`. Returns early — leaving
+        ``conn_manager`` as ``None`` — whenever the config resolves to a single
+        (IP, SNI) pair, so single-target users get the original direct path
+        with no background health thread. Building the pool must never block
+        Start, so any failure is logged and swallowed.
+        """
+        # stop / forget any pool from a previous session first
+        self._stop_pool()
+        try:
+            from core.pool import build_connection_manager
+
+            cfg = dict(self.config)
+            # fold the resolved single target in as the fallback so a config
+            # that only set the new plural keys, OR only the legacy singular
+            # ones, both work — and the cartesian product stays correct.
+            cfg.setdefault("CONNECT_PORT", connect_port)
+            if connect_ip and not cfg.get("CONNECT_IP"):
+                cfg["CONNECT_IP"] = connect_ip
+            if fake_sni and not cfg.get("FAKE_SNI"):
+                cfg["FAKE_SNI"] = fake_sni
+
+            mgr = build_connection_manager(cfg)
+            if mgr is None:
+                self.conn_manager = None
+                return
+            self.conn_manager = mgr
+            n_pairs = len(mgr.explorer.stats)
+            self._spoof_log(
+                f"استخر مسیرها فعال شد: {n_pairs} مسیر (IP×SNI) — "
+                f"بررسی سلامت هر {int(mgr.interval)} ثانیه، انتخاب وزن‌دار.")
+            # start the background health loop (daemon thread; safe to stop()).
+            mgr.start_health_loop()
+        except Exception as exc:  # pool must never block Start
+            self._spoof_log(f"استخر مسیرها راه‌اندازی نشد ({exc}) — حالت تک‌مسیره.")
+            self.conn_manager = None
+
+    def _stop_pool(self) -> None:
+        """Stop the route-pool health loop and forget the manager."""
+        mgr = self.conn_manager
+        if mgr is not None:
+            try:
+                mgr.stop()
+            except Exception:
+                pass
+        self.conn_manager = None
+
     def _start_core_only(self, epoch: int | None = None) -> None:
         """Plain Tunnel: run xray-core alone, connecting straight to the server.
 
@@ -1562,12 +1615,22 @@ class EngineController:
         # detection + strategy/IP rotation) so the runtime can consult it
         self._build_resilience(bypass_method, connect_ip)
 
+        # build the multi-IP / multi-SNI route pool for this session (7.7). It
+        # is None for single-target configs, so the legacy direct path keeps
+        # working with zero overhead. The base connect_ip/fake_sni are folded
+        # in so a single-list config still degrades to the static target.
+        self._build_pool(connect_ip, connect_port, fake_sni)
+
         from main import ProxyServer
         self._proxy = ProxyServer(proxy_cfg)
         self._proxy.bypass_method = bypass_method
         # hand the spoofer the resilience controller if it knows how to use one
         if self._resilience is not None and hasattr(self._proxy, "resilience"):
             self._proxy.resilience = self._resilience
+        # hand the spoofer the route pool (if any) — it picks (IP, SNI) per
+        # connection and feeds outcomes back so weak routes get drained.
+        if self.conn_manager is not None and hasattr(self._proxy, "conn_manager"):
+            self._proxy.conn_manager = self.conn_manager
         self._proxy.on_log = self._spoof_log
         self._proxy.on_status_change = self._on_proxy_status
         self._proxy.on_connection_count_change = self._emit_count
@@ -1896,6 +1959,8 @@ class EngineController:
                 proxy.stop()
             except Exception as exc:
                 self._log(f"خطا در توقف spoofer: {exc}")
+        # stop the route-pool health loop (daemon thread) before clearing state
+        self._stop_pool()
         self._spoof_port = None
         self._resilience = None
         self._active_strategy = None

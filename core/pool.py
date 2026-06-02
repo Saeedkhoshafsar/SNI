@@ -49,6 +49,15 @@ logger = logging.getLogger("snispf.pool")
 ProbeFn = Callable[[str, int, float], bool]
 
 
+# --- per-IP failover thresholds (ported 1:1 from the reference forwarder) ---
+# How many failures within :data:`FAILOVER_WINDOW` seconds before an IP is
+# considered "blocked" and the forwarder should fail over to another route.
+FAILOVER_THRESHOLD: int = 3
+# Rapid-failure window in seconds. Failures older than this are pruned, so a
+# slow trickle of unrelated errors never trips the failover.
+FAILOVER_WINDOW: float = 30.0
+
+
 # ---------------------------------------------------------------------------
 # Default real probe (stdlib only; not exercised in sandbox tests)
 # ---------------------------------------------------------------------------
@@ -192,6 +201,131 @@ class PairStats:
             f"loss={self.combined_loss_rate * 100:.1f}% "
             f"alive={self.alive} active={self.active_connections}>"
         )
+
+
+# ---------------------------------------------------------------------------
+# ConnectionTracker — per-IP rapid-failure detection (failover trigger)
+# ---------------------------------------------------------------------------
+
+class ConnectionTracker:
+    """Tracks per-IP connection failures within a rolling time window.
+
+    Ported from the reference ``forwarder.ConnectionTracker`` so the
+    forwarder can detect an upstream IP that has *suddenly* started blocking
+    (e.g. a CDN edge that got poisoned) independently of the slower,
+    probe-based pool scoring.
+
+    The rule is simple and matches the reference exactly:
+
+      * :meth:`record_failure` appends ``time.monotonic()`` for the IP and
+        prunes anything older than :data:`FAILOVER_WINDOW` seconds, returning
+        the live failure count.
+      * :meth:`record_success` clears the IP's failure history (a working
+        connection proves the route is healthy again) and bumps a success
+        counter for diagnostics.
+      * :meth:`should_failover` is ``True`` once an IP has accumulated
+        :data:`FAILOVER_THRESHOLD` failures inside the window.
+
+    Thread-safe: every mutation takes an internal lock so the forwarder's
+    async tasks (which may run on different threads via ``run_in_executor``)
+    and the UI poller can share one tracker.
+    """
+
+    def __init__(
+        self,
+        threshold: int = FAILOVER_THRESHOLD,
+        window: float = FAILOVER_WINDOW,
+        *,
+        clock: Optional[Callable[[], float]] = None,
+    ) -> None:
+        self.threshold = int(threshold)
+        self.window = float(window)
+        # Injectable clock so tests can advance time deterministically.
+        self._clock: Callable[[], float] = clock or time.monotonic
+        self._failures: Dict[str, List[float]] = {}
+        self._successes: Dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def _prune(self, ip: str, now: float) -> None:
+        cutoff = now - self.window
+        kept = [t for t in self._failures.get(ip, []) if t > cutoff]
+        if kept:
+            self._failures[ip] = kept
+        else:
+            self._failures.pop(ip, None)
+
+    def record_failure(self, ip: str) -> int:
+        """Record a failure for *ip*; return live failures inside the window."""
+        if not ip:
+            return 0
+        with self._lock:
+            now = self._clock()
+            self._failures.setdefault(ip, []).append(now)
+            self._prune(ip, now)
+            return len(self._failures.get(ip, []))
+
+    def record_success(self, ip: str) -> None:
+        """Record a success: clears failure history + bumps success count."""
+        if not ip:
+            return
+        with self._lock:
+            self._failures.pop(ip, None)
+            self._successes[ip] = self._successes.get(ip, 0) + 1
+
+    def should_failover(self, ip: str) -> bool:
+        """``True`` when *ip* has hit the failover threshold in the window."""
+        if not ip:
+            return False
+        with self._lock:
+            now = self._clock()
+            self._prune(ip, now)
+            return len(self._failures.get(ip, [])) >= self.threshold
+
+    def failure_count(self, ip: str) -> int:
+        """Live failure count for *ip* inside the window (0 if none)."""
+        if not ip:
+            return 0
+        with self._lock:
+            now = self._clock()
+            self._prune(ip, now)
+            return len(self._failures.get(ip, []))
+
+    def success_count(self, ip: str) -> int:
+        """Cumulative successful connections recorded for *ip*."""
+        with self._lock:
+            return int(self._successes.get(ip, 0))
+
+    def clear(self, ip: str) -> None:
+        """Forget all failure history for *ip* (e.g. after manual rotation)."""
+        with self._lock:
+            self._failures.pop(ip, None)
+
+    def reset(self) -> None:
+        """Forget everything (used when a new session starts)."""
+        with self._lock:
+            self._failures.clear()
+            self._successes.clear()
+
+    def snapshot(self) -> dict:
+        """Diagnostic snapshot of per-IP failure/success state for the UI."""
+        with self._lock:
+            now = self._clock()
+            ips = set(self._failures) | set(self._successes)
+            rows = []
+            for ip in sorted(ips):
+                live = len([t for t in self._failures.get(ip, [])
+                            if t > now - self.window])
+                rows.append({
+                    "ip": ip,
+                    "failures": live,
+                    "successes": int(self._successes.get(ip, 0)),
+                    "blocked": live >= self.threshold,
+                })
+            return {
+                "threshold": self.threshold,
+                "window": self.window,
+                "ips": rows,
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +757,10 @@ class ConnectionManager:
             slots=active_slots,
             loss_threshold=loss_threshold,
         )
+        # Per-IP rapid-failure tracker (7.8). The forwarder records each
+        # connect outcome here; ``should_failover`` lets it skip a route that
+        # is failing in bursts without waiting for the slower probe cycle.
+        self.tracker = ConnectionTracker()
 
     # ------------------------------------------------------------------
     # Health loop (run in a daemon thread)
@@ -676,12 +814,34 @@ class ConnectionManager:
     # ------------------------------------------------------------------
 
     def pick_pair(self) -> Optional[PairStats]:
-        """Pick the best (IP, SNI) pair for the next outbound connection."""
-        return self.pool.pick()
+        """Pick the best (IP, SNI) pair, skipping IPs in rapid-failover.
+
+        Tries up to a few weighted picks and returns the first whose IP is not
+        currently tripped in the :class:`ConnectionTracker`. Falls back to the
+        last pick if *every* candidate is in failover (better a degraded route
+        than none — the pool/probe loop will keep draining the worst).
+        """
+        last: Optional[PairStats] = None
+        # Try several weighted picks; the more routes exist the more attempts we
+        # allow so a single bad IP is reliably skipped when alternatives remain.
+        attempts = max(8, len(self.pool.active_pairs) * 4)
+        for _ in range(attempts):
+            ps = self.pool.pick()
+            if ps is None:
+                return last
+            last = ps
+            if not self.tracker.should_failover(ps.ip):
+                return ps
+        return last
 
     def report_failure(self, ps: PairStats) -> None:
-        """Notify the pool that a connection on ``ps`` failed."""
+        """Notify the pool + tracker that a connection on ``ps`` failed."""
         self.pool.report_failure(ps)
+        self.tracker.record_failure(ps.ip)
+
+    def report_success(self, ps: PairStats) -> None:
+        """Notify the tracker that a connection on ``ps`` succeeded."""
+        self.tracker.record_success(ps.ip)
 
 
 # ---------------------------------------------------------------------------
@@ -757,3 +917,94 @@ def _dedupe(items: List[str]) -> List[str]:
             seen.add(it)
             out.append(it)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Export helpers (7.10 — Domain/SNI list export)
+# ---------------------------------------------------------------------------
+
+def export_sni_list(
+    snis: List[str],
+    filepath: str,
+    *,
+    header: str = "Verified fake-SNI domains",
+) -> int:
+    """Write a clean, de-duplicated SNI list to *filepath*; return the count.
+
+    Ported (and adapted) from the reference ``DomainChecker.export_sni_list``.
+    Where the reference filtered ``DomainResult`` objects, our pool already
+    works with plain SNI strings, so this trims/dedupes them, writes a small
+    provenance header, and returns how many were written. Blank/whitespace
+    entries are dropped. The file is UTF-8 and newline-terminated so it can be
+    pasted straight back into the multi-SNI box in Settings.
+    """
+    clean = _dedupe([str(s).strip() for s in (snis or []) if str(s).strip()])
+    lines = [
+        f"# {header}",
+        "# Generated by the SNI route-pool exporter",
+        f"# Total: {len(clean)} entries",
+        "",
+    ]
+    lines.extend(clean)
+    text = "\n".join(lines) + ("\n" if clean else "")
+    with open(filepath, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return len(clean)
+
+
+def export_routes(
+    manager_or_config,
+    filepath: str,
+    *,
+    stable_only: bool = False,
+) -> int:
+    """Export the pool's ``(IP, SNI)`` routes to *filepath*; return the count.
+
+    Accepts either a live :class:`ConnectionManager` (exports its current
+    explorer stats, optionally only the *stable* pairs) or a plain config dict
+    (exports the configured cartesian product). Each line is ``IP\\tSNI`` with a
+    trailing ``loss%`` column when live stats are available, so the user can
+    eyeball which routes are healthy. Returns the number of routes written.
+    """
+    rows: List[Tuple[str, str, Optional[float]]] = []
+
+    explorer = None
+    if isinstance(manager_or_config, ConnectionManager):
+        explorer = manager_or_config.explorer
+    elif hasattr(manager_or_config, "explorer"):
+        explorer = getattr(manager_or_config, "explorer")
+
+    if explorer is not None:
+        stats = explorer.stable_stats() if stable_only else explorer.all_stats()
+        for ps in sorted(stats, key=lambda p: p.score):
+            loss = ps.combined_loss_rate if ps.probed else None
+            rows.append((ps.ip, ps.sni, loss))
+    elif isinstance(manager_or_config, dict):
+        cfg = manager_or_config
+        ips = _dedupe([str(x).strip() for x in (cfg.get("CONNECT_IPS") or [])
+                       if str(x).strip()]) or (
+            [str(cfg["CONNECT_IP"]).strip()] if cfg.get("CONNECT_IP") else [])
+        snis = _dedupe([str(x).strip() for x in (cfg.get("FAKE_SNIS") or [])
+                        if str(x).strip()]) or (
+            [str(cfg["FAKE_SNI"]).strip()] if cfg.get("FAKE_SNI") else [])
+        for ip in ips:
+            for sni in snis:
+                rows.append((ip, sni, None))
+    else:
+        raise TypeError(
+            "export_routes expects a ConnectionManager or config dict")
+
+    lines = [
+        "# SNI route-pool export (IP <TAB> SNI [<TAB> loss%])",
+        f"# Total: {len(rows)} routes",
+        "",
+    ]
+    for ip, sni, loss in rows:
+        if loss is None:
+            lines.append(f"{ip}\t{sni}")
+        else:
+            lines.append(f"{ip}\t{sni}\t{loss * 100:.1f}%")
+    text = "\n".join(lines) + ("\n" if rows else "")
+    with open(filepath, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return len(rows)

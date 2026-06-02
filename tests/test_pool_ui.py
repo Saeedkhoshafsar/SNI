@@ -192,6 +192,93 @@ class EngineBridgePoolSummaryTest(unittest.TestCase):
         self.assertGreaterEqual(snap.get("known", 0), 1)
         self.assertGreaterEqual(snap.get("active", 0), 1)
 
+    def test_live_summary_includes_failover(self):
+        from core.pool import ConnectionManager, FAILOVER_THRESHOLD
+        from ui.engine_bridge import EngineBridge
+        from core.engine import EngineController
+        b = EngineBridge(EngineController({}))
+        combos = [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")]
+        mgr = ConnectionManager(combos, 443,
+                                probe_fn=lambda ip, p, to: True)
+        mgr.explorer.initial_explore()
+        mgr.pool.initialize()
+        for _ in range(FAILOVER_THRESHOLD):
+            mgr.tracker.record_failure("1.1.1.1")
+        b.controller.conn_manager = mgr
+        snap = b.pool_summary({})
+        self.assertIn("failover", snap)
+        self.assertIn("1.1.1.1", snap.get("blocked_ips", []))
+
+
+@unittest.skipUnless(_HAVE_QT, "PySide6 not available")
+class PoolPageFailoverExportTest(unittest.TestCase):
+    def _page(self):
+        from ui.window import PoolPage
+        return PoolPage()
+
+    def test_failover_line_lists_blocked(self):
+        page = self._page()
+        page.set_provider(lambda: {
+            "enabled": True, "total": 2, "known": 2, "stable": 1, "weak": 1,
+            "dead": 0, "unexplored": 0, "active": 1, "seconds_since_check": 3,
+            "rows": [{"ip": "1.1.1.1", "sni": "a.com", "loss": 0.0,
+                      "alive": True, "active": 1, "in_pool": True}],
+            "blocked_ips": ["9.9.9.9"],
+        })
+        self.assertIn("9.9.9.9", page.lbl_failover.text())
+
+    def test_failover_line_all_healthy(self):
+        page = self._page()
+        page.set_provider(lambda: {
+            "enabled": True, "total": 2, "known": 2, "active": 1,
+            "seconds_since_check": 1, "rows": [], "blocked_ips": [],
+        })
+        self.assertIn("سالم", page.lbl_failover.text())
+
+    def test_export_button_disabled_when_pool_off(self):
+        page = self._page()
+        page.set_provider(lambda: {"enabled": False})
+        self.assertFalse(page.btn_export.isEnabled())
+
+    def test_export_button_enabled_when_pool_on(self):
+        page = self._page()
+        page.set_provider(lambda: {
+            "enabled": True, "total": 1, "rows": [
+                {"ip": "1.1.1.1", "sni": "a.com", "loss": 0.0,
+                 "alive": True, "active": 0, "in_pool": True}],
+        })
+        self.assertTrue(page.btn_export.isEnabled())
+
+    def test_export_writes_snis(self):
+        import tempfile
+        from unittest import mock
+        page = self._page()
+        page.set_provider(lambda: {
+            "enabled": True, "total": 2, "rows": [
+                {"ip": "1.1.1.1", "sni": "a.com", "loss": 0.0, "alive": True,
+                 "active": 0, "in_pool": True},
+                {"ip": "2.2.2.2", "sni": "b.com", "loss": 0.0, "alive": True,
+                 "active": 0, "in_pool": True}],
+        })
+        path = os.path.join(tempfile.mkdtemp(), "out.txt")
+        with mock.patch("ui.window.QFileDialog.getSaveFileName",
+                        return_value=(path, "")), \
+             mock.patch("ui.window.QMessageBox.information"):
+            page._on_export()
+        body = open(path, encoding="utf-8").read()
+        self.assertIn("a.com", body)
+        self.assertIn("b.com", body)
+
+    def test_export_no_snis_shows_info(self):
+        from unittest import mock
+        page = self._page()
+        page.set_provider(lambda: {"enabled": True, "total": 0, "rows": []})
+        with mock.patch("ui.window.QMessageBox.information") as info, \
+             mock.patch("ui.window.QFileDialog.getSaveFileName") as save:
+            page._on_export()
+            info.assert_called_once()
+            save.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,10 +18,10 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit,
-    QProgressBar, QPushButton, QScrollArea, QSizeGrip, QSpinBox,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSizeGrip, QSpinBox, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 
@@ -2237,6 +2237,7 @@ class PoolPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._provider = None          # callable -> snapshot dict
+        self._last_snap = None         # latest snapshot (for the export action)
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
         root.setSpacing(16)
@@ -2253,25 +2254,39 @@ class PoolPage(QWidget):
         self.lbl_counts.setObjectName("Faint")
         self.lbl_check = QLabel(tr("آخرین سلامت‌سنجی: —"))
         self.lbl_check.setObjectName("Faint")
+        # per-IP rapid-failover state (7.8): shows any IP currently blocked
+        self.lbl_failover = QLabel(tr("بازیابی خودکار: —"))
+        self.lbl_failover.setObjectName("Faint")
+        self.lbl_failover.setWordWrap(True)
         self.lbl_help = QLabel(tr(
             "وقتی بیش از یک IP یا SNI در «تنظیمات» وارد کنید، حاصل‌ضرب آن‌ها یک "
             "استخر مسیر می‌سازد: هر مسیر در پس‌زمینه سلامت‌سنجی می‌شود و بهترین‌ها "
             "با انتخاب وزنی (هرچه افت کمتر، شانس بیشتر) و بدون قطع اتصال‌های زنده "
-            "به‌کار می‌روند. اگر فقط یک مسیر باشد، استخر غیرفعال است."))
+            "به‌کار می‌روند. اگر یک IP پشت‌سرهم خطا دهد، خودکار کنار گذاشته می‌شود. "
+            "اگر فقط یک مسیر باشد، استخر غیرفعال است."))
         self.lbl_help.setObjectName("Faint")
         self.lbl_help.setWordWrap(True)
         sb.addWidget(self.lbl_state)
         sb.addWidget(self.lbl_counts)
         sb.addWidget(self.lbl_check)
+        sb.addWidget(self.lbl_failover)
         sb.addWidget(self.lbl_help)
         root.addWidget(summary)
 
         # --- per-pair table card -----------------------------------------
         pairs = Card()
         pb = pairs.body()
+        head = QHBoxLayout()
         ph = QLabel(tr("مسیرها (IP × SNI)"))
         ph.setObjectName("H2")
-        pb.addWidget(ph)
+        head.addWidget(ph)
+        head.addStretch(1)
+        # 7.10 — export the current routes / SNIs to a text file.
+        self.btn_export = QPushButton(tr("خروجی فهرست SNI…"))
+        self.btn_export.setObjectName("Ghost")
+        self.btn_export.clicked.connect(self._on_export)
+        head.addWidget(self.btn_export)
+        pb.addLayout(head)
         self.tbl = QPlainTextEdit()
         self.tbl.setObjectName("Log")
         self.tbl.setReadOnly(True)
@@ -2309,14 +2324,18 @@ class PoolPage(QWidget):
 
     # -- rendering --------------------------------------------------------
     def _render(self, snap) -> None:
+        self._last_snap = snap if isinstance(snap, dict) else None
         if not snap or not snap.get("enabled"):
             self.lbl_state.setText(tr("استخر: غیرفعال (حالت تک‌مسیره)"))
             self.lbl_counts.setText(tr("مسیرها: —"))
             self.lbl_check.setText(tr("آخرین سلامت‌سنجی: —"))
+            self.lbl_failover.setText(tr("بازیابی خودکار: —"))
+            self.btn_export.setEnabled(False)
             self.tbl.setPlainText(tr(
                 "استخر فعال نیست. در «تنظیمات» بیش از یک IP یا SNI وارد کنید "
                 "تا استخر چند-مسیره ساخته شود."))
             return
+        self.btn_export.setEnabled(True)
 
         total = int(snap.get("total", 0))
         known = int(snap.get("known", 0))
@@ -2341,7 +2360,49 @@ class PoolPage(QWidget):
             self.lbl_check.setText(
                 tr("آخرین سلامت‌سنجی: {s} ثانیه پیش").format(s=int(secs)))
 
+        # per-IP failover line (7.8): list any IP currently in rapid-failover.
+        blocked = snap.get("blocked_ips") or []
+        if blocked:
+            self.lbl_failover.setText(tr(
+                "بازیابی خودکار: {n} IP موقتاً کنار گذاشته شد — {ips}").format(
+                    n=len(blocked), ips="، ".join(str(x) for x in blocked)))
+        else:
+            self.lbl_failover.setText(tr("بازیابی خودکار: همه‌ی IPها سالم‌اند"))
+
         self.tbl.setPlainText(self._pair_table(snap.get("rows", []) or []))
+
+    # -- export (7.10) ----------------------------------------------------
+    def _on_export(self) -> None:
+        """Write the current pool's SNIs to a user-chosen text file."""
+        snap = self._last_snap
+        rows = (snap or {}).get("rows", []) if isinstance(snap, dict) else []
+        snis = []
+        seen = set()
+        for r in rows:
+            s = str(r.get("sni", "")).strip()
+            if s and s not in seen:
+                seen.add(s)
+                snis.append(s)
+        if not snis:
+            QMessageBox.information(
+                self, tr("خروجی SNI"),
+                tr("هنوز هیچ SNIِ آزموده‌شده‌ای برای خروجی‌گرفتن وجود ندارد."))
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr("ذخیره‌ی فهرست SNI"), "sni_list.txt",
+            tr("فایل متنی (*.txt)"))
+        if not path:
+            return
+        try:
+            from core.pool import export_sni_list
+            n = export_sni_list(snis, path)
+            QMessageBox.information(
+                self, tr("خروجی SNI"),
+                tr("{n} مورد در فایل ذخیره شد.").format(n=n))
+        except Exception as exc:
+            QMessageBox.warning(
+                self, tr("خروجی SNI"),
+                tr("ذخیره ناموفق بود: {e}").format(e=exc))
 
     @staticmethod
     def _pair_table(rows: list) -> str:
