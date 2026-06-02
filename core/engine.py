@@ -1797,7 +1797,12 @@ class EngineController:
         if self.conn_manager is not None and hasattr(self._proxy, "conn_manager"):
             self._proxy.conn_manager = self.conn_manager
             try:
-                ps = self.conn_manager.lookup_pair(connect_ip, fake_sni)
+                # ensure_pair (not lookup_pair): the primary route is usually NOT
+                # one of the pool's cartesian combinations, so we must CREATE a
+                # stats object for it — otherwise its real-traffic successes are
+                # never recorded and the tracker can't tell it works, letting the
+                # promoter swap it for a probe-only route (the TimeoutError flood).
+                ps = self.conn_manager.ensure_pair(connect_ip, fake_sni)
                 if ps is not None and hasattr(self._proxy, "_active_pair"):
                     self._proxy._active_pair = ps
             except Exception:

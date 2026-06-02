@@ -594,6 +594,62 @@ class BackgroundOptimiserTest(unittest.TestCase):
         # candidate equals current (or no strict margin) ⇒ None
         self.assertIsNone(better)
 
+    def test_healthy_route_never_swapped_even_if_probe_clean_candidate_exists(self):
+        """THE GOLDEN RULE / regression guard for the TimeoutError flood.
+
+        A working (healthy) route must NEVER be swapped for a probe-clean
+        candidate — a clean TCP probe does not prove DPI bypass. Even when a
+        different IP probes perfectly and the current route is NOT in the pool
+        (lookup_pair → None, exactly the field scenario), find_better_route must
+        return None while the incumbent is healthy.
+        """
+        # the current route (the user's confirmed primary) is NOT in the pool;
+        # 2.2.2.2 probes squeaky-clean and would look "better" by probe loss.
+        combos = [("2.2.2.2", "cloudflare.com")]
+        mgr = self._mgr(combos, ["2.2.2.2"])
+        self.assertIsNone(mgr.lookup_pair("104.19.229.21", "www.hcaptcha.com"))
+        better = mgr.find_better_route(
+            "104.19.229.21", "www.hcaptcha.com", current_healthy=True)
+        self.assertIsNone(better)  # working route left alone — no churn
+
+    def test_broken_route_prefers_real_proven_candidate(self):
+        """When broken, prefer a candidate proven by REAL traffic over a
+        probe-only candidate, even if the probe-only one has lower probe loss."""
+        combos = [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")]
+        # both probe clean; 1.1.1.1 has carried successful REAL traffic, 2.2.2.2
+        # only probed clean.
+        mgr = self._mgr(combos, ["1.1.1.1", "2.2.2.2"])
+        proven = mgr.lookup_pair("1.1.1.1", "a.com")
+        proven.record_real_packet(lost=False)  # real-traffic proof
+        self.assertTrue(proven.real_proven)
+        unproven = mgr.lookup_pair("2.2.2.2", "b.com")
+        self.assertFalse(unproven.real_proven)
+        better = mgr.find_better_route("9.9.9.9", "x.com",
+                                       current_healthy=False)
+        self.assertIsNotNone(better)
+        self.assertEqual(better.ip, "1.1.1.1")  # real-proven wins
+
+    def test_ensure_pair_creates_when_missing(self):
+        combos = [("1.1.1.1", "a.com")]
+        mgr = self._mgr(combos, ["1.1.1.1"])
+        self.assertIsNone(mgr.lookup_pair("5.5.5.5", "primary.com"))
+        ps = mgr.ensure_pair("5.5.5.5", "primary.com")
+        self.assertIsNotNone(ps)
+        self.assertEqual((ps.ip, ps.sni), ("5.5.5.5", "primary.com"))
+        # now lookup finds it and real outcomes can attribute to it
+        self.assertIs(mgr.lookup_pair("5.5.5.5", "primary.com"), ps)
+        # idempotent — same object returned
+        self.assertIs(mgr.ensure_pair("5.5.5.5", "primary.com"), ps)
+
+    def test_real_proven_property(self):
+        ps = PairStats("1.1.1.1", "a.com")
+        self.assertFalse(ps.real_proven)        # no real traffic yet
+        ps.record_real_packet(lost=False)
+        self.assertTrue(ps.real_proven)         # one good real packet → proven
+        ps2 = PairStats("2.2.2.2", "b.com")
+        ps2.record_real_packet(lost=True)       # 100% real loss
+        self.assertFalse(ps2.real_proven)       # too lossy → not proven
+
     def test_find_better_route_never_returns_current(self):
         combos = [("1.1.1.1", "a.com")]
         mgr = ConnectionManager(combos + [("2.2.2.2", "b.com")], 443,

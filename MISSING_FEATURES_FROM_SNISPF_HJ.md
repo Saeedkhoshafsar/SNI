@@ -366,3 +366,38 @@ chosen  = random.choices(pool, weights=weights, k=1)[0]
 `ui/engine_bridge.py` (active_route/best_route در snapshot).
 
 **تست:** ۶۶۶ تست سبز (۲۸ تست جدید).
+
+---
+
+## ۱۱. اصلاحیه (Phase 4.1) — promote فقط بر اساس «ترافیک واقعی»، نه probe
+
+**گزارش میدانی:** کاربر نسخه‌ی Phase 4 (commit `ca06d3d`) را تست کرد. «یه لحظه سرعت
+خوبی داشت» ولی دوباره به سیل `TimeoutError` خورد. لاگ نشان داد:
+
+* `20:12:42` مسیرِ `104.19.229.21 + www.hcaptcha.com` **کار کرد** (HTTP 200، محتوای واقعی).
+* `20:13:16` promoter آن را با `172.66.41.252 + www.cloudflare.com` عوض کرد →
+  بلافاصله سیل `TimeoutError`. سپس هر ~۱۰ ثانیه churn به google.com، phpbb.com،
+  nextjs.org، apple.com، one.one.one.one … .
+
+**ریشه‌ی واقعی (درس کلیدی):** یک probe تمیزِ TCP **اثبات نمی‌کند** که آن مسیر می‌تواند
+یک ClientHello جعلی را از DPI رد کند. خیلی از IPهای CDN، TCP-وصل می‌شوند (probe loss=0)
+ولی تزریق SNI جعلی تایم‌اوت می‌خورد. پس promote کردن صرفاً بر اساس probe loss، یک مسیرِ
+*کارا* را با مسیرهای probe-سالم-ولی-DPI-مرده عوض می‌کرد. ضمناً مسیر تکیِ کاربر در استخرِ
+۴۲۹تایی نبود؛ پس `lookup_pair`=None و successهای واقعیِ آن هرگز ثبت نمی‌شد.
+
+**اصلاح (governed by REAL TRAFFIC):**
+1. **قانون طلایی:** مسیرِ سالم (که ترافیک واقعی را موفق حمل می‌کند) **هرگز** عوض نمی‌شود.
+   `find_better_route(..., current_healthy=True)` همیشه `None` برمی‌گرداند → پایانِ churn.
+2. **فقط وقتی مسیر واقعاً خراب است** (failover tracker از شکست‌های واقعی فعال شده) swap
+   می‌کنیم — و آن هم به **بهترین** کاندید که با ترافیک واقعی اثبات شده (`real_proven`).
+3. **`PairStats.real_proven`:** مسیر فقط وقتی «اثبات‌شده» است که حداقل
+   `REAL_PROOF_MIN_PACKETS` بسته‌ی واقعی با loss ≤ `REAL_PROOF_MAX_LOSS` حمل کرده باشد.
+   `best_candidate()` کاندیدهای real-proven را همیشه بالاتر از probe-only رتبه می‌دهد.
+4. **`ConnectionManager.ensure_pair(ip, sni)`:** برای مسیر تکیِ کاربر (که معمولاً در استخر
+   نیست) یک `PairStats` می‌سازد تا successهای واقعیِ آن ثبت شوند و tracker بفهمد کار می‌کند.
+
+**فایل‌های تغییر یافته:** `core/pool.py` (real_proven + best_candidate بر پایه‌ی proof +
+find_better_route قانون طلایی + ensure_pair + REAL_PROOF_* constants)،
+`core/engine.py` (بایند مسیر اولیه با `ensure_pair` به‌جای `lookup_pair`).
+
+**تست:** ۶۷۰ تست سبز (۴ تست جدید: قانون طلایی، ترجیح real-proven، ensure_pair، real_proven).

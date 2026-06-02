@@ -58,14 +58,27 @@ FAILOVER_THRESHOLD: int = 3
 FAILOVER_WINDOW: float = 30.0
 
 
-# --- background-optimiser promotion policy (redesign) -----------------------
-# The optimiser only swaps the live route for a candidate that is *strictly*
-# better. A healthy incumbent gets a margin advantage so tiny probe jitter never
-# triggers churn (the "suddenly good / suddenly bad" complaint). A candidate
-# must beat the incumbent's loss by at least this margin AND have been probed
-# enough times to be trustworthy.
-PROMOTE_MARGIN: float = 0.15          # candidate.loss must be ≥ this lower
+# --- background-optimiser promotion policy (redesign v2) --------------------
+# CRITICAL LESSON FROM THE FIELD: a clean TCP probe does NOT mean a route can
+# carry a spoofed ClientHello past DPI. Many CDN IPs accept the TCP handshake
+# (probe loss = 0) yet the fake-SNI injection times out — so promoting purely on
+# probe loss swapped a *working* route for probe-clean-but-DPI-dead ones and
+# flooded the log with TimeoutError. Therefore the promoter is now governed by
+# REAL TRAFFIC, not probes:
+#
+#   * We NEVER swap away from a route that is serving real traffic successfully
+#     (a healthy incumbent is the strongest evidence we have — leave it alone).
+#   * We only swap when the current route is genuinely BROKEN (rapid real
+#     failures via the ConnectionTracker), and only TO a candidate that is not
+#     itself failing — preferring one with proven real-traffic success.
+#   * Probe data is used only as a weak tie-breaker / liveness gate, never as a
+#     reason to disturb a working route.
+PROMOTE_MARGIN: float = 0.15          # (legacy) probe-loss margin, tie-break only
 PROMOTE_MIN_PROBES: int = 3           # min probes before a candidate is trusted
+# A candidate is "real-proven" once it has carried at least this many successful
+# real connections with an acceptable real-loss rate.
+REAL_PROOF_MIN_PACKETS: int = 1
+REAL_PROOF_MAX_LOSS: float = 0.50
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +180,19 @@ class PairStats:
     def is_stable(self) -> bool:
         """True when the pair is alive and has been probed at least once."""
         return self.alive and self.probed
+
+    @property
+    def real_proven(self) -> bool:
+        """True when this pair has actually carried *real* traffic successfully.
+
+        A clean TCP probe only proves the IP accepts a connection — it does NOT
+        prove a spoofed ClientHello survives DPI. Only real forwarded traffic
+        with an acceptable loss rate proves the route really works end-to-end.
+        This is the gate the promoter trusts when swapping a broken route.
+        """
+        if self.real_packets_sent < REAL_PROOF_MIN_PACKETS:
+            return False
+        return self.real_loss_rate <= REAL_PROOF_MAX_LOSS
 
     # ------------------------------------------------------------------
     # Mutation helpers (thread-safe)
@@ -858,13 +884,20 @@ class ConnectionManager:
     # ------------------------------------------------------------------
 
     def best_candidate(self) -> Optional[PairStats]:
-        """Return the single best *stable* pair the optimiser has found, or None.
+        """Return the single best candidate the optimiser has found, or None.
 
-        "Best" = alive, probed enough times to be trusted, not currently in
-        rapid-failover, and lowest combined-loss. This is what the engine's
-        promoter compares against the live route. We never return an unprobed or
-        dead pair — promoting one of those would just reintroduce the cold-pool
-        TimeoutError problem.
+        Ranking is governed by REAL TRAFFIC first, probes only as a tie-break:
+
+          1. A candidate that has *proven* itself with successful real traffic
+             (:attr:`PairStats.real_proven`) always beats one that has only been
+             TCP-probed — a clean probe does NOT mean a spoofed ClientHello
+             survives DPI, so real-traffic proof is the only trustworthy signal.
+          2. Among candidates of the same proof tier, the lower combined-loss
+             wins.
+
+        We still skip dead/unprobed pairs and any IP currently tripped in the
+        rapid-failover tracker, so we never hand the promoter a route that is
+        already known to be failing.
         """
         best: Optional[PairStats] = None
         for ps in self.explorer.stable_stats():
@@ -872,13 +905,44 @@ class ConnectionManager:
                 continue
             if self.tracker.should_failover(ps.ip):
                 continue
-            if best is None or ps.combined_loss_rate < best.combined_loss_rate:
+            if best is None or self._candidate_is_better(ps, best):
                 best = ps
         return best
+
+    @staticmethod
+    def _candidate_is_better(cand: PairStats, incumbent: PairStats) -> bool:
+        """True if ``cand`` should outrank ``incumbent`` as the best candidate.
+
+        Real-traffic proof dominates; combined-loss only breaks ties within the
+        same proof tier.
+        """
+        if cand.real_proven != incumbent.real_proven:
+            return cand.real_proven  # proven beats unproven, always
+        return cand.combined_loss_rate < incumbent.combined_loss_rate
 
     def lookup_pair(self, ip: str, sni: str) -> Optional[PairStats]:
         """Return the :class:`PairStats` for an (ip, sni) if it lives in the pool."""
         return self.explorer.stats.get((ip, sni))
+
+    def ensure_pair(self, ip: str, sni: str) -> PairStats:
+        """Return the :class:`PairStats` for ``(ip, sni)``, creating it if absent.
+
+        The user's confirmed primary route is frequently NOT one of the
+        cartesian (IPs × SNIs) pool combinations, so :meth:`lookup_pair` returns
+        ``None`` for it. Without a stats object the spoofer can't attribute the
+        primary route's real-traffic successes/failures to anything — meaning the
+        tracker never learns the primary actually works and the promoter has no
+        real-traffic proof to weigh. ``ensure_pair`` guarantees the primary (or
+        any route we adopt) is tracked, so real outcomes are always recorded.
+        """
+        key = (ip, sni)
+        existing = self.explorer.stats.get(key)
+        if existing is not None:
+            return existing
+        ps = PairStats(ip, sni)
+        # register so probes/scoring/lookup all see it from now on
+        self.explorer.stats[key] = ps
+        return ps
 
     def find_better_route(
         self,
@@ -887,35 +951,38 @@ class ConnectionManager:
         *,
         current_healthy: bool,
     ) -> Optional[PairStats]:
-        """Two-mode promotion decision used by the engine's background promoter.
+        """Real-traffic-governed promotion decision for the background promoter.
 
-        * **Healthy incumbent** (``current_healthy=True``): only return a
-          candidate that beats the current route's combined-loss by at least
-          :data:`PROMOTE_MARGIN` — a conservative upgrade that ignores jitter so
-          a working route is never disturbed for a marginal gain.
+        THE GOLDEN RULE (learned the hard way from the TimeoutError flood):
+        **a working route is the strongest evidence we have — never disturb it.**
+
+        * **Healthy incumbent** (``current_healthy=True``): the live route is
+          carrying real traffic without rapid failures. We return ``None`` — no
+          swap, full stop. A clean TCP probe on some other IP does NOT prove it
+          can carry a spoofed ClientHello past DPI, so we refuse to gamble a
+          working route for a probe-only "upgrade". This kills the route-churn /
+          TimeoutError-flood regression.
 
         * **Broken incumbent** (``current_healthy=False``): the current route is
-          failing, so return the best stable candidate *as soon as one exists*
-          (emergency replacement) — anything trusted is better than a route that
-          doesn't work. This is the "no working single route ⇒ swap in the first
-          good thing, then keep upgrading" case.
+          genuinely failing (rapid real failures via the tracker). Only now do we
+          swap, and we swap to the *best* candidate — which, by
+          :meth:`best_candidate`, prefers one already proven with real traffic.
+          This is the "no working route ⇒ move to the first good thing, then keep
+          upgrading among broken ones" case.
 
         Returns ``None`` when no swap is warranted.
         """
+        # Healthy route → leave it alone. This is the whole fix.
+        if current_healthy:
+            return None
+
         cand = self.best_candidate()
         if cand is None:
             return None
-        # never "upgrade" to the route we're already on
+        # never "swap" to the route we're already on
         if cand.ip == current_ip and cand.sni == current_sni:
             return None
-        if not current_healthy:
-            return cand
-        # healthy incumbent → require a strict margin over the current route
-        cur = self.lookup_pair(current_ip, current_sni)
-        cur_loss = cur.combined_loss_rate if (cur is not None and cur.probed) else 0.0
-        if cand.combined_loss_rate <= cur_loss - PROMOTE_MARGIN:
-            return cand
-        return None
+        return cand
 
 
 # ---------------------------------------------------------------------------
