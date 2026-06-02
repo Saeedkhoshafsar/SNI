@@ -23,6 +23,21 @@ from core.profile import Profile
 #  Fakes
 # --------------------------------------------------------------------------
 
+class _HangingOpener:
+    """An opener whose every request blocks for (almost) the full per-request
+    timeout before raising — simulating a dead route that neither answers nor
+    fails fast. Used to prove the hard wall-clock deadline aborts the whole
+    measurement instead of letting each fallback attempt burn its own timeout.
+    """
+
+    def open(self, _req, timeout=None):
+        import time
+        # sleep close to the (already deadline-bounded) per-request timeout so
+        # the wall-clock guard — not the socket timeout — is what stops us.
+        time.sleep(min(float(timeout or 1.0), 1.0))
+        raise OSError("simulated dead route (no response)")
+
+
 class FakeProxy:
     last_instance = None
 
@@ -1056,7 +1071,8 @@ class EnginePingTest(unittest.TestCase):
             lambda self, profile, **k: (object(), lambda: None, None))
         saved_probe = EngineController._v2ray_style_delay
         EngineController._v2ray_style_delay = (
-            lambda self, opener, per_timeout, attempts=2: (True, 64.0, "ok"))
+            lambda self, opener, per_timeout, attempts=2, **_k:
+            (True, 64.0, "ok"))
         try:
             ok, ms, detail = ctrl.measure_profile_delay(
                 self._profile("h"), timeout=2.0)
@@ -1131,6 +1147,187 @@ class EnginePingTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNone(ms)
         self.assertIsInstance(detail, str)
+
+    def test_measure_profile_delay_hard_deadline_stops_a_dead_config(self):
+        """A broken config used to grind through every fallback endpoint ×
+        attempt (each with a multi-second timeout) for up to a minute. With a
+        hard wall-clock ``deadline`` the whole measurement must return in
+        roughly ``deadline`` seconds — not 30-60 s. We simulate a route that
+        hangs each request until its per-request timeout fires, and assert the
+        TOTAL wall-clock is bounded by the deadline (with slack), proving we
+        stop spending fallback attempts past the budget.
+        """
+        import time as _t
+        ctrl = EngineController({})
+
+        saved_spawn = EngineController._spawn_measure_core
+        EngineController._spawn_measure_core = (
+            lambda self, profile, **k: (_HangingOpener(), lambda: None, None))
+        try:
+            t0 = _t.time()
+            ok, ms, detail = ctrl.measure_profile_delay(
+                self._profile("dead"), timeout=15.0, deadline=2.0)
+            elapsed = _t.time() - t0
+        finally:
+            EngineController._spawn_measure_core = saved_spawn
+
+        self.assertFalse(ok)            # dead config stays red
+        self.assertIsNone(ms)
+        # the whole thing must finish near the 2 s budget, NOT minutes. Generous
+        # slack (one in-flight request may run to its own timeout) but still far
+        # below the old worst case.
+        self.assertLess(elapsed, 6.0, f"deadline not honored: {elapsed:.1f}s")
+
+    def test_measure_profile_download_hard_deadline_stops_a_dead_config(self):
+        """Same guarantee for the download test: a route that never streams
+        bytes must be abandoned at the wall-clock ``deadline`` instead of
+        marching through 5 URLs × 2 attempts × a ~13 s timeout (~2 min)."""
+        import time as _t
+        ctrl = EngineController({})
+
+        saved_spawn = EngineController._spawn_measure_core
+        EngineController._spawn_measure_core = (
+            lambda self, profile, **k: (_HangingOpener(), lambda: None, None))
+        # restore the ORIGINAL staticmethod descriptor (not the bound function)
+        # so a later test relying on the real _warm_tunnel isn't broken.
+        saved_warm = EngineController.__dict__["_warm_tunnel"]
+        EngineController._warm_tunnel = staticmethod(lambda *_a, **_k: None)
+        try:
+            t0 = _t.time()
+            ok, mbps, detail = ctrl.measure_profile_download(
+                self._profile("dead"), duration=6.0, deadline=2.0)
+            elapsed = _t.time() - t0
+        finally:
+            EngineController._spawn_measure_core = saved_spawn
+            EngineController._warm_tunnel = saved_warm
+
+        self.assertFalse(ok)
+        self.assertIsNone(mbps)
+        self.assertLess(elapsed, 6.0, f"deadline not honored: {elapsed:.1f}s")
+
+    def test_v2ray_style_delay_respects_end_by(self):
+        """The stable delay helper must stop firing attempts once the wall-clock
+        ``end_by`` has passed — a working config returns immediately, a dead one
+        is not retried into oblivion."""
+        import time as _t
+        ctrl = EngineController({})
+
+        calls = {"n": 0}
+
+        class _Opener:
+            def open(self, _req, timeout=None):
+                calls["n"] += 1
+                raise OSError("refused")
+
+        # end_by already in the past → no attempt should even start.
+        ok, ms, _d = ctrl._v2ray_style_delay(
+            _Opener(), per_timeout=5.0, attempts=2, end_by=_t.time() - 1.0)
+        self.assertFalse(ok)
+        self.assertEqual(calls["n"], 0, "fired requests past the deadline")
+
+    def _spoof_profile(self):
+        """A spoof profile: its server address is a loopback port (our SNI
+        spoofer), which is exactly what ``Profile.is_spoof_config`` keys on."""
+        p = self._profile("127.0.0.1", port=40443)
+        assert p.is_spoof_config, "fixture must be recognised as a spoof config"
+        return p
+
+    def test_spoof_config_gets_longer_budget_than_ordinary(self):
+        """A spoof config must be given a noticeably LONGER wall-clock budget
+        than an ordinary one — it's slow to ESTABLISH and a too-tight cap
+        false-reds working servers. We assert the per-attempt 'wall' the engine
+        chooses for a spoof config exceeds the ordinary one (v2rayN gives spoof/
+        relay paths a 1 s warm-up + a 10 s ping budget; we mirror the spirit).
+        """
+        ctrl = EngineController({})
+        seen = []
+
+        def _capture(self, profile, *, timeout, wall, is_spoof):
+            seen.append((is_spoof, wall))
+            return (False, None, "captured")
+
+        saved = EngineController._measure_profile_delay_once
+        EngineController._measure_profile_delay_once = _capture
+        try:
+            ctrl.measure_profile_delay(self._profile("plain"))
+            ctrl.measure_profile_delay(self._spoof_profile())
+        finally:
+            EngineController._measure_profile_delay_once = saved
+
+        ordinary_wall = next(w for sp, w in seen if not sp)
+        spoof_wall = next(w for sp, w in seen if sp)
+        self.assertGreater(spoof_wall, ordinary_wall,
+                           "spoof must get a longer budget to establish")
+        self.assertGreaterEqual(spoof_wall, 10.0,
+                                "spoof budget should be roomy (v2rayN ~10 s+)")
+
+    def test_spoof_config_gets_second_chance_before_red(self):
+        """v2rayN re-tests whatever fails the first pass (RunRealPingBatchAsync
+        → lstFailed). We mirror that: a spoof config that FAILS its first
+        attempt but SUCCEEDS on the second must end up green — a slow wake-up
+        no longer false-reds a working spoof server."""
+        ctrl = EngineController({})
+        calls = {"n": 0}
+
+        def _flaky_once(self, profile, *, timeout, wall, is_spoof):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return (False, None, "cold start")     # first pass: not ready
+            return (True, 120.0, "verified on retry")  # second pass: works
+
+        saved = EngineController._measure_profile_delay_once
+        EngineController._measure_profile_delay_once = _flaky_once
+        try:
+            ok, ms, detail = ctrl.measure_profile_delay(self._spoof_profile())
+        finally:
+            EngineController._measure_profile_delay_once = saved
+
+        self.assertTrue(ok, "spoof must get a second chance, not instant red")
+        self.assertEqual(calls["n"], 2, "exactly one automatic retry expected")
+        self.assertAlmostEqual(ms, 120.0)
+
+    def test_ordinary_config_is_judged_on_a_single_pass(self):
+        """An ordinary (non-spoof) config is fast and deterministic — it gets
+        exactly ONE pass, no extra retry (that's reserved for slow spoof
+        configs), so a healthy config still resolves quickly."""
+        ctrl = EngineController({})
+        calls = {"n": 0}
+
+        def _once(self, profile, *, timeout, wall, is_spoof):
+            calls["n"] += 1
+            return (False, None, "dead")
+
+        saved = EngineController._measure_profile_delay_once
+        EngineController._measure_profile_delay_once = _once
+        try:
+            ctrl.measure_profile_delay(self._profile("plain"))
+        finally:
+            EngineController._measure_profile_delay_once = saved
+        self.assertEqual(calls["n"], 1, "ordinary config must not be retried")
+
+    def test_spoof_download_gets_second_chance(self):
+        """Same automatic-retry guarantee for the download test: a spoof config
+        that fails its first download attempt but streams on the second ends up
+        green (mirrors v2rayN's failed-part retest)."""
+        ctrl = EngineController({})
+        calls = {"n": 0}
+
+        def _flaky(self, profile, *, duration, max_bytes, wall, is_spoof):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return (False, None, "cold")
+            return (True, 12.5, "ok on retry")
+
+        saved = EngineController._measure_profile_download_once
+        EngineController._measure_profile_download_once = _flaky
+        try:
+            ok, mbps, detail = ctrl.measure_profile_download(
+                self._spoof_profile())
+        finally:
+            EngineController._measure_profile_download_once = saved
+        self.assertTrue(ok)
+        self.assertEqual(calls["n"], 2)
+        self.assertAlmostEqual(mbps, 12.5)
 
     def test_probe_strategies_via_engine_picks_winner(self):
         import core.prober as prober_mod

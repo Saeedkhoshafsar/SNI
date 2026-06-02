@@ -1761,8 +1761,16 @@ class InlinePingWorker(QThread):
         # can't carry traffic simply won't stream — no fast false-negative.
         if self._mode == "download":
             try:
+                # The engine picks the right wall-clock budget per config type:
+                # ordinary configs are judged fast (~8 s), while SPOOF configs —
+                # which are slow to ESTABLISH — get a longer window + an
+                # automatic second chance (modeled on v2rayN's failed-part
+                # retest) so a working-but-slow-to-wake spoof isn't false-red,
+                # yet a genuinely dead config still bails in seconds instead of
+                # hanging for a minute. We DON'T pass an explicit deadline here
+                # so that per-config logic applies.
                 ok, mbps, _detail = self._engine.measure_profile_download(
-                    self._profile, duration=8.0)
+                    self._profile, duration=6.0)
             except Exception as exc:
                 self.result.emit(tr("خطا: {exc}").format(exc=exc), "err")
                 return
@@ -1775,6 +1783,10 @@ class InlinePingWorker(QThread):
 
         # --- REAL delay mode (default) -------------------------------------
         try:
+            # Same per-config budget logic as download: ordinary configs answer
+            # fast (~6 s cap), spoof configs get a longer budget + warm-up + one
+            # automatic retry so a slow-to-establish spoof isn't false-red. No
+            # explicit deadline → the engine applies the right per-config cap.
             ok, ms, _detail = self._engine.measure_profile_delay(
                 self._profile, timeout=15.0)
         except Exception as exc:
