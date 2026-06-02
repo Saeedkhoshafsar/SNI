@@ -1375,10 +1375,10 @@ class EngineController:
             n_pairs = len(mgr.explorer.stats)
             self._spoof_log(
                 f"بهینه‌ساز مسیر فعال شد: {n_pairs} مسیر (IP×SNI) در پس‌زمینه "
-                f"با دست‌دادنِ جعلیِ واقعی (SNI جعلی) تست می‌شوند (هر "
-                f"{int(mgr.interval)} ثانیه) تا فقط مسیرهایی که DPI را رد "
-                f"می‌کنند «تأییدشده» شوند. مسیر فعلی هرگز بدون یافتنِ یک "
-                f"جایگزینِ تأییدشده عوض نمی‌شود.")
+                f"تست می‌شوند (هر {int(mgr.interval)} ثانیه). مسیر فعلی فقط "
+                f"زمانی عوض می‌شود که (۱) واقعاً خراب شده باشد و (۲) یک مسیر "
+                f"جایگزین با «ترافیک واقعی» اثبات‌شده باشد — صِرفِ پاسخ‌دادن یک "
+                f"IP به دست‌دادن آزمایشی، اثبات نیست و سوئیچ نمی‌شود.")
             # start the background health loop (daemon thread; safe to stop()).
             mgr.start_health_loop()
         except Exception as exc:  # pool must never block Start
@@ -1497,8 +1497,21 @@ class EngineController:
         ev = self._promoter_stop
         # poll a bit faster than the health interval so improvements land soon
         period = max(3.0, float(getattr(mgr, "interval", 30.0)) / 3.0)
+        # Anti-flap cooldown: after a swap we must let the *new* route gather a
+        # few real-traffic outcomes before considering another move. Without it
+        # the promoter could swap on every poll and produce the route-churn the
+        # user reported (xbox→nodejs→apple→…). A swap is a disruption (it resets
+        # the route for new connections and floods the log), so each one must
+        # buy a settling window. 0 == never swapped yet.
+        cooldown = max(period * 3.0, 30.0)
+        last_swap_mono = 0.0
         while not ev.wait(period):
             try:
+                now = time.monotonic()
+                if last_swap_mono and (now - last_swap_mono) < cooldown:
+                    # Recently swapped — give the new route time to prove (or
+                    # disprove) itself on real traffic before churning again.
+                    continue
                 cur_ip, cur_sni = proxy.current_route()
                 # Is the current route healthy? Use the per-IP failover tracker
                 # (rapid real-traffic failures) as the "broken" signal.
@@ -1512,6 +1525,7 @@ class EngineController:
                     continue
                 swapped = proxy.apply_route(better.ip, better.sni, pair=better)
                 if swapped:
+                    last_swap_mono = now
                     self._save_best_result(
                         better.ip, better.sni, better.combined_loss_rate)
             except Exception:
