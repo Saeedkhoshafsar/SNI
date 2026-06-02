@@ -149,6 +149,11 @@ class ScannerDialog(QDialog):
         self._worker: Optional[ScanWorker] = None
         # profiles the user accepted (read by the caller after exec())
         self.result_profiles: List[Profile] = []
+        # per-scan state — initialised here too (not only when a scan starts) so
+        # the hit/verify/reject slots are safe to call before _start_scan() has
+        # run (e.g. in tests, or a stray late signal). _start_scan() resets them.
+        self._row_for_ip: dict = {}
+        self._verified_ips: set = set()
 
         self.setObjectName("ScannerDialog")
         self.setWindowTitle(tr("اسکن IP تمیز کلودفلر"))

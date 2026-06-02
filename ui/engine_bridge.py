@@ -59,6 +59,47 @@ class EngineBridge(QObject):
         """Live diagnostics snapshot (see :meth:`EngineController.diagnostics`)."""
         return self.controller.diagnostics()
 
+    def pool_summary(self, config: dict | None = None) -> dict:
+        """Snapshot of the multi-IP / multi-SNI route pool for the UI.
+
+        Decoupled from the engine internals: if the controller owns a live
+        :class:`core.pool.ConnectionManager` (set as ``controller.conn_manager``
+        by a future forwarder-integration phase) its real health stats are
+        returned. Otherwise we derive a *static* snapshot from *config* so the
+        Pool page always shows what the current settings would build — even
+        before the engine integrates the pool. Always returns a plain dict so
+        the renderer can stay engine-agnostic and tests can fake it.
+        """
+        mgr = getattr(self.controller, "conn_manager", None)
+        if mgr is not None:
+            try:
+                snap = mgr.explorer.summary()
+                snap["enabled"] = True
+                snap["active"] = len(mgr.pool.active_pairs)
+                snap["seconds_since_check"] = mgr.seconds_since_check
+                return snap
+            except Exception:
+                pass
+
+        # Static fallback derived purely from config (no background thread).
+        from core.pool import build_connection_manager
+        cfg = config if config is not None else {}
+        try:
+            built = build_connection_manager(cfg)
+        except Exception:
+            built = None
+        if built is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "total": len(built.explorer.stats),
+            "known": 0, "stable": 0, "weak": 0, "dead": 0,
+            "unexplored": len(built.explorer.stats),
+            "active": 0,
+            "seconds_since_check": None,
+            "rows": [],
+        }
+
     # -- ping / strategy-test passthroughs (blocking; call on a worker) ----
     def ping_profiles(self, profiles):
         """Rank profiles by latency before connecting (see EngineController)."""
