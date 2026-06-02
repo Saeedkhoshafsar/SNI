@@ -200,7 +200,8 @@ class ProxyServer:
             except Exception:
                 pass
             self._active_pair = pair
-        self._log(f"[اسپوف SNI] مسیر فعال بدون قطع جابه‌جا شد → {ip} "
+        self._log(f"[اسپوف SNI] مسیر فعال به یک مسیرِ تأییدشده (اثبات‌شده با "
+                  f"دست‌دادن واقعی) جابه‌جا شد → {ip} "
                   f"(SNI: {sni_b.decode(errors='replace')})")
         return True
 

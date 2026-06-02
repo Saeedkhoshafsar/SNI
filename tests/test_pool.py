@@ -40,6 +40,21 @@ def _make_probe(good_ips):
     return probe
 
 
+def _make_spoof_probe(good_pairs):
+    """Return a spoof_probe_fn where only (ip, sni) in *good_pairs* pass.
+
+    Mirrors :func:`core.pool.spoof_handshake_probe`'s signature
+    ``(ip, port, timeout, sni) -> bool`` so tests can drive the explorer's
+    high-confidence path deterministically without any network.
+    """
+    good = {(ip, sni) for ip, sni in good_pairs}
+
+    def probe(ip, port, timeout, sni):
+        return (ip, sni) in good
+
+    return probe
+
+
 # ---------------------------------------------------------------------------
 # PairStats
 # ---------------------------------------------------------------------------
@@ -573,10 +588,17 @@ class BackgroundOptimiserTest(unittest.TestCase):
         mgr = self._mgr(combos, [])  # nothing probes clean
         self.assertIsNone(mgr.best_candidate())
 
-    def test_find_better_route_emergency_when_broken(self):
-        # current route broken ⇒ swap to first good route immediately
+    def test_find_better_route_emergency_swaps_only_to_proven(self):
+        # current route broken ⇒ swap, but ONLY to a route we are confident in
+        # (real_proven). A merely probe-clean candidate is not good enough
+        # (confidence gate): a clean TCP connect does not prove DPI bypass.
         combos = [("1.1.1.1", "a.com"), ("9.9.9.9", "x.com")]
         mgr = self._mgr(combos, ["1.1.1.1"])
+        # 1.1.1.1 only probed clean → not proven → no swap yet (stay put).
+        self.assertIsNone(
+            mgr.find_better_route("9.9.9.9", "x.com", current_healthy=False))
+        # Prove 1.1.1.1 with real traffic → now the broken route may swap to it.
+        mgr.lookup_pair("1.1.1.1", "a.com").record_real_packet(lost=False)
         better = mgr.find_better_route("9.9.9.9", "x.com",
                                        current_healthy=False)
         self.assertIsNotNone(better)
@@ -666,6 +688,86 @@ class BackgroundOptimiserTest(unittest.TestCase):
         mgr = self._mgr(combos, ["1.1.1.1"])
         self.assertIsNotNone(mgr.lookup_pair("1.1.1.1", "a.com"))
         self.assertIsNone(mgr.lookup_pair("3.3.3.3", "z.com"))
+
+
+# ---------------------------------------------------------------------------
+# Spoof-handshake probe: high-confidence promotion evidence
+# ---------------------------------------------------------------------------
+
+class SpoofProbeTest(unittest.TestCase):
+    """The spoof probe replays a fake-SNI ClientHello to confirm DPI bypass.
+
+    A pair becomes ``real_proven`` (and therefore a promotion candidate) when
+    the spoof probe confirms its decoy survives — BEFORE any live traffic.
+    A pair that only passes a bare TCP connect must NEVER become proven.
+    """
+
+    def _mgr(self, combos, good_pairs):
+        mgr = ConnectionManager(
+            combos, 443, spoof_probe_fn=_make_spoof_probe(good_pairs))
+        mgr.explorer.initial_explore()
+        mgr.pool.initialize()
+        return mgr
+
+    def test_record_spoof_probe_makes_pair_proven(self):
+        ps = PairStats("1.1.1.1", "a.com")
+        self.assertFalse(ps.spoof_proven)
+        self.assertFalse(ps.real_proven)
+        # one confirmed spoofed handshake → proven (no real traffic needed)
+        ps.record_spoof_probe(success=True)
+        self.assertTrue(ps.spoof_proven)
+        self.assertTrue(ps.real_proven)
+
+    def test_failed_spoof_probe_does_not_prove(self):
+        ps = PairStats("2.2.2.2", "b.com")
+        # connects at TCP level but the decoy is blocked by DPI every time
+        ps.record_spoof_probe(success=False)
+        ps.record_spoof_probe(success=False)
+        ps.record_spoof_probe(success=False)
+        self.assertFalse(ps.spoof_proven)
+        self.assertFalse(ps.real_proven)
+        # repeated blocks should also mark it not-alive (dead route)
+        self.assertFalse(ps.alive)
+
+    def test_explorer_uses_spoof_probe_when_present(self):
+        # 1.1.1.1+a.com decoy survives; 2.2.2.2+b.com is TCP-up but DPI-blocked
+        combos = [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")]
+        mgr = self._mgr(combos, [("1.1.1.1", "a.com")])
+        good = mgr.lookup_pair("1.1.1.1", "a.com")
+        bad = mgr.lookup_pair("2.2.2.2", "b.com")
+        self.assertTrue(good.real_proven)     # decoy confirmed → proven
+        self.assertFalse(bad.real_proven)     # probe-blocked → never proven
+
+    def test_promoter_swaps_to_spoof_proven_when_broken(self):
+        # broken incumbent ⇒ swap, and the spoof-proven route is the target
+        combos = [("1.1.1.1", "a.com"), ("9.9.9.9", "x.com")]
+        mgr = self._mgr(combos, [("1.1.1.1", "a.com")])
+        better = mgr.find_better_route("9.9.9.9", "x.com",
+                                       current_healthy=False)
+        self.assertIsNotNone(better)
+        self.assertEqual((better.ip, better.sni), ("1.1.1.1", "a.com"))
+
+    def test_promoter_stays_put_when_no_proven_candidate(self):
+        # nothing passes the spoof probe ⇒ no confident target ⇒ stay put
+        combos = [("1.1.1.1", "a.com"), ("9.9.9.9", "x.com")]
+        mgr = self._mgr(combos, [])  # every decoy blocked
+        self.assertIsNone(
+            mgr.find_better_route("9.9.9.9", "x.com", current_healthy=False))
+
+    def test_default_runtime_enables_spoof_probe(self):
+        # When neither probe_fn nor spoof_probe_fn is given (real runtime),
+        # the manager wires in the real spoof_handshake_probe by default.
+        from core.pool import spoof_handshake_probe
+        mgr = ConnectionManager([("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")],
+                                443)
+        self.assertIs(mgr.explorer._spoof_probe_fn, spoof_handshake_probe)
+
+    def test_injected_probe_fn_keeps_plain_tcp_semantics(self):
+        # A test that injects probe_fn (and no spoof fn) must keep using plain
+        # TCP probing — the spoof default must not silently override it.
+        mgr = ConnectionManager([("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")],
+                                443, probe_fn=_make_probe(["1.1.1.1"]))
+        self.assertIsNone(mgr.explorer._spoof_probe_fn)
 
 
 if __name__ == "__main__":

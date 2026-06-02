@@ -1375,8 +1375,10 @@ class EngineController:
             n_pairs = len(mgr.explorer.stats)
             self._spoof_log(
                 f"بهینه‌ساز مسیر فعال شد: {n_pairs} مسیر (IP×SNI) در پس‌زمینه "
-                f"تست می‌شوند (هر {int(mgr.interval)} ثانیه). اتصال با مسیر "
-                f"فعلی برقرار است؛ مسیر بهتر بدون قطع جایگزین می‌شود.")
+                f"با دست‌دادنِ جعلیِ واقعی (SNI جعلی) تست می‌شوند (هر "
+                f"{int(mgr.interval)} ثانیه) تا فقط مسیرهایی که DPI را رد "
+                f"می‌کنند «تأییدشده» شوند. مسیر فعلی هرگز بدون یافتنِ یک "
+                f"جایگزینِ تأییدشده عوض نمی‌شود.")
             # start the background health loop (daemon thread; safe to stop()).
             mgr.start_health_loop()
         except Exception as exc:  # pool must never block Start
