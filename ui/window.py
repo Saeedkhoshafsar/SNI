@@ -464,6 +464,44 @@ class SettingsPage(QWidget):
         form.addWidget(self.pair_hint)
         form.addSpacing(6)
 
+        # --- multi-IP / multi-SNI route pool (CONNECT_IPS / FAKE_SNIS) -------
+        # When more than one IP and/or SNI is listed here, their cartesian
+        # product becomes a self-healing pool (core.pool): each route is
+        # health-checked in the background and the best ones are used with
+        # weighted-random load-balancing. Leaving these empty keeps the single
+        # CONNECT_IP / FAKE_SNI above (the legacy direct mode) — nothing changes.
+        form.addSpacing(4)
+        pool_title = QLabel(tr("استخر چند-مسیره (اختیاری)"))
+        pool_title.setObjectName("Muted")
+        form.addWidget(pool_title)
+
+        form.addWidget(self._field_label("IPهای استخر — هر خط یک IP"))
+        self.pool_ips = QPlainTextEdit()
+        self.pool_ips.setObjectName("PoolList")
+        self.pool_ips.setPlaceholderText(tr(
+            "خالی = فقط همان «IP اتصال» بالا.\n"
+            "172.66.41.252\n108.162.196.145\n172.65.13.230"))
+        self.pool_ips.setFixedHeight(78)
+        form.addWidget(self.pool_ips)
+
+        form.addWidget(self._field_label("SNIهای استخر — هر خط یک SNI"))
+        self.pool_snis = QPlainTextEdit()
+        self.pool_snis.setObjectName("PoolList")
+        self.pool_snis.setPlaceholderText(tr(
+            "خالی = فقط همان «SNI جعلی» بالا.\n"
+            "apple.com\ngithub.com\nmicrosoft.com"))
+        self.pool_snis.setFixedHeight(78)
+        form.addWidget(self.pool_snis)
+
+        self.pool_hint = QLabel("")
+        self.pool_hint.setObjectName("Muted")
+        self.pool_hint.setWordWrap(True)
+        form.addWidget(self.pool_hint)
+        self.pool_ips.textChanged.connect(self._update_pool_hint)
+        self.pool_snis.textChanged.connect(self._update_pool_hint)
+        self._update_pool_hint()
+        form.addSpacing(6)
+
         ports_wrap = QWidget()
         ports = QHBoxLayout(ports_wrap)
         ports.setContentsMargins(0, 0, 0, 0)
@@ -537,6 +575,14 @@ class SettingsPage(QWidget):
         self.spin_listen.setValue(int(cfg.get("LISTEN_PORT", 40443)))
         self.spin_socks.setValue(int(cfg.get("socks_port", 10808)))
         self.connect_ip.setText(str(cfg.get("CONNECT_IP", "")))
+        # multi-IP / multi-SNI pool lists (one entry per line)
+        pool_ips = cfg.get("CONNECT_IPS", []) or []
+        pool_snis = cfg.get("FAKE_SNIS", []) or []
+        self.pool_ips.setPlainText(
+            "\n".join(str(x).strip() for x in pool_ips if str(x).strip()))
+        self.pool_snis.setPlainText(
+            "\n".join(str(x).strip() for x in pool_snis if str(x).strip()))
+        self._update_pool_hint()
         self.chk_lan.setChecked(bool(cfg.get("allow_lan", False)))
         self._update_lan_hint(self.chk_lan.isChecked())
         self.chk_system_proxy.setChecked(bool(cfg.get("system_proxy", False)))
@@ -552,6 +598,8 @@ class SettingsPage(QWidget):
             "LISTEN_PORT": self.spin_listen.value(),
             "socks_port": self.spin_socks.value(),
             "CONNECT_IP": self.connect_ip.text().strip(),
+            "CONNECT_IPS": self._pool_ip_list(),
+            "FAKE_SNIS": self._pool_sni_list(),
             "sni_ip_pairs": list(self._sni_ip_pairs),
             "allow_lan": self.chk_lan.isChecked(),
             "system_proxy": self.chk_system_proxy.isChecked(),
@@ -631,6 +679,44 @@ class SettingsPage(QWidget):
             self.force_spoof_hint.setText(tr(
                 "خاموش — کانفیگ‌های معمولی مستقیماً وصل می‌شوند (مثل V2RayTun)؛ "
                 "فقط کانفیگ‌های اسپوف (لینک‌های لوکال) از اسپوفر رد می‌شوند."))
+
+    # -- multi-IP / multi-SNI pool helpers --------------------------------
+    @staticmethod
+    def _parse_lines(text: str) -> list[str]:
+        """Split a textarea into a clean, de-duplicated list (one per line)."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for raw in (text or "").splitlines():
+            v = raw.strip()
+            if v and v.lower() not in seen:
+                seen.add(v.lower())
+                out.append(v)
+        return out
+
+    def _pool_ip_list(self) -> list[str]:
+        return self._parse_lines(self.pool_ips.toPlainText())
+
+    def _pool_sni_list(self) -> list[str]:
+        return self._parse_lines(self.pool_snis.toPlainText())
+
+    def _update_pool_hint(self) -> None:
+        """Live preview of how many (IP, SNI) routes the pool will build."""
+        ips = self._pool_ip_list()
+        snis = self._pool_sni_list()
+        # mirror config_store.pool_enabled(): empty lists fall back to the
+        # single CONNECT_IP / FAKE_SNI, so the pool needs >1 resulting pair.
+        eff_ips = len(ips) or 1
+        eff_snis = len(snis) or 1
+        pairs = eff_ips * eff_snis
+        if pairs <= 1:
+            self.pool_hint.setText(tr(
+                "استخر غیرفعال — حالت تک‌مسیره (همان IP/SNI بالا)؛ "
+                "بدون پایش پس‌زمینه."))
+        else:
+            self.pool_hint.setText(tr(
+                "استخر فعال — {ips} IP × {snis} SNI = {pairs} مسیر؛ "
+                "هر ۳۰ ثانیه سلامت‌سنجی و انتخاب وزنی خودکار.").format(
+                    ips=eff_ips, snis=eff_snis, pairs=pairs))
 
     def _field_label(self, t: str) -> QLabel:
         lbl = QLabel(tr(t))
@@ -2128,6 +2214,156 @@ class DiagnosticsPage(QWidget):
         return "\n".join(lines)
 
 
+class PoolPage(QWidget):
+    """Live picture of the multi-IP / multi-SNI route pool (core.pool).
+
+    Pure renderer: polls a zero-arg ``provider`` that returns a plain dict
+    snapshot (the shape produced by
+    :meth:`core.pool.CombinationExplorer.summary` plus a couple of extra
+    keys) on a timer and repaints. No engine/pool internals are touched here,
+    so the GUI stays fully decoupled from the core — and tests can feed a fake
+    provider.
+
+    Expected snapshot keys (all optional, sane fallbacks)::
+
+        enabled            bool   — is the pool active for the current config?
+        total/known/stable/weak/dead/unexplored  int  — pair counts
+        seconds_since_check  float|None  — age of the last health-check cycle
+        active             int    — pairs currently serving connections
+        rows               list[dict]  — per-pair rows from summary()
+                            {ip, sni, loss, alive, active, in_pool}
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._provider = None          # callable -> snapshot dict
+        root = QVBoxLayout(self)
+        root.setContentsMargins(26, 22, 26, 22)
+        root.setSpacing(16)
+
+        root.addWidget(_section_title(
+            "استخر مسیرها", "وضعیت زنده‌ی استخر چند-IP / چند-SNI"))
+
+        # --- summary card -------------------------------------------------
+        summary = Card()
+        sb = summary.body()
+        self.lbl_state = QLabel(tr("استخر: —"))
+        self.lbl_state.setObjectName("H2")
+        self.lbl_counts = QLabel(tr("مسیرها: —"))
+        self.lbl_counts.setObjectName("Faint")
+        self.lbl_check = QLabel(tr("آخرین سلامت‌سنجی: —"))
+        self.lbl_check.setObjectName("Faint")
+        self.lbl_help = QLabel(tr(
+            "وقتی بیش از یک IP یا SNI در «تنظیمات» وارد کنید، حاصل‌ضرب آن‌ها یک "
+            "استخر مسیر می‌سازد: هر مسیر در پس‌زمینه سلامت‌سنجی می‌شود و بهترین‌ها "
+            "با انتخاب وزنی (هرچه افت کمتر، شانس بیشتر) و بدون قطع اتصال‌های زنده "
+            "به‌کار می‌روند. اگر فقط یک مسیر باشد، استخر غیرفعال است."))
+        self.lbl_help.setObjectName("Faint")
+        self.lbl_help.setWordWrap(True)
+        sb.addWidget(self.lbl_state)
+        sb.addWidget(self.lbl_counts)
+        sb.addWidget(self.lbl_check)
+        sb.addWidget(self.lbl_help)
+        root.addWidget(summary)
+
+        # --- per-pair table card -----------------------------------------
+        pairs = Card()
+        pb = pairs.body()
+        ph = QLabel(tr("مسیرها (IP × SNI)"))
+        ph.setObjectName("H2")
+        pb.addWidget(ph)
+        self.tbl = QPlainTextEdit()
+        self.tbl.setObjectName("Log")
+        self.tbl.setReadOnly(True)
+        self.tbl.setMinimumHeight(220)
+        pb.addWidget(self.tbl)
+        root.addWidget(pairs, 1)
+
+        # poll timer (started/stopped when the page becomes visible)
+        self._timer = QTimer(self)
+        self._timer.setInterval(1500)
+        self._timer.timeout.connect(self.refresh)
+
+    def set_provider(self, provider) -> None:
+        """Give the page a zero-arg callable returning a snapshot dict."""
+        self._provider = provider
+        self.refresh()
+
+    def start_polling(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start()
+        self.refresh()
+
+    def stop_polling(self) -> None:
+        self._timer.stop()
+
+    def refresh(self) -> None:
+        if self._provider is None:
+            self._render(None)
+            return
+        try:
+            snap = self._provider()
+        except Exception:
+            snap = None
+        self._render(snap)
+
+    # -- rendering --------------------------------------------------------
+    def _render(self, snap) -> None:
+        if not snap or not snap.get("enabled"):
+            self.lbl_state.setText(tr("استخر: غیرفعال (حالت تک‌مسیره)"))
+            self.lbl_counts.setText(tr("مسیرها: —"))
+            self.lbl_check.setText(tr("آخرین سلامت‌سنجی: —"))
+            self.tbl.setPlainText(tr(
+                "استخر فعال نیست. در «تنظیمات» بیش از یک IP یا SNI وارد کنید "
+                "تا استخر چند-مسیره ساخته شود."))
+            return
+
+        total = int(snap.get("total", 0))
+        known = int(snap.get("known", 0))
+        stable = int(snap.get("stable", 0))
+        weak = int(snap.get("weak", 0))
+        dead = int(snap.get("dead", 0))
+        unexplored = int(snap.get("unexplored", 0))
+        active = int(snap.get("active", 0))
+
+        self.lbl_state.setText(
+            tr("استخر: فعال — {active} مسیر در حال سرویس").format(active=active))
+        self.lbl_counts.setText(tr(
+            "کل {total} · سالم {stable} · ضعیف {weak} · مرده {dead} · "
+            "کشف‌نشده {unexplored} (آزموده {known})").format(
+                total=total, stable=stable, weak=weak, dead=dead,
+                unexplored=unexplored, known=known))
+
+        secs = snap.get("seconds_since_check")
+        if secs is None:
+            self.lbl_check.setText(tr("آخرین سلامت‌سنجی: در حال راه‌اندازی…"))
+        else:
+            self.lbl_check.setText(
+                tr("آخرین سلامت‌سنجی: {s} ثانیه پیش").format(s=int(secs)))
+
+        self.tbl.setPlainText(self._pair_table(snap.get("rows", []) or []))
+
+    @staticmethod
+    def _pair_table(rows: list) -> str:
+        if not rows:
+            return tr("هنوز مسیری آزموده نشده — اولین سلامت‌سنجی در حال انجام است…")
+        header = (f"{tr('IP'):<18}{tr('SNI'):<24}"
+                  f"{tr('افت'):>7}{tr('اتصال'):>7}  {tr('وضعیت')}")
+        lines = [header]
+        for r in rows:
+            if not r.get("alive", True):
+                state = tr("مرده")
+            elif r.get("in_pool"):
+                state = tr("★ فعال")
+            else:
+                state = tr("سالم")
+            lines.append(
+                f"{str(r.get('ip', '')):<18}{str(r.get('sni', '')):<24}"
+                f"{float(r.get('loss', 0.0)) * 100:>6.0f}%"
+                f"{int(r.get('active', 0)):>7}  {state}")
+        return "\n".join(lines)
+
+
 class LogPage(QWidget):
     """Professional log console (step 23).
 
@@ -2410,13 +2646,17 @@ class MainWindow(QWidget):
         # strip via _pump_resilience(self.engine.diagnostics), so the dedicated
         # tab was redundant. The engine's diagnostics provider stays wired.
         self.page_log = LogPage()
+        # live route-pool status page (multi-IP / multi-SNI). It polls a
+        # zero-arg provider so it stays decoupled from the engine/pool; the
+        # provider is wired in _wire_core once the engine is known.
+        self.page_pool = PoolPage()
         # wrap every page in a scroll area so tall content scrolls instead of
         # overlapping/clipping when the window is short (the layout bug on the
         # built Windows app). ``_scroll`` maps page -> its scroll wrapper so the
         # page-change / nav logic can still reason about which page is shown.
         self._scroll: dict[QWidget, QScrollArea] = {}
         for p in (self.page_dashboard, self.page_profiles, self.page_settings,
-                  self.page_strategy, self.page_log):
+                  self.page_strategy, self.page_pool, self.page_log):
             wrap = _scrollable(p)
             self._scroll[p] = wrap
             self.stack.addWidget(wrap)
@@ -2469,6 +2709,13 @@ class MainWindow(QWidget):
         self.page_dashboard.power_handler = self._on_power
         self.page_profiles.on_selection_changed = self._on_profile_selected
         self.page_settings.btn_save.clicked.connect(self._save_settings)
+
+        # live route-pool status: feed the page a zero-arg provider that reads
+        # the engine's live manager (when present) or falls back to a static
+        # config-derived snapshot. Bound to the current store so it always
+        # reflects saved settings.
+        self.page_pool.set_provider(
+            lambda: self.engine.pool_summary(self.store.config))
 
         # initialise widgets from persisted state
         self.page_settings.load_from(self.store.config)
@@ -2954,6 +3201,11 @@ class MainWindow(QWidget):
         # replay the dashboard intro when navigating back to it
         if current is self._scroll.get(self.page_dashboard):
             self.page_dashboard.play_intro()
+        # only poll the route-pool page while it is visible (saves probes/CPU)
+        if current is self._scroll.get(self.page_pool):
+            self.page_pool.start_polling()
+        else:
+            self.page_pool.stop_polling()
 
     # --- navigation -------------------------------------------------------
     def _build_nav(self) -> QWidget:
@@ -2975,6 +3227,7 @@ class MainWindow(QWidget):
             ("پروفایل‌ها", "servers"),
             ("تنظیمات", "settings"),
             ("استراتژی", "strategy"),
+            ("استخر", "strategy"),
             ("لاگ", "logs"),
         ]
         self._nav_buttons: list[NavItem] = []

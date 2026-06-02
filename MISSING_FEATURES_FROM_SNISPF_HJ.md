@@ -238,6 +238,36 @@ chosen  = random.choices(pool, weights=weights, k=1)[0]
 
 ---
 
+## ۶.۵. وضعیت پیاده‌سازی (Progress)
+
+> به‌روزرسانی: ۲۰۲۶-۰۶-۰۲ — فاز ۱ (هسته‌ی استخر) پیاده شد.
+
+| استپ | قابلیت | وضعیت | فایل |
+|---|---|---|---|
+| ۷.۱ | خواندن `CONNECT_IPS`/`FAKE_SNIS` با fallback | ✅ انجام شد | `core/config_store.py` (`connect_ips`/`fake_snis`/`pool_enabled`) + `config.json` |
+| ۷.۲ | `PairStats` + فرمول combined-loss `0.7/0.3` | ✅ انجام شد | `core/pool.py` |
+| ۷.۳ | `CombinationExplorer` (پروب TCP تزریق‌پذیر) | ✅ انجام شد | `core/pool.py` (`probe_fn` injectable برای تست headless) |
+| ۷.۴ | `ActivePool` + Weighted-Random `pick()` (`1/(loss+0.01)`) | ✅ انجام شد | `core/pool.py` |
+| ۷.۵ | `ConnectionManager` + حلقه‌ی Health-Check دیمن + `build_connection_manager` | ✅ انجام شد | `core/pool.py` (حلقه با `Event` قابل‌توقف + jitter) |
+| ۷.۶ | Graceful Rotation (`_draining` + شمارش اتصال فعال) | ✅ هسته آماده | `core/pool.py` (`acquire`/`release`/`refresh`) — اتصال به forwarder در فاز بعد |
+| ۷.۷ | یکپارچه‌سازی forwarder/engine (`pick_pair` per-connection) | ⏳ فاز بعد | `core/engine.py` |
+| ۷.۸ | `ConnectionTracker` (failover per-IP ۳/۳۰s) + semaphore | ⏳ فاز بعد | لایه‌ی forwarder, `core/resilience.py` |
+| ۷.۹ | UI: کارت «استخر مسیرها» + ورودی لیست IP/SNI در تنظیمات | ✅ انجام شد | `ui/window.py` (`PoolPage` + تب «استخر» در نوار کناری + ورودی `CONNECT_IPS`/`FAKE_SNIS` در `SettingsPage`) + `ui/engine_bridge.py` (`pool_summary`) |
+| ۷.۱۰ | تقویت Domain Checker (`export_sni_list`) | ⏳ فاز بعد | `core/cf_scanner.py` |
+
+**تست‌ها:** `tests/test_pool.py` + `tests/test_pool_ui.py` + افزوده‌ها در
+`tests/test_config_store.py` و `tests/test_window_fixes_ui.py` —
+کل ۶۰۶ تست سبز (به‌جز ۳ خطای از-قبل‌موجود و بی‌ربط در `test_scanner_ui.py`).
+
+**UI:** تب جدید «استخر» در نوار کناری (`PoolPage`) وضعیت زنده‌ی هر مسیر (سالم/ضعیف/مرده،
+افت، اتصال‌های فعال، آخرین سلامت‌سنجی) را نشان می‌دهد؛ در صفحه‌ی «تنظیمات» دو کادر
+چندخطی برای وارد کردن لیست IPها و SNIها اضافه شد با راهنمای زنده‌ی «چند مسیر ساخته می‌شود».
+
+**سازگاری تک‌مسیره:** حفظ شد — `build_connection_manager` در حالت تک‌جفت `None` برمی‌گرداند و
+هیچ thread پس‌زمینه‌ای ساخته نمی‌شود؛ `pool_enabled()` هم همین را تضمین می‌کند.
+
+---
+
 ## ۷. اولویت‌بندی و ترتیب پیشنهادی پیاده‌سازی (Roadmap)
 
 | استپ | قابلیت | فایل‌های جدید/تغییری ما | پیش‌نیاز | ریسک |

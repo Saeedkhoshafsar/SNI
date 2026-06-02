@@ -53,6 +53,48 @@ class ConfigStoreTest(unittest.TestCase):
         # a key absent from the file still comes from DEFAULT_CONFIG
         self.assertEqual(fresh.get("socks_port"), DEFAULT_CONFIG["socks_port"])
 
+    # -- multi-IP / multi-SNI pool helpers ------------------------------
+
+    def test_connect_ips_falls_back_to_singular(self):
+        # default config has empty CONNECT_IPS → uses CONNECT_IP
+        self.assertEqual(self.store.connect_ips(),
+                         [DEFAULT_CONFIG["CONNECT_IP"]])
+
+    def test_fake_snis_falls_back_to_singular(self):
+        self.assertEqual(self.store.fake_snis(),
+                         [DEFAULT_CONFIG["FAKE_SNI"]])
+
+    def test_connect_ips_prefers_plural_list(self):
+        self.store.set("CONNECT_IPS", ["1.1.1.1", "2.2.2.2"])
+        self.assertEqual(self.store.connect_ips(), ["1.1.1.1", "2.2.2.2"])
+
+    def test_ips_dedupe_and_strip(self):
+        self.store.set("CONNECT_IPS", [" 1.1.1.1 ", "1.1.1.1", "", "2.2.2.2"])
+        self.assertEqual(self.store.connect_ips(), ["1.1.1.1", "2.2.2.2"])
+
+    def test_pool_disabled_for_single_pair(self):
+        self.assertFalse(self.store.pool_enabled())  # 1 IP × 1 SNI
+
+    def test_pool_enabled_for_multi(self):
+        self.store.set("CONNECT_IPS", ["1.1.1.1", "2.2.2.2"])
+        self.store.set("FAKE_SNIS", ["a.com"])
+        self.assertTrue(self.store.pool_enabled())   # 2 × 1 > 1
+
+    def test_pool_keys_roundtrip(self):
+        self.store.set("CONNECT_IPS", ["1.1.1.1"])
+        self.store.set("FAKE_SNIS", ["a.com", "b.com"])
+        self.store.set("ACTIVE_SLOTS", 4)
+        self.store.save_config()
+        fresh = ConfigStore(runtime_dir=self.tmp)
+        self.assertEqual(fresh.get("CONNECT_IPS"), ["1.1.1.1"])
+        self.assertEqual(fresh.get("FAKE_SNIS"), ["a.com", "b.com"])
+        self.assertEqual(fresh.get("ACTIVE_SLOTS"), 4)
+
+    def test_pool_defaults_present(self):
+        for key in ("CONNECT_IPS", "FAKE_SNIS", "HEALTH_CHECK_INTERVAL",
+                    "ACTIVE_SLOTS", "LOSS_THRESHOLD", "DEAD_THRESHOLD"):
+            self.assertIn(key, DEFAULT_CONFIG)
+
     # -- profiles -------------------------------------------------------
 
     def test_add_and_select(self):

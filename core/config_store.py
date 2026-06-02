@@ -31,6 +31,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "CONNECT_IP": "104.19.229.21",
     "CONNECT_PORT": 443,
     "FAKE_SNI": "www.hcaptcha.com",
+    # Multi-IP / Multi-SNI pool (ported from SNISPF-HJ). When these lists hold
+    # more than one entry their cartesian product becomes a self-healing pool of
+    # (IP, SNI) pairs (see core.pool). Empty lists fall back transparently to the
+    # singular CONNECT_IP / FAKE_SNI above, so the single-target path is never
+    # broken — the pool simply stays disabled when there is only one pair.
+    "CONNECT_IPS": [],            # list[str] of upstream IPs; [] ⇒ use CONNECT_IP
+    "FAKE_SNIS": [],              # list[str] of fake SNIs; [] ⇒ use FAKE_SNI
+    # Background health-check loop knobs (only active when the pool is enabled).
+    "HEALTH_CHECK_INTERVAL": 30,  # seconds between health-check cycles (+ jitter)
+    "HEALTH_CHECK_TIMEOUT": 3,    # per-probe TCP connect timeout (seconds)
+    "PROBE_COUNT": 5,             # TCP probes per pair per cycle
+    "ACTIVE_SLOTS": 3,            # warm (IP, SNI) pairs kept ready to serve
+    "LOSS_THRESHOLD": 0.20,       # combined-loss above this ⇒ pair is drained
+    "DEAD_THRESHOLD": 0.80,       # probe-loss above this ⇒ pair marked dead
     # SNI ↔ connect-IP pairs (issue #3): when the user picks a fake SNI that has
     # a saved pairing, the matching connect IP auto-fills. Seeded with a couple
     # of known-good Cloudflare front IPs so it works out of the box.
@@ -111,6 +125,47 @@ class ConfigStore:
 
     def update(self, **kwargs: Any) -> None:
         self.config.update(kwargs)
+
+    # ------------------------------------------------------------ pool helpers
+
+    def connect_ips(self) -> list[str]:
+        """Effective upstream IP list.
+
+        Prefers the plural ``CONNECT_IPS`` list; when it is empty (or absent)
+        falls back to the singular ``CONNECT_IP`` so the legacy single-target
+        config keeps working unchanged. Blank entries are dropped and order is
+        preserved with duplicates removed.
+        """
+        ips = self.config.get("CONNECT_IPS") or []
+        if not isinstance(ips, list):
+            ips = []
+        cleaned = [str(ip).strip() for ip in ips if str(ip).strip()]
+        if not cleaned:
+            single = str(self.config.get("CONNECT_IP", "")).strip()
+            if single:
+                cleaned = [single]
+        return _dedupe(cleaned)
+
+    def fake_snis(self) -> list[str]:
+        """Effective fake-SNI list (plural ``FAKE_SNIS`` ⇒ singular fallback)."""
+        snis = self.config.get("FAKE_SNIS") or []
+        if not isinstance(snis, list):
+            snis = []
+        cleaned = [str(s).strip() for s in snis if str(s).strip()]
+        if not cleaned:
+            single = str(self.config.get("FAKE_SNI", "")).strip()
+            if single:
+                cleaned = [single]
+        return _dedupe(cleaned)
+
+    def pool_enabled(self) -> bool:
+        """True only when the resolved lists yield more than one (IP, SNI) pair.
+
+        A single pair gains nothing from the pool (and would needlessly spawn a
+        background thread), so the pool stays disabled — exactly mirroring the
+        reference ``build_connection_manager`` returning ``None``.
+        """
+        return len(self.connect_ips()) * len(self.fake_snis()) > 1
 
     # ---------------------------------------------------------------- profiles
 
@@ -251,6 +306,17 @@ class ConfigStore:
 # ---------------------------------------------------------------------------
 #  tiny JSON helpers (fail-soft)
 # ---------------------------------------------------------------------------
+
+def _dedupe(items: list[str]) -> list[str]:
+    """Return *items* with duplicates removed, preserving first-seen order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in items:
+        if it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
+
 
 def _read_json(path: str) -> Any:
     try:

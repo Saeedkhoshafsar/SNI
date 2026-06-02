@@ -88,9 +88,10 @@ class MaximizeRestoreTest(unittest.TestCase):
 class DiagnosticsRemovedTest(unittest.TestCase):
     def test_no_diagnostics_in_nav_or_stack(self):
         w = _window()
-        # 5 tabs: Dashboard / Profiles / Settings / Strategy / Log
-        self.assertEqual(len(w.nav_group.buttons()), 5)
-        self.assertEqual(w.stack.count(), 5)
+        # 6 tabs: Dashboard / Profiles / Settings / Strategy / Pool / Log
+        # (the route-pool page was added; Diagnostics remains removed)
+        self.assertEqual(len(w.nav_group.buttons()), 6)
+        self.assertEqual(w.stack.count(), 6)
         self.assertFalse(hasattr(w, "page_diagnostics"))
 
     def test_nav_labels_have_no_diagnostics(self):
