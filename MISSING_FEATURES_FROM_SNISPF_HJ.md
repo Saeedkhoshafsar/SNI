@@ -366,3 +366,84 @@ chosen  = random.choices(pool, weights=weights, k=1)[0]
 `ui/engine_bridge.py` (active_route/best_route در snapshot).
 
 **تست:** ۶۶۶ تست سبز (۲۸ تست جدید).
+
+---
+
+## ۱۱. اصلاحیه (Phase 4.1) — promote فقط بر اساس «ترافیک واقعی»، نه probe
+
+**گزارش میدانی:** کاربر نسخه‌ی Phase 4 (commit `ca06d3d`) را تست کرد. «یه لحظه سرعت
+خوبی داشت» ولی دوباره به سیل `TimeoutError` خورد. لاگ نشان داد:
+
+* `20:12:42` مسیرِ `104.19.229.21 + www.hcaptcha.com` **کار کرد** (HTTP 200، محتوای واقعی).
+* `20:13:16` promoter آن را با `172.66.41.252 + www.cloudflare.com` عوض کرد →
+  بلافاصله سیل `TimeoutError`. سپس هر ~۱۰ ثانیه churn به google.com، phpbb.com،
+  nextjs.org، apple.com، one.one.one.one … .
+
+**ریشه‌ی واقعی (درس کلیدی):** یک probe تمیزِ TCP **اثبات نمی‌کند** که آن مسیر می‌تواند
+یک ClientHello جعلی را از DPI رد کند. خیلی از IPهای CDN، TCP-وصل می‌شوند (probe loss=0)
+ولی تزریق SNI جعلی تایم‌اوت می‌خورد. پس promote کردن صرفاً بر اساس probe loss، یک مسیرِ
+*کارا* را با مسیرهای probe-سالم-ولی-DPI-مرده عوض می‌کرد. ضمناً مسیر تکیِ کاربر در استخرِ
+۴۲۹تایی نبود؛ پس `lookup_pair`=None و successهای واقعیِ آن هرگز ثبت نمی‌شد.
+
+**اصلاح (governed by REAL TRAFFIC):**
+1. **قانون طلایی:** مسیرِ سالم (که ترافیک واقعی را موفق حمل می‌کند) **هرگز** عوض نمی‌شود.
+   `find_better_route(..., current_healthy=True)` همیشه `None` برمی‌گرداند → پایانِ churn.
+2. **فقط وقتی مسیر واقعاً خراب است** (failover tracker از شکست‌های واقعی فعال شده) swap
+   می‌کنیم — و آن هم به **بهترین** کاندید که با ترافیک واقعی اثبات شده (`real_proven`).
+3. **`PairStats.real_proven`:** مسیر فقط وقتی «اثبات‌شده» است که حداقل
+   `REAL_PROOF_MIN_PACKETS` بسته‌ی واقعی با loss ≤ `REAL_PROOF_MAX_LOSS` حمل کرده باشد.
+   `best_candidate()` کاندیدهای real-proven را همیشه بالاتر از probe-only رتبه می‌دهد.
+4. **`ConnectionManager.ensure_pair(ip, sni)`:** برای مسیر تکیِ کاربر (که معمولاً در استخر
+   نیست) یک `PairStats` می‌سازد تا successهای واقعیِ آن ثبت شوند و tracker بفهمد کار می‌کند.
+
+**فایل‌های تغییر یافته:** `core/pool.py` (real_proven + best_candidate بر پایه‌ی proof +
+find_better_route قانون طلایی + ensure_pair + REAL_PROOF_* constants)،
+`core/engine.py` (بایند مسیر اولیه با `ensure_pair` به‌جای `lookup_pair`).
+
+**تست:** ۶۷۰ تست سبز (۴ تست جدید: قانون طلایی، ترجیح real-proven، ensure_pair، real_proven).
+
+---
+
+## ۱۲. اصلاحیه (Phase 4.2) — probeِ «دست‌دادنِ جعلی» = اطمینانِ کامل قبل از سوئیچ
+
+**گزارش میدانی دوم:** کاربر Phase 4.1 را تست کرد. «اولش کار کرد ولی بعدش نه». لاگ
+(`20:38`–`20:43`) دو چیز را نشان داد:
+
+* مسیر اولیه `104.19.229.21 + www.hcaptcha.com` در تستِ داخلی HTTP 200 داد، ولی به
+  محض شروعِ ترافیک واقعیِ YouTube (ده‌ها اتصال همزمان) سیل `TimeoutError` آمد و
+  failover درست فعال شد.
+* بعد promoter هر ~۱۰ ثانیه به مسیرهای جدید churn کرد (sciencedirect.com، rust-lang.org،
+  microsoft.com، vercel.com …) که **همه** TimeoutError دادند. کاربر گفت IP/دامینِ
+  تأییدشده‌ی خودش را هم به لیست اضافه کرده بود و «عجیب است که هیچ‌کدام کار نکردند».
+
+**ریشه‌ی واقعی:** استخر فقط **TCP-connect** را probe می‌کرد. یک TCP-connect تمیز
+اثبات نمی‌کند که SNI جعلی از DPI رد می‌شود — به همین خاطر «همه‌چیز probe-سالم بود ولی
+هیچ‌چیز کار نمی‌کرد». ضمناً هیچ مسیری هرگز `real_proven` نمی‌شد (چون ترافیک واقعی فقط روی
+مسیر فعال ثبت می‌شد)، پس promoter یا churn می‌کرد یا هدفِ اثبات‌شده‌ای نداشت.
+
+**اصلاح (probeِ high-confidence):**
+1. **`spoof_handshake_probe(ip, port, timeout, fake_sni)`** — به‌جای TCP-connect خام،
+   دقیقاً همان ClientHello با **SNI جعلی** که اسپوفر زنده می‌فرستد را replay می‌کند و
+   منتظر پاسخِ TLS سرور می‌ماند:
+   * سرور بایت TLS برمی‌گرداند → decoy از DPI رد شد → مسیر **تأییدشده** است.
+   * RST/بسته‌شدن یا سکوت (timeout) → DPI آن SNI جعلی را کشت → مسیر **مرده** است.
+   این probe **بدون WinDivert و بدون Admin** کار می‌کند (socketِ مستقلِ خودش) و هرگز به
+   مسیر داده‌ی زنده (xray↔spoofer)، پینگ‌گرفتن یا کانفیگ‌های معمولی دست نمی‌زند.
+2. **`PairStats.spoof_proven` + `record_spoof_probe`:** یک مسیر با عبورِ موفقِ
+   دست‌دادنِ جعلی `real_proven` می‌شود — *قبل* از هر ترافیک واقعی. probeِ شکست‌خورده
+   مسیر را زنده فرض نمی‌کند.
+3. **دروازه‌ی اطمینان در `find_better_route`:** حتی وقتی مسیر فعلی خراب است، swap
+   **فقط** به مسیری انجام می‌شود که `real_proven` باشد (با ترافیک واقعی یا با
+   دست‌دادنِ جعلیِ تأییدشده). اگر هیچ مسیر اثبات‌شده‌ای نباشد، روی مسیر فعلی می‌ماند به‌جای
+   churn روی مسیرهای ناآزموده. این دقیقاً خواسته‌ی کاربر است: «بدون اطمینانِ کامل، سوئیچ
+   نشود».
+4. **پیش‌فرضِ runtime:** وقتی نه `probe_fn` و نه `spoof_probe_fn` داده شود (یعنی
+   runtime واقعی)، `ConnectionManager` خودکار `spoof_handshake_probe` را وصل می‌کند.
+   تست‌هایی که `probe_fn` تزریق می‌کنند سمانتیکِ TCP خام را حفظ می‌کنند.
+
+**فایل‌های تغییر یافته:** `core/pool.py` (spoof_handshake_probe + SpoofProbeFn +
+spoof_proven/record_spoof_probe + explorer/manager/factory wiring + confidence gate)،
+`main.py` و `core/engine.py` (پیام‌های لاگ شفاف‌تر).
+
+**تست:** ۶۴ تست `test_pool.py` سبز (۷ تست جدید برای spoof-probe) + ۱۵۴ تست
+pool/engine/forwarder بدون شکست. (شکست‌های PySide6 در sandbox بی‌ربط‌اند.)

@@ -35,6 +35,7 @@ Design rules kept consistent with the rest of ``core/`` (see ``prober.py``):
 from __future__ import annotations
 
 import logging
+import os
 import random
 import socket
 import threading
@@ -48,6 +49,11 @@ logger = logging.getLogger("snispf.pool")
 # Injectable so tests never touch the network.
 ProbeFn = Callable[[str, int, float], bool]
 
+# A spoof probe additionally takes the fake SNI: ``(ip, port, timeout, sni)``
+# and returns True only when a spoofed ClientHello carrying ``sni`` is confirmed
+# to survive the DPI (see :func:`spoof_handshake_probe`).
+SpoofProbeFn = Callable[[str, int, float, str], bool]
+
 
 # --- per-IP failover thresholds (ported 1:1 from the reference forwarder) ---
 # How many failures within :data:`FAILOVER_WINDOW` seconds before an IP is
@@ -58,14 +64,27 @@ FAILOVER_THRESHOLD: int = 3
 FAILOVER_WINDOW: float = 30.0
 
 
-# --- background-optimiser promotion policy (redesign) -----------------------
-# The optimiser only swaps the live route for a candidate that is *strictly*
-# better. A healthy incumbent gets a margin advantage so tiny probe jitter never
-# triggers churn (the "suddenly good / suddenly bad" complaint). A candidate
-# must beat the incumbent's loss by at least this margin AND have been probed
-# enough times to be trustworthy.
-PROMOTE_MARGIN: float = 0.15          # candidate.loss must be ≥ this lower
+# --- background-optimiser promotion policy (redesign v2) --------------------
+# CRITICAL LESSON FROM THE FIELD: a clean TCP probe does NOT mean a route can
+# carry a spoofed ClientHello past DPI. Many CDN IPs accept the TCP handshake
+# (probe loss = 0) yet the fake-SNI injection times out — so promoting purely on
+# probe loss swapped a *working* route for probe-clean-but-DPI-dead ones and
+# flooded the log with TimeoutError. Therefore the promoter is now governed by
+# REAL TRAFFIC, not probes:
+#
+#   * We NEVER swap away from a route that is serving real traffic successfully
+#     (a healthy incumbent is the strongest evidence we have — leave it alone).
+#   * We only swap when the current route is genuinely BROKEN (rapid real
+#     failures via the ConnectionTracker), and only TO a candidate that is not
+#     itself failing — preferring one with proven real-traffic success.
+#   * Probe data is used only as a weak tie-breaker / liveness gate, never as a
+#     reason to disturb a working route.
+PROMOTE_MARGIN: float = 0.15          # (legacy) probe-loss margin, tie-break only
 PROMOTE_MIN_PROBES: int = 3           # min probes before a candidate is trusted
+# A candidate is "real-proven" once it has carried at least this many successful
+# real connections with an acceptable real-loss rate.
+REAL_PROOF_MIN_PACKETS: int = 1
+REAL_PROOF_MAX_LOSS: float = 0.50
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +96,12 @@ def tcp_connect_probe(ip: str, port: int, timeout: float) -> bool:  # pragma: no
 
     Deliberately tiny and dependency-free (mirrors :func:`core.prober.tcp_probe`)
     — a completed three-way handshake means the IP is reachable on *port*.
+
+    NOTE: a clean three-way handshake proves only *reachability*, **not** that a
+    spoofed ClientHello survives the DPI. That is exactly the trap that produced
+    the "everything probes clean but nothing actually works" churn: a CDN edge
+    accepts the TCP connection (loss=0) yet times out the moment a fake SNI is
+    injected. Prefer :func:`spoof_handshake_probe` for promotion decisions.
     """
     try:
         sock = socket.create_connection((ip, port), timeout=timeout)
@@ -84,6 +109,87 @@ def tcp_connect_probe(ip: str, port: int, timeout: float) -> bool:  # pragma: no
         return True
     except Exception:
         return False
+
+
+def spoof_handshake_probe(ip: str, port: int, timeout: float,
+                          fake_sni: str) -> bool:  # pragma: no cover - needs net
+    """High-confidence probe: does a *spoofed* ClientHello survive the DPI?
+
+    This is the proof the promoter needs before it dares swap the live route
+    (the user's golden rule: *"never switch without full confidence"*). A plain
+    TCP connect lies — it says "reachable" for routes that the DPI silently
+    kills as soon as a fake SNI appears on the wire. So instead we replay the
+    exact decoy the spoofer sends and watch what the network does with it:
+
+      1. TCP-connect to ``ip:port`` (must complete the three-way handshake).
+      2. Send a TLS ClientHello carrying the **fake** ``fake_sni`` — byte-for-byte
+         the same decoy :class:`ClientHelloMaker` builds for live traffic.
+      3. Watch the socket for a short window:
+
+         * server sends **any TLS bytes back** (ServerHello / Alert / data) →
+           the decoy reached a real TLS endpoint untouched → **route is good**.
+         * connection is **reset / closed** right after the decoy, or we get a
+           **timeout with zero bytes** → the DPI swallowed the fake SNI →
+           **route is dead for spoofing** even though TCP connected fine.
+
+    Crucially this needs **no WinDivert and no Admin** — we own this socket and
+    speak raw bytes on it directly. It never touches the live forwarder path
+    (xray ↔ spoofer), so normal pinging and ordinary configs are completely
+    unaffected: this only runs inside the background explorer's probe threads.
+
+    Returns ``True`` only when the spoofed handshake is *confirmed* to pass.
+    Any error, reset, or empty timeout is a conservative ``False`` so an
+    unproven route can never masquerade as a promotion candidate.
+    """
+    sock = None
+    try:
+        # Local import: utils is always present at runtime, but keeping the
+        # import here means headless pool tests (which inject their own
+        # probe_fn and never call this) don't depend on packet templates.
+        from utils.packet_templates import ClientHelloMaker
+
+        sock = socket.create_connection((ip, port), timeout=timeout)
+        sock.settimeout(timeout)
+        # Disable Nagle so the decoy goes out as its own segment, exactly like
+        # the live injector emits it.
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+        # Encode exactly like the live spoofer (main.py uses a plain ``.encode()``
+        # i.e. UTF-8) so the decoy we replay is byte-for-byte what real traffic
+        # sends — anything else would validate a different ClientHello than the
+        # one the forwarder actually emits.
+        fake_sni_bytes = str(fake_sni).strip().encode() if fake_sni else b""
+        if not fake_sni_bytes:
+            # No fake SNI to validate — fall back to reachability only.
+            return True
+
+        client_hello = ClientHelloMaker.get_client_hello_with(
+            os.urandom(32), os.urandom(32), fake_sni_bytes, os.urandom(32))
+        sock.sendall(client_hello)
+
+        # A real TLS server answers a ClientHello within a round-trip. If the
+        # DPI is going to kill the connection for the fake SNI it does so now:
+        # either an RST (recv raises / returns b"") or dead silence (timeout).
+        try:
+            data = sock.recv(16)
+        except socket.timeout:
+            return False
+        except OSError:
+            return False
+        # b"" == orderly close (RST/FIN) right after our decoy → blocked.
+        # Any TLS record back (0x16 handshake, 0x15 alert, 0x17 appdata) → passed.
+        return len(data) > 0
+    except Exception:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +219,13 @@ class PairStats:
         self.probes_recv: int = 0
         self.real_packets_sent: int = 0
         self.real_packets_lost: int = 0
+        # Spoofed-ClientHello validation (see :func:`spoof_handshake_probe`).
+        # These count the high-confidence probes that actually replay a fake
+        # SNI and confirm it survives the DPI — the *only* synthetic signal
+        # trustworthy enough to promote a route on. ``record_probe`` (plain TCP)
+        # never touches these.
+        self.spoof_probes_sent: int = 0
+        self.spoof_probes_ok: int = 0
 
         self.active_connections: int = 0
         self.total_connections: int = 0
@@ -168,6 +281,49 @@ class PairStats:
         """True when the pair is alive and has been probed at least once."""
         return self.alive and self.probed
 
+    @property
+    def spoof_proven(self) -> bool:
+        """True when a *spoofed* ClientHello has been confirmed to survive DPI.
+
+        Filled by :meth:`record_spoof_probe` from the background explorer's
+        :func:`spoof_handshake_probe`. Unlike a plain TCP probe, this replays
+        the exact fake-SNI decoy the live spoofer sends, so a pass is strong
+        evidence the route works for spoofing — *before* any real traffic has
+        ever touched it. Requires at least one confirmed pass and no observed
+        block among the recent spoof probes.
+        """
+        if self.spoof_probes_sent < REAL_PROOF_MIN_PACKETS:
+            return False
+        # Demand a clean record: at least one confirmed pass, and the pass rate
+        # must clear the same bar real traffic must (1 - MAX_LOSS).
+        if self.spoof_probes_ok <= 0:
+            return False
+        pass_rate = self.spoof_probes_ok / self.spoof_probes_sent
+        return pass_rate >= (1.0 - REAL_PROOF_MAX_LOSS)
+
+    @property
+    def real_proven(self) -> bool:
+        """True when this route is *confirmed* to work — by real traffic OR by
+        a spoofed-handshake probe.
+
+        A clean TCP probe only proves the IP accepts a connection — it does NOT
+        prove a spoofed ClientHello survives DPI (that was the "everything
+        probes clean but nothing works" trap). A route earns ``real_proven``
+        only through evidence that the *fake SNI itself* got through:
+
+          * **real forwarded traffic** with an acceptable loss rate, or
+          * a **spoof-handshake probe** that replayed the decoy and saw the
+            server answer (:attr:`spoof_proven`).
+
+        This is the gate the promoter trusts when swapping a broken route — the
+        user's golden rule: never switch without full confidence.
+        """
+        if self.spoof_proven:
+            return True
+        if self.real_packets_sent < REAL_PROOF_MIN_PACKETS:
+            return False
+        return self.real_loss_rate <= REAL_PROOF_MAX_LOSS
+
     # ------------------------------------------------------------------
     # Mutation helpers (thread-safe)
     # ------------------------------------------------------------------
@@ -175,6 +331,34 @@ class PairStats:
     def record_probe(self, success: bool, dead_threshold: float = 0.80) -> None:
         """Update probe counters and flip ``alive`` if needed."""
         with self.lock:
+            self.probes_sent += 1
+            self.probed = True
+            if success:
+                self.probes_recv += 1
+            if self.probes_sent >= self.MIN_PROBES:
+                loss = (self.probes_sent - self.probes_recv) / self.probes_sent
+                if loss >= dead_threshold:
+                    self.alive = False
+                elif self.probes_recv > 0:
+                    self.alive = True
+
+    def record_spoof_probe(self, success: bool,
+                           dead_threshold: float = 0.80) -> None:
+        """Record the outcome of a spoofed-ClientHello probe (high confidence).
+
+        This is the signal that lets a route become :attr:`real_proven` before
+        it has ever carried live traffic. It also counts as a regular probe for
+        liveness/scoring (so a route that connects-but-blocks correctly ranks
+        worse than one whose decoy passes), but a *failed* spoof probe on an
+        otherwise TCP-reachable IP still records as a probe miss so the route
+        is not mistaken for healthy.
+        """
+        with self.lock:
+            self.spoof_probes_sent += 1
+            if success:
+                self.spoof_probes_ok += 1
+            # Mirror into the plain-probe counters so liveness + loss scoring
+            # reflect the *spoof* outcome, not a misleading bare TCP connect.
             self.probes_sent += 1
             self.probed = True
             if success:
@@ -372,6 +556,7 @@ class CombinationExplorer:
         loss_threshold: float = 0.20,
         dead_threshold: float = 0.80,
         probe_fn: Optional[ProbeFn] = None,
+        spoof_probe_fn: Optional["SpoofProbeFn"] = None,
     ) -> None:
         self.port = port
         self.timeout = timeout
@@ -380,6 +565,12 @@ class CombinationExplorer:
         self.dead_threshold = dead_threshold
         # Injectable network primitive (default = real TCP connect).
         self._probe_fn: ProbeFn = probe_fn or tcp_connect_probe
+        # High-confidence probe: replays a fake-SNI ClientHello to confirm the
+        # decoy survives the DPI. When present (the real runtime default), the
+        # explorer uses THIS for promotion-grade evidence; bare TCP is only a
+        # fallback. Tests inject their own deterministic ``probe_fn`` and leave
+        # this ``None`` so they never touch the network.
+        self._spoof_probe_fn: Optional["SpoofProbeFn"] = spoof_probe_fn
 
         # Build a stats object for every (ip, sni) pair.
         self.stats: Dict[Tuple[str, str], PairStats] = {
@@ -421,15 +612,32 @@ class CombinationExplorer:
     # ------------------------------------------------------------------
 
     def _probe_one(self, ps: PairStats) -> None:
-        """Run ``probe_count`` connect probes against one pair (via probe_fn)."""
+        """Run ``probe_count`` probes against one pair.
+
+        When a spoof probe is configured (the real runtime), it replays a fake
+        ``ps.sni`` ClientHello and records the outcome as *high-confidence*
+        evidence (:meth:`PairStats.record_spoof_probe`) — the only synthetic
+        signal the promoter will swap a live route for. Otherwise it falls back
+        to the plain TCP-connect ``probe_fn`` (used by headless tests, and as a
+        safety net if the spoof probe can't run).
+        """
         # Randomise the count slightly to avoid perfectly synchronised bursts.
         count = max(2, self.probe_count + random.randint(-1, 1))
         for _ in range(count):
-            try:
-                ok = bool(self._probe_fn(ps.ip, self.port, self.timeout))
-            except Exception:
-                ok = False
-            ps.record_probe(success=ok, dead_threshold=self.dead_threshold)
+            if self._spoof_probe_fn is not None:
+                try:
+                    ok = bool(self._spoof_probe_fn(
+                        ps.ip, self.port, self.timeout, ps.sni))
+                except Exception:
+                    ok = False
+                ps.record_spoof_probe(success=ok,
+                                      dead_threshold=self.dead_threshold)
+            else:
+                try:
+                    ok = bool(self._probe_fn(ps.ip, self.port, self.timeout))
+                except Exception:
+                    ok = False
+                ps.record_probe(success=ok, dead_threshold=self.dead_threshold)
 
     def _run_probes_parallel(self, pairs: List[PairStats]) -> None:
         """Probe a list of pairs in parallel daemon threads."""
@@ -747,11 +955,21 @@ class ConnectionManager:
         loss_threshold: float = 0.20,
         dead_threshold: float = 0.80,
         probe_fn: Optional[ProbeFn] = None,
+        spoof_probe_fn: Optional[SpoofProbeFn] = None,
     ) -> None:
         self.interval = health_check_interval
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_check_ts: float = 0.0
+
+        # Default to the real spoof-handshake probe so the live runtime gets
+        # promotion-grade evidence out of the box. Tests pass an explicit
+        # ``probe_fn`` and leave ``spoof_probe_fn=None`` *only* if they also opt
+        # out — but since most tests inject ``probe_fn`` and expect plain-TCP
+        # semantics, we only enable the spoof default when no ``probe_fn`` was
+        # given (i.e. the real runtime) OR a spoof fn is explicitly supplied.
+        if spoof_probe_fn is None and probe_fn is None:
+            spoof_probe_fn = spoof_handshake_probe
 
         self.explorer = CombinationExplorer(
             combinations=combinations,
@@ -761,6 +979,7 @@ class ConnectionManager:
             loss_threshold=loss_threshold,
             dead_threshold=dead_threshold,
             probe_fn=probe_fn,
+            spoof_probe_fn=spoof_probe_fn,
         )
         self.pool = ActivePool(
             explorer=self.explorer,
@@ -858,13 +1077,20 @@ class ConnectionManager:
     # ------------------------------------------------------------------
 
     def best_candidate(self) -> Optional[PairStats]:
-        """Return the single best *stable* pair the optimiser has found, or None.
+        """Return the single best candidate the optimiser has found, or None.
 
-        "Best" = alive, probed enough times to be trusted, not currently in
-        rapid-failover, and lowest combined-loss. This is what the engine's
-        promoter compares against the live route. We never return an unprobed or
-        dead pair — promoting one of those would just reintroduce the cold-pool
-        TimeoutError problem.
+        Ranking is governed by REAL TRAFFIC first, probes only as a tie-break:
+
+          1. A candidate that has *proven* itself with successful real traffic
+             (:attr:`PairStats.real_proven`) always beats one that has only been
+             TCP-probed — a clean probe does NOT mean a spoofed ClientHello
+             survives DPI, so real-traffic proof is the only trustworthy signal.
+          2. Among candidates of the same proof tier, the lower combined-loss
+             wins.
+
+        We still skip dead/unprobed pairs and any IP currently tripped in the
+        rapid-failover tracker, so we never hand the promoter a route that is
+        already known to be failing.
         """
         best: Optional[PairStats] = None
         for ps in self.explorer.stable_stats():
@@ -872,13 +1098,44 @@ class ConnectionManager:
                 continue
             if self.tracker.should_failover(ps.ip):
                 continue
-            if best is None or ps.combined_loss_rate < best.combined_loss_rate:
+            if best is None or self._candidate_is_better(ps, best):
                 best = ps
         return best
+
+    @staticmethod
+    def _candidate_is_better(cand: PairStats, incumbent: PairStats) -> bool:
+        """True if ``cand`` should outrank ``incumbent`` as the best candidate.
+
+        Real-traffic proof dominates; combined-loss only breaks ties within the
+        same proof tier.
+        """
+        if cand.real_proven != incumbent.real_proven:
+            return cand.real_proven  # proven beats unproven, always
+        return cand.combined_loss_rate < incumbent.combined_loss_rate
 
     def lookup_pair(self, ip: str, sni: str) -> Optional[PairStats]:
         """Return the :class:`PairStats` for an (ip, sni) if it lives in the pool."""
         return self.explorer.stats.get((ip, sni))
+
+    def ensure_pair(self, ip: str, sni: str) -> PairStats:
+        """Return the :class:`PairStats` for ``(ip, sni)``, creating it if absent.
+
+        The user's confirmed primary route is frequently NOT one of the
+        cartesian (IPs × SNIs) pool combinations, so :meth:`lookup_pair` returns
+        ``None`` for it. Without a stats object the spoofer can't attribute the
+        primary route's real-traffic successes/failures to anything — meaning the
+        tracker never learns the primary actually works and the promoter has no
+        real-traffic proof to weigh. ``ensure_pair`` guarantees the primary (or
+        any route we adopt) is tracked, so real outcomes are always recorded.
+        """
+        key = (ip, sni)
+        existing = self.explorer.stats.get(key)
+        if existing is not None:
+            return existing
+        ps = PairStats(ip, sni)
+        # register so probes/scoring/lookup all see it from now on
+        self.explorer.stats[key] = ps
+        return ps
 
     def find_better_route(
         self,
@@ -887,35 +1144,47 @@ class ConnectionManager:
         *,
         current_healthy: bool,
     ) -> Optional[PairStats]:
-        """Two-mode promotion decision used by the engine's background promoter.
+        """Real-traffic-governed promotion decision for the background promoter.
 
-        * **Healthy incumbent** (``current_healthy=True``): only return a
-          candidate that beats the current route's combined-loss by at least
-          :data:`PROMOTE_MARGIN` — a conservative upgrade that ignores jitter so
-          a working route is never disturbed for a marginal gain.
+        THE GOLDEN RULE (learned the hard way from the TimeoutError flood):
+        **a working route is the strongest evidence we have — never disturb it.**
+
+        * **Healthy incumbent** (``current_healthy=True``): the live route is
+          carrying real traffic without rapid failures. We return ``None`` — no
+          swap, full stop. A clean TCP probe on some other IP does NOT prove it
+          can carry a spoofed ClientHello past DPI, so we refuse to gamble a
+          working route for a probe-only "upgrade". This kills the route-churn /
+          TimeoutError-flood regression.
 
         * **Broken incumbent** (``current_healthy=False``): the current route is
-          failing, so return the best stable candidate *as soon as one exists*
-          (emergency replacement) — anything trusted is better than a route that
-          doesn't work. This is the "no working single route ⇒ swap in the first
-          good thing, then keep upgrading" case.
+          genuinely failing (rapid real failures via the tracker). Only now do we
+          consider a swap — and **only to a route we are confident in**. Per the
+          user's rule ("never switch without full confidence"), the candidate
+          MUST be :attr:`PairStats.real_proven` — i.e. proven either by real
+          forwarded traffic OR by a spoofed-handshake probe that confirmed the
+          fake SNI survives the DPI. A merely TCP-reachable candidate is NOT
+          good enough: that is exactly what produced the endless churn through
+          probe-clean-but-DPI-dead CDN edges. If no proven candidate exists we
+          return ``None`` and stay put rather than gamble on an unproven route.
 
         Returns ``None`` when no swap is warranted.
         """
+        # Healthy route → leave it alone. This is the whole fix.
+        if current_healthy:
+            return None
+
         cand = self.best_candidate()
         if cand is None:
             return None
-        # never "upgrade" to the route we're already on
+        # CONFIDENCE GATE: only ever swap to a route proven to carry a spoofed
+        # handshake (real traffic or spoof probe). Never churn onto a route that
+        # merely completed a bare TCP connect.
+        if not cand.real_proven:
+            return None
+        # never "swap" to the route we're already on
         if cand.ip == current_ip and cand.sni == current_sni:
             return None
-        if not current_healthy:
-            return cand
-        # healthy incumbent → require a strict margin over the current route
-        cur = self.lookup_pair(current_ip, current_sni)
-        cur_loss = cur.combined_loss_rate if (cur is not None and cur.probed) else 0.0
-        if cand.combined_loss_rate <= cur_loss - PROMOTE_MARGIN:
-            return cand
-        return None
+        return cand
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +1195,7 @@ def build_connection_manager(
     config: dict,
     *,
     probe_fn: Optional[ProbeFn] = None,
+    spoof_probe_fn: Optional[SpoofProbeFn] = None,
 ) -> Optional[ConnectionManager]:
     """Build a :class:`ConnectionManager` from a config dict, or ``None``.
 
@@ -979,6 +1249,7 @@ def build_connection_manager(
         loss_threshold=float(config.get("LOSS_THRESHOLD", 0.20)),
         dead_threshold=float(config.get("DEAD_THRESHOLD", 0.80)),
         probe_fn=probe_fn,
+        spoof_probe_fn=spoof_probe_fn,
     )
 
 
