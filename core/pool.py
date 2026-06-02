@@ -303,23 +303,27 @@ class PairStats:
 
     @property
     def real_proven(self) -> bool:
-        """True when this route is *confirmed* to work — by real traffic OR by
-        a spoofed-handshake probe.
+        """True only when this route is proven by **real forwarded traffic**.
 
-        A clean TCP probe only proves the IP accepts a connection — it does NOT
-        prove a spoofed ClientHello survives DPI (that was the "everything
-        probes clean but nothing works" trap). A route earns ``real_proven``
-        only through evidence that the *fake SNI itself* got through:
+        Hard-won lesson (the 21:33–21:37 churn log): a spoof-handshake probe is
+        NOT enough. ``spoof_handshake_probe`` opens a *direct* socket to the CDN
+        IP and sends a fake-SNI ClientHello — but a Cloudflare edge answers TLS
+        bytes to *almost any* ClientHello on :443, so that probe passes for
+        nearly every reachable CF IP. It therefore says nothing about whether
+        the **live, WinDivert-injected** path (xray → spoofer → CDN) actually
+        works. Trusting it made dozens of dead routes look "proven", and the
+        promoter churned through them (xbox→nodejs→apple→deepseek→gmail) while
+        every one still failed at the real injection layer.
 
-          * **real forwarded traffic** with an acceptable loss rate, or
-          * a **spoof-handshake probe** that replayed the decoy and saw the
-            server answer (:attr:`spoof_proven`).
+        So promotion now demands the *only* trustworthy signal: this exact route
+        carried **real forwarded traffic** with an acceptable loss rate. The
+        spoof probe is kept purely as a liveness / tie-break hint (see
+        :attr:`spoof_proven` and :meth:`_candidate_is_better`) and can never, on
+        its own, authorise a swap of the live route.
 
-        This is the gate the promoter trusts when swapping a broken route — the
-        user's golden rule: never switch without full confidence.
+        This is the gate the promoter trusts — the user's golden rule: never
+        switch without full confidence.
         """
-        if self.spoof_proven:
-            return True
         if self.real_packets_sent < REAL_PROOF_MIN_PACKETS:
             return False
         return self.real_loss_rate <= REAL_PROOF_MAX_LOSS
@@ -1106,11 +1110,18 @@ class ConnectionManager:
     def _candidate_is_better(cand: PairStats, incumbent: PairStats) -> bool:
         """True if ``cand`` should outrank ``incumbent`` as the best candidate.
 
-        Real-traffic proof dominates; combined-loss only breaks ties within the
-        same proof tier.
+        Proof tiers, strongest first:
+          1. **real_proven** — proven by real forwarded traffic. Dominates all.
+          2. **spoof_proven** — the fake-SNI decoy reached a TLS endpoint on a
+             direct socket. A weak hint (a CDN answers almost any ClientHello)
+             so it only ranks *within* the unproven tier; it never promotes a
+             route by itself (see :meth:`find_better_route`).
+          3. combined loss — final tie-break.
         """
         if cand.real_proven != incumbent.real_proven:
-            return cand.real_proven  # proven beats unproven, always
+            return cand.real_proven  # real-traffic proof beats everything
+        if cand.spoof_proven != incumbent.spoof_proven:
+            return cand.spoof_proven  # within the same proof tier, decoy-pass wins
         return cand.combined_loss_rate < incumbent.combined_loss_rate
 
     def lookup_pair(self, ip: str, sni: str) -> Optional[PairStats]:

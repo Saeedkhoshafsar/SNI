@@ -695,11 +695,14 @@ class BackgroundOptimiserTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class SpoofProbeTest(unittest.TestCase):
-    """The spoof probe replays a fake-SNI ClientHello to confirm DPI bypass.
+    """The spoof probe replays a fake-SNI ClientHello as a liveness hint.
 
-    A pair becomes ``real_proven`` (and therefore a promotion candidate) when
-    the spoof probe confirms its decoy survives — BEFORE any live traffic.
-    A pair that only passes a bare TCP connect must NEVER become proven.
+    IMPORTANT (lesson from the 21:33–21:37 churn log): the spoof probe opens a
+    *direct* socket to the CDN IP, and a Cloudflare edge answers TLS bytes to
+    almost any ClientHello — so a pass proves only reachability, NOT that the
+    live WinDivert-injected path works. It therefore can NEVER make a route
+    ``real_proven`` or authorise a swap on its own. Only real forwarded traffic
+    does. The probe survives purely as a ranking tie-break (``spoof_proven``).
     """
 
     def _mgr(self, combos, good_pairs):
@@ -709,13 +712,23 @@ class SpoofProbeTest(unittest.TestCase):
         mgr.pool.initialize()
         return mgr
 
-    def test_record_spoof_probe_makes_pair_proven(self):
+    def test_spoof_probe_sets_spoof_proven_but_not_real_proven(self):
         ps = PairStats("1.1.1.1", "a.com")
         self.assertFalse(ps.spoof_proven)
         self.assertFalse(ps.real_proven)
-        # one confirmed spoofed handshake → proven (no real traffic needed)
+        # one confirmed spoofed handshake → spoof_proven (a hint) but NOT
+        # real_proven — a direct-socket decoy reply is a false positive for the
+        # live injected path, so it must never authorise a swap.
         ps.record_spoof_probe(success=True)
         self.assertTrue(ps.spoof_proven)
+        self.assertFalse(ps.real_proven)
+
+    def test_real_traffic_is_the_only_thing_that_proves_a_route(self):
+        ps = PairStats("1.1.1.1", "a.com")
+        ps.record_spoof_probe(success=True)
+        self.assertFalse(ps.real_proven)
+        # a single successful real forwarded connection proves it for real
+        ps.record_real_packet(lost=False)
         self.assertTrue(ps.real_proven)
 
     def test_failed_spoof_probe_does_not_prove(self):
@@ -735,13 +748,38 @@ class SpoofProbeTest(unittest.TestCase):
         mgr = self._mgr(combos, [("1.1.1.1", "a.com")])
         good = mgr.lookup_pair("1.1.1.1", "a.com")
         bad = mgr.lookup_pair("2.2.2.2", "b.com")
-        self.assertTrue(good.real_proven)     # decoy confirmed → proven
-        self.assertFalse(bad.real_proven)     # probe-blocked → never proven
+        # decoy survives → spoof_proven (a ranking hint) but still NOT proven
+        # for promotion until real traffic confirms it
+        self.assertTrue(good.spoof_proven)
+        self.assertFalse(good.real_proven)
+        self.assertFalse(bad.spoof_proven)
+        self.assertFalse(bad.real_proven)
 
-    def test_promoter_swaps_to_spoof_proven_when_broken(self):
-        # broken incumbent ⇒ swap, and the spoof-proven route is the target
+    def test_spoof_proven_breaks_ranking_ties_within_unproven_tier(self):
+        # Among routes that have NO real traffic, a spoof-passing one ranks
+        # above a merely-TCP-reachable one (a useful exploration hint), even
+        # though neither is promotable yet.
+        a = PairStats("1.1.1.1", "a.com")   # decoy passes
+        b = PairStats("2.2.2.2", "b.com")   # decoy blocked but TCP up
+        a.record_spoof_probe(success=True)
+        b.record_spoof_probe(success=False)
+        self.assertTrue(ConnectionManager._candidate_is_better(a, b))
+        self.assertFalse(ConnectionManager._candidate_is_better(b, a))
+
+    def test_promoter_never_swaps_to_spoof_only_route_when_broken(self):
+        # broken incumbent, but the only candidate is spoof-proven (direct
+        # decoy) and has carried NO real traffic → a false positive → stay put.
         combos = [("1.1.1.1", "a.com"), ("9.9.9.9", "x.com")]
         mgr = self._mgr(combos, [("1.1.1.1", "a.com")])
+        self.assertIsNone(
+            mgr.find_better_route("9.9.9.9", "x.com", current_healthy=False))
+
+    def test_promoter_swaps_to_real_proven_route_when_broken(self):
+        # broken incumbent + a candidate proven by REAL traffic ⇒ swap to it.
+        combos = [("1.1.1.1", "a.com"), ("9.9.9.9", "x.com")]
+        mgr = self._mgr(combos, [("1.1.1.1", "a.com")])
+        good = mgr.lookup_pair("1.1.1.1", "a.com")
+        good.record_real_packet(lost=False)   # real-traffic proof
         better = mgr.find_better_route("9.9.9.9", "x.com",
                                        current_healthy=False)
         self.assertIsNotNone(better)
