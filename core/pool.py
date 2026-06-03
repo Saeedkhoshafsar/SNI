@@ -1583,9 +1583,12 @@ class SniIpScanner:
         workers: int = 8,
         spoof_probe_fn: Optional[SpoofProbeFn] = None,
         on_result: Optional[Callable[[dict], None]] = None,
+        on_results_batch: Optional[Callable[[list], None]] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
         on_done: Optional[Callable[[int, int], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
+        batch_interval: float = 0.10,
+        batch_size: int = 40,
     ) -> None:
         # de-dupe while preserving order; drop blanks
         seen: set = set()
@@ -1606,9 +1609,18 @@ class SniIpScanner:
         self.workers = max(1, int(workers))
         self._probe = spoof_probe_fn or spoof_handshake_probe
         self.on_result = on_result
+        # on_results_batch(list[dict]) — preferred over on_result: verdicts are
+        # COALESCED and delivered in batches so the GUI repaints a handful of
+        # times per second instead of once per probe. Spraying one Qt signal per
+        # probe (×2 with the old "testing" event) flooded the event loop and
+        # froze the window the moment the user moved the mouse. Batching fixes
+        # that freeze. on_result is kept for back-compat / headless tests.
+        self.on_results_batch = on_results_batch
         self.on_progress = on_progress
         self.on_done = on_done
         self.on_log = on_log
+        self._batch_interval = max(0.02, float(batch_interval))
+        self._batch_size = max(1, int(batch_size))
 
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -1669,14 +1681,15 @@ class SniIpScanner:
         events: "_queue.Queue[tuple]" = _queue.Queue()
 
         def _worker() -> None:
-            # network only — NEVER touch the Qt callbacks here.
+            # network only — NEVER touch the Qt callbacks here. We no longer
+            # push a "testing" event per pair: that doubled the signal volume
+            # for no real benefit (the row flips straight to ✓/✗ fast enough).
             while not self._stop.is_set():
                 try:
                     idx = jobs.get_nowait()
                 except _queue.Empty:
                     return
                 cand = self._cands[idx]
-                events.put(("testing", idx, False, None))
                 t0 = time.monotonic()
                 ok = False
                 try:
@@ -1685,7 +1698,7 @@ class SniIpScanner:
                 except Exception:
                     ok = False
                 latency = (time.monotonic() - t0) * 1000.0
-                events.put(("done", idx, ok, latency))
+                events.put((idx, ok, latency))
 
         n_workers = min(self.workers, total)
         threads = [
@@ -1696,33 +1709,61 @@ class SniIpScanner:
         for t in threads:
             t.start()
 
-        # Drain results on the caller's (Qt) thread until every candidate has a
-        # final verdict or the user stops. We count "done" events rather than
-        # joining the workers so a single blocked socket can never wedge the UI.
+        # Drain verdicts on the caller's (Qt) thread until every candidate has a
+        # final verdict or the user stops. We count verdicts rather than joining
+        # the workers so a single blocked socket can never wedge the UI.
+        #
+        # Freeze fix: verdicts are COALESCED into a batch and flushed at most
+        # every ``batch_interval`` seconds (or when ``batch_size`` piles up), so
+        # the GUI does a handful of bulk repaints per second instead of one per
+        # probe. Each flush emits ONE on_results_batch signal + ONE progress
+        # signal — not 2N signals — which is what stops the window freezing when
+        # the mouse moves mid-scan.
         done_count = 0
+        pending: list = []
+        last_flush = time.monotonic()
+
+        def _flush() -> None:
+            nonlocal pending, last_flush
+            if pending:
+                if self.on_results_batch is not None:
+                    self._emit(self.on_results_batch, pending)
+                else:
+                    for d in pending:
+                        self._emit(self.on_result, d)
+                pending = []
+            self._emit(self.on_progress, done_count, total)
+            last_flush = time.monotonic()
+
         while done_count < total and not self._stop.is_set():
             try:
-                kind, idx, ok, latency = events.get(timeout=0.2)
+                idx, ok, latency = events.get(timeout=self._batch_interval)
             except _queue.Empty:
+                # idle tick — flush whatever has accumulated so the table still
+                # updates smoothly even when probes are slow.
+                if pending or (time.monotonic() - last_flush) >= self._batch_interval:
+                    _flush()
                 continue
             cand = self._cands[idx]
-            if kind == "testing":
-                cand.status = ScanCandidate.TESTING
-                self._emit(self.on_result, cand.as_dict())
-                continue
-            # kind == "done"
             cand.latency_ms = latency
             cand.status = ScanCandidate.OK if ok else ScanCandidate.FAIL
             done_count += 1
             if ok:
                 self._ok += 1
             self._done = done_count
-            self._emit(self.on_result, cand.as_dict())
-            self._emit(self.on_progress, done_count, total)
+            pending.append(cand.as_dict())
+            # log lines are cheap (the LogBuffer is bounded) but still useful
             self._emit(
                 self.on_log,
                 "%s  %s  ←  %s  (%.0fms)" % (
                     "✓" if ok else "✗", cand.ip, cand.sni, latency or 0.0))
+            now = time.monotonic()
+            if (len(pending) >= self._batch_size
+                    or (now - last_flush) >= self._batch_interval):
+                _flush()
+
+        # final flush so the last partial batch is never dropped
+        _flush()
 
         if self._stop.is_set():
             self._emit(self.on_log, "آزمایش متوقف شد.")

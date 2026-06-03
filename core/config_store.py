@@ -85,6 +85,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "verbose_conn_log": False,    # log every per-connection lifecycle line (#5: off = readable log)
     "auto_prober": False,
     "probe_timeout": 5.0,         # per-candidate probe timeout (seconds)
+    # inline SNI/IP scan concurrency. 8 keeps the GUI responsive; >16 floods the
+    # Qt event loop with verdicts and used to freeze the window on any mouse move.
+    "scan_workers": 8,            # parallel probes during "شروع تست" (1..32)
     # ping / latency measurement (core.ping) — done *before* connecting
     "ping_samples": 3,            # latency samples per server
     "ping_timeout": 3.0,          # per-sample TCP timeout (seconds)
