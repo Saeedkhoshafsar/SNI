@@ -67,8 +67,10 @@ class ScannerPageSetupTest(unittest.TestCase):
         self.assertEqual(self.page._selected_workers(), 50)
         self.assertEqual(self.page._selected_timeout(), 5.0)
         self.assertEqual(self.page._selected_topn(), 25)
-        # 443 pill on by default; config-port pill on by default
-        self.assertIn(443, self.page._selected_extra_ports())
+        # Default = config-port pill ONLY (no extra CDN ports pre-checked) so
+        # the probe count equals the IP count (e.g. 5,000 IPs = 5,000 probes,
+        # not 10,000). See the «N IP × M پورت» hint / Fix #3.
+        self.assertEqual(self.page._selected_extra_ports(), ())
         self.assertTrue(self.page.chk_port_config.isChecked())
 
     def test_custom_count_workers_timeout_topn(self):
@@ -179,6 +181,54 @@ class ScannerPageResultsTest(unittest.TestCase):
         self.page.set_profiles([self.p, p2])
         self.page.focus_profile(p2)
         self.assertIs(self.page.current_profile(), p2)
+
+    # ---- Fix #1: scanning requires a config (no bare/without-config scan) ----
+    def test_start_without_config_does_not_launch_worker(self):
+        self.page.cmb_config.setCurrentIndex(0)   # «بدون کانفیگ»
+        self.assertIsNone(self.page.current_profile())
+        self.page._start()
+        # the info popup is stubbed; the key behaviour is that no worker spun up
+        self.assertIsNone(getattr(self.page, "_worker", None))
+
+    # ---- Fix #3: probe-count hint matches the real IP × port total ----------
+    def test_probe_hint_default_is_ip_count_not_doubled(self):
+        # default = config port only → 5,000 IPs = 5,000 probes (not 10,000)
+        self.assertEqual(self.page._effective_ports(),
+                         [self.page._config_port()])
+        hint = self.page.lbl_probe_hint.text()
+        self.assertIn("5,000", hint)
+        self.assertNotIn("10,000", hint)
+
+    def test_probe_hint_reflects_extra_ports(self):
+        # tick an extra CDN port → probe total doubles, hint shows × 2 پورت
+        self.page._port_checks[8443].setChecked(True)
+        ports = self.page._effective_ports()
+        self.assertEqual(len(ports), 2)
+        self.assertIn("10,000", self.page.lbl_probe_hint.text())
+
+    # ---- Fix #4: sort the results table by lowest ping ----------------------
+    def test_sort_by_latency_orders_ascending_and_reindexes(self):
+        self.page.chk_autosort.setChecked(False)   # test the explicit button
+        self.page._on_hit("104.16.5.9", 443, 300.0, "")
+        self.page._on_hit("104.16.5.1", 443, 50.0, "")
+        self.page._on_hit("104.16.5.5", 443, 150.0, "")
+        self.page._sort_by_latency()
+        from ui.scanner_page import _COL_LATENCY
+        lats = [self.page.table.item(r, _COL_LATENCY).data(Qt.UserRole)
+                for r in range(self.page.table.rowCount())]
+        self.assertEqual(lats, sorted(lats))        # ascending by ping
+        self.assertEqual(lats[0], 50.0)
+        # the endpoint→row map must still be correct after the re-sort
+        row = self.page._row_for_ep["104.16.5.1:443"]
+        self.assertEqual(self.page.table.item(row, _COL_LATENCY).text(), "50ms")
+
+    def test_autosort_keeps_lowest_ping_first_during_scan(self):
+        self.assertTrue(self.page.chk_autosort.isChecked())  # on by default
+        self.page._on_hit("104.16.5.9", 443, 300.0, "")
+        self.page._on_hit("104.16.5.1", 443, 40.0, "")
+        from ui.scanner_page import _COL_LATENCY
+        # auto-sort fires on each hit → row 0 is always the lowest ping so far
+        self.assertEqual(self.page.table.item(0, _COL_LATENCY).text(), "40ms")
 
 
 if __name__ == "__main__":  # pragma: no cover

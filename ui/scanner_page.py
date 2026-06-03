@@ -217,6 +217,7 @@ class ScannerPage(QWidget):
         root.addWidget(self._build_log())
 
         self._refresh_enabled_states()
+        self._update_probe_hint()
 
     # ------------------------------------------------------------------ UI
     def _build_setup_card(self) -> QWidget:
@@ -252,6 +253,7 @@ class ScannerPage(QWidget):
             "وارد یا آپلود کنید."))
         self.cmb_source.currentIndexChanged.connect(
             self._refresh_enabled_states)
+        self.cmb_source.currentIndexChanged.connect(self._update_probe_hint)
         r2.addWidget(self.cmb_source)
 
         r2.addSpacing(12)
@@ -266,12 +268,14 @@ class ScannerPage(QWidget):
             "چند IP تصادفی کلودفلر اسکن شود (در منبع تصادفی). تا "
             f"{MAX_CANDIDATES_HARD:,} پشتیبانی می‌شود."))
         self.cmb_count.currentIndexChanged.connect(self._refresh_enabled_states)
+        self.cmb_count.currentIndexChanged.connect(self._update_probe_hint)
         r2.addWidget(self.cmb_count)
         self.spin_count = QSpinBox()
         self.spin_count.setRange(1, MAX_CANDIDATES_HARD)
         self.spin_count.setValue(5000)
         self.spin_count.setSingleStep(1000)
         self.spin_count.setVisible(False)
+        self.spin_count.valueChanged.connect(self._update_probe_hint)
         r2.addWidget(self.spin_count)
         r2.addStretch(1)
         lay.addLayout(r2)
@@ -327,12 +331,23 @@ class ScannerPage(QWidget):
         self._port_checks: dict[int, QCheckBox] = {}
         for p in CF_PORTS:
             cb = QCheckBox(str(p))
-            if p == 443:
-                cb.setChecked(True)
+            # Default to the config port ONLY (no extra ports pre-checked) so the
+            # probe count equals the IP count — e.g. 5,000 IPs = 5,000 probes,
+            # not 10,000. Selecting extra ports multiplies the work; the live
+            # hint below makes that explicit.
+            cb.toggled.connect(self._update_probe_hint)
             r4.addWidget(cb)
             self._port_checks[p] = cb
+        self.chk_port_config.toggled.connect(self._update_probe_hint)
         r4.addStretch(1)
         lay.addLayout(r4)
+
+        # live "N IPs × M ports = K probes" hint so the header count and the
+        # actual scan size never disagree (#3).
+        self.lbl_probe_hint = QLabel("")
+        self.lbl_probe_hint.setObjectName("hint")
+        self.lbl_probe_hint.setWordWrap(True)
+        lay.addWidget(self.lbl_probe_hint)
 
         # --- row: Phase-2 toggle + Top N ---
         r5 = QHBoxLayout()
@@ -436,6 +451,19 @@ class ScannerPage(QWidget):
         head = QHBoxLayout()
         head.addWidget(QLabel(tr("نتایج (IP:port تمیز):")))
         head.addStretch(1)
+        # --- sort by lowest ping (#4) ---
+        self.btn_sort_ping = QPushButton(tr("⬆ مرتب‌سازی بر اساس کم‌ترین پینگ"))
+        self.btn_sort_ping.setObjectName("Ghost")
+        self.btn_sort_ping.setToolTip(tr(
+            "نتایج را صعودی بر اساس تأخیر (کم‌ترین پینگ اول) مرتب می‌کند."))
+        self.btn_sort_ping.clicked.connect(self._sort_by_latency)
+        head.addWidget(self.btn_sort_ping)
+        self.chk_autosort = QCheckBox(tr("مرتب‌سازی خودکار"))
+        self.chk_autosort.setChecked(True)
+        self.chk_autosort.setToolTip(tr(
+            "نتایج را همان لحظه که پیدا می‌شوند بر اساس کم‌ترین پینگ مرتب نگه "
+            "می‌دارد."))
+        head.addWidget(self.chk_autosort)
         self.btn_check_all = QPushButton(tr("انتخاب همه"))
         self.btn_check_all.setObjectName("Ghost")
         self.btn_check_all.clicked.connect(lambda: self._set_all_checked(True))
@@ -541,6 +569,7 @@ class ScannerPage(QWidget):
         if not has_cfg:
             self.chk_xray.setChecked(False)
         self._refresh_enabled_states()
+        self._update_probe_hint()
 
     def _refresh_enabled_states(self, *_):
         is_file = self.cmb_source.currentData() == SOURCE_FILE
@@ -581,6 +610,51 @@ class ScannerPage(QWidget):
         return tuple(p for p, cb in self._port_checks.items()
                      if cb.isChecked())
 
+    def _effective_ports(self) -> list[int]:
+        """The de-duplicated port list a scan would actually probe each IP on.
+
+        Mirrors :meth:`ScanConfig.all_ports`: the config port (when the «پورت
+        کانفیگ» pill is checked) first, then any extra CDN ports, with the
+        config port removed from the extras so it's never counted twice.
+        """
+        ports: list[int] = []
+        cfg_port = self._config_port()
+        if self.chk_port_config.isChecked():
+            ports.append(cfg_port)
+        for p in self._selected_extra_ports():
+            if p not in ports:
+                ports.append(p)
+        return ports
+
+    def _update_probe_hint(self, *_):
+        """Keep the «N IP × M پورت = K پروب» hint in sync with the controls.
+
+        This is what stops the header count (e.g. «۵۰۰۰ تصادفی») and the actual
+        scan size from disagreeing: it always shows the real probe total.
+        """
+        if not hasattr(self, "lbl_probe_hint"):
+            return
+        is_file = self.cmb_source.currentData() == SOURCE_FILE
+        ports = self._effective_ports()
+        nports = max(1, len(ports))
+        if is_file:
+            n_ips = len(parse_ip_list(self.txt_manual.toPlainText()))
+            src_txt = tr("از فایل/لیست شما")
+        else:
+            n_ips = self._selected_count()
+            src_txt = tr("تصادفی")
+        total = n_ips * nports
+        ports_txt = "، ".join(str(p) for p in ports) if ports else "—"
+        if nports == 1:
+            self.lbl_probe_hint.setText(tr(
+                "{n:,} IP {src} روی پورت {ports} ← مجموعاً {total:,} پروب"
+            ).format(n=n_ips, src=src_txt, ports=ports_txt, total=total))
+        else:
+            self.lbl_probe_hint.setText(tr(
+                "{n:,} IP {src} × {m} پورت ({ports}) ← مجموعاً {total:,} پروب"
+            ).format(n=n_ips, src=src_txt, m=nports, ports=ports_txt,
+                     total=total))
+
     def _config_port(self) -> int:
         prof = self.current_profile()
         if prof is not None:
@@ -612,12 +686,25 @@ class ScannerPage(QWidget):
         self._uploaded_ips = ips
         self.lbl_manual_count.setText(
             tr("{n} IP معتبر").format(n=len(ips)) if ips else "")
+        self._update_probe_hint()
 
     # ------------------------------------------------------------ scanning
     def _start(self):
         if self._worker is not None and self._worker.isRunning():
             return
         prof = self.current_profile()
+        # A scan is only meaningful against a real config: the clean IP must
+        # answer on the config's port/SNI and (for ws configs) carry its WS
+        # upgrade. Without one we'd fall back to a generic edge probe that the
+        # user can't actually use — so require the user to add/select a config
+        # first instead of running a meaningless sweep.
+        if prof is None:
+            QMessageBox.information(
+                self, tr("کانفیگ لازم است"),
+                tr("برای اسکن باید یک کانفیگ انتخاب کنید. اگر کانفیگی ندارید، "
+                   "ابتدا از بخش «کانفیگ‌ها» یک کانفیگ اضافه کنید، سپس آن را "
+                   "از فهرست بالا انتخاب کنید."))
+            return
         is_file = self.cmb_source.currentData() == SOURCE_FILE
 
         ips: Optional[List[str]] = None
@@ -638,8 +725,8 @@ class ScannerPage(QWidget):
                    "پورت‌های کلودفلر)."))
             return
 
-        # build the ScanConfig from the chosen reference profile (or a bare
-        # Phase-1 HTTP probe when no config is selected).
+        # build the ScanConfig from the chosen reference profile. The clean IP
+        # must satisfy the config's own port / SNI / (ws) upgrade.
         common = dict(
             timeout=self._selected_timeout(),
             concurrency=self._selected_workers(),
@@ -649,22 +736,13 @@ class ScannerPage(QWidget):
             source=SOURCE_FILE if is_file else SOURCE_RANDOM,
             top_n=self._selected_topn(),
         )
-        if prof is not None:
-            cfg = scan_config_from_profile(prof, **common)
-            # the "پورت کانفیگ" pill toggles whether the config port is probed
-            if not self.chk_port_config.isChecked() and extra_ports:
-                cfg.port = extra_ports[0]
-                cfg.ports = extra_ports[1:]
-        else:
-            from core.cf_scanner import MODE_HTTP
-            port = extra_ports[0] if extra_ports else 443
-            cfg = ScanConfig(
-                port=port, server_name="speed.cloudflare.com",
-                host="speed.cloudflare.com", mode=MODE_HTTP,
-                ports=(extra_ports[1:] if extra_ports else ()),
-                **common)
+        cfg = scan_config_from_profile(prof, **common)
+        # the "پورت کانفیگ" pill toggles whether the config port is probed
+        if not self.chk_port_config.isChecked() and extra_ports:
+            cfg.port = extra_ports[0]
+            cfg.ports = extra_ports[1:]
 
-        validate_xray = self.chk_xray.isChecked() and prof is not None
+        validate_xray = self.chk_xray.isChecked()
 
         # live result file (SenPaiScanner keeps updating it during the scan)
         self._result_path = os.path.join(os.getcwd(), default_result_filename())
@@ -734,8 +812,15 @@ class ScannerPage(QWidget):
         chk.setData(Qt.UserRole, (ip, int(port)))
         self.table.setItem(row, _COL_CHECK, chk)
         self.table.setItem(row, _COL_ENDPOINT, QTableWidgetItem(ep))
-        self.table.setItem(row, _COL_LATENCY, QTableWidgetItem("—"))
-        self.table.setItem(row, _COL_SPEED, QTableWidgetItem("—"))
+        lat_item = QTableWidgetItem("—")
+        # numeric latency kept in UserRole (NOT EditRole) so the displayed text
+        # ("50ms") is preserved while we still have a clean key to sort on; a
+        # missing/unknown ping sorts last via a large sentinel.
+        lat_item.setData(Qt.UserRole, 1e12)
+        self.table.setItem(row, _COL_LATENCY, lat_item)
+        spd_item = QTableWidgetItem("—")
+        spd_item.setData(Qt.UserRole, 0.0)
+        self.table.setItem(row, _COL_SPEED, spd_item)
         self.table.setItem(row, _COL_STATUS, QTableWidgetItem(tr("فاز ۱")))
         self._row_for_ep[ep] = row
         return row
@@ -743,22 +828,80 @@ class ScannerPage(QWidget):
     def _on_hit(self, ip: str, port: int, latency_ms: float, detail: str = ""):
         self._found += 1
         row = self._ensure_row(ip, port)
-        self.table.item(row, _COL_LATENCY).setText(f"{latency_ms:.0f}ms")
+        lat_item = self.table.item(row, _COL_LATENCY)
+        lat_item.setText(f"{latency_ms:.0f}ms")
+        lat_item.setData(Qt.UserRole, float(latency_ms))
         tag = (tr("عالی") if latency_ms < 150 else
                tr("خوب") if latency_ms < 350 else tr("کند"))
         self.table.item(row, _COL_STATUS).setText(tr("تمیز · {t}").format(t=tag))
         if detail:
             self.table.item(row, _COL_ENDPOINT).setToolTip(detail)
         self.lbl_progress.setText(tr("پیداشده: {f}").format(f=self._found))
+        if getattr(self, "chk_autosort", None) and self.chk_autosort.isChecked():
+            self._sort_by_latency()
 
     def _on_verified(self, ip: str, port: int, latency_ms: float,
                      speed_bps: float):
         row = self._ensure_row(ip, port)
-        self.table.item(row, _COL_LATENCY).setText(f"{latency_ms:.0f}ms")
+        lat_item = self.table.item(row, _COL_LATENCY)
+        lat_item.setText(f"{latency_ms:.0f}ms")
+        lat_item.setData(Qt.UserRole, float(latency_ms))
         spd = _fmt_speed(speed_bps) if speed_bps > 0 else "—"
-        self.table.item(row, _COL_SPEED).setText(spd)
+        spd_item = self.table.item(row, _COL_SPEED)
+        spd_item.setText(spd)
+        spd_item.setData(Qt.UserRole, float(speed_bps))
         self.table.item(row, _COL_STATUS).setText(tr("✅ تأییدشده"))
         self.table.item(row, _COL_CHECK).setCheckState(Qt.Checked)
+        if getattr(self, "chk_autosort", None) and self.chk_autosort.isChecked():
+            self._sort_by_latency()
+
+    def _sort_by_latency(self):
+        """Reorder rows ascending by ping (best/lowest first) and re-index.
+
+        Done manually (rather than ``QTableWidget.sortItems``) so the displayed
+        latency text — e.g. "50ms" — is preserved: the numeric sort key lives in
+        the latency item's ``UserRole``. After reordering we rebuild the cached
+        endpoint→row map (read from each checkbox item's ``UserRole``) so live
+        updates still write to the correct rows.
+        """
+        n = self.table.rowCount()
+        if n < 2:
+            return
+
+        # snapshot every row: its sort key + the data needed to rewrite it
+        snapshot = []
+        for row in range(n):
+            chk = self.table.item(row, _COL_CHECK)
+            lat = self.table.item(row, _COL_LATENCY)
+            key = lat.data(Qt.UserRole) if lat is not None else 1e12
+            try:
+                key = float(key)
+            except (TypeError, ValueError):
+                key = 1e12
+            cells = []
+            for col in range(self.table.columnCount()):
+                cells.append(self.table.takeItem(row, col))
+            check_state = (cells[_COL_CHECK].checkState()
+                           if cells[_COL_CHECK] is not None else Qt.Checked)
+            snapshot.append((key, cells, check_state))
+
+        # stable ascending sort by ping (lowest first)
+        order = sorted(range(len(snapshot)), key=lambda i: snapshot[i][0])
+
+        new_map: dict[str, int] = {}
+        for new_row, idx in enumerate(order):
+            _, cells, check_state = snapshot[idx]
+            for col, item in enumerate(cells):
+                if item is not None:
+                    self.table.setItem(new_row, col, item)
+            chk = self.table.item(new_row, _COL_CHECK)
+            if chk is not None:
+                chk.setCheckState(check_state)
+                data = chk.data(Qt.UserRole)
+                if data:
+                    ip, port = data
+                    new_map[self._row_endpoint(ip, port)] = new_row
+        self._row_for_ep = new_map
 
     def _on_rejected(self, ip: str, port: int):
         ep = self._row_endpoint(ip, port)

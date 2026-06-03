@@ -121,6 +121,17 @@ TOPN_PRESETS: tuple[int, ...] = (10, 25, 50, 100)
 # 100,000 the user asked for — keeps a runaway "Custom" entry from OOM-ing).
 MAX_CANDIDATES_HARD = 100_000
 
+# Default HTTP download sample size, ported verbatim from SenPaiScanner's
+# ``speedSampleForMode`` (``internal/ui/cmds.go``). This is the single most
+# important faithfulness knob: with a non-zero speed sample the probe sets
+# ``speed_tested=True`` and ``is_healthy`` then REQUIRES a non-zero throughput
+# AND a successful WebSocket upgrade — exactly what makes the real scanner find
+# only ~3 truly-clean IPs out of 100,000 instead of accepting every edge IP that
+# merely completes a TLS handshake + trace GET. 64 KB is enough to catch IPs
+# that stall on real data while still completing on restricted networks; 256 KB
+# was too large and timed out on throttled links (per upstream's comment).
+SENPAI_SPEED_SAMPLE_BYTES = 64 * 1024
+
 
 # probe outcome (kept for backward compatibility with the old API + the UI).
 OK = "ok"
@@ -935,7 +946,12 @@ class ScanConfig:
     # --- SenPaiScanner Phase-1 tunables ---
     tries: int = 4
     mode: str = MODE_HTTP
-    speed_bytes: int = 0
+    # Default to SenPaiScanner's 64 KB speed sample so Phase-1 actually proves
+    # the edge carries real data (and, via ``to_spec``, requires a WebSocket
+    # upgrade too). With ``speed_bytes=0`` the probe was far too lenient and
+    # marked ~25% of edge IPs "clean"; this mirrors the real scanner's strictness
+    # (≈3 hits / 100k). Set to 0 explicitly to opt out (e.g. a pure TCP sweep).
+    speed_bytes: int = SENPAI_SPEED_SAMPLE_BYTES
     require_ws: bool = False
     # --- SenPaiScanner setup-row extras ---
     source: str = SOURCE_RANDOM   # SOURCE_RANDOM | SOURCE_FILE
@@ -962,13 +978,20 @@ class ScanConfig:
         return out
 
     def to_spec(self, port: Optional[int] = None) -> "ProbeSpec":
+        # Faithful to SenPaiScanner's scan path: when an HTTP-mode probe takes a
+        # speed sample it ALSO requires a successful WebSocket upgrade
+        # (``RequireWebSocket: mode == ModeHTTP && speedSampleForMode(mode) > 0``).
+        # That double gate (non-zero throughput + WS survives a DPI idle-hold) is
+        # what makes the scan trustworthy and weeds out the false positives.
+        require_ws = (self.require_ws or self.is_ws
+                      or (self.mode == MODE_HTTP and self.speed_bytes > 0))
         return ProbeSpec(
             port=int(port if port is not None else self.port),
             server_name=self.server_name,
             host=self.host or self.server_name, path=self.path or "/",
             is_ws=self.is_ws, is_tls=self.is_tls, tries=self.tries,
             mode=self.mode, speed_bytes=self.speed_bytes,
-            require_ws=self.require_ws or self.is_ws)
+            require_ws=require_ws)
 
 
 @dataclass
