@@ -13,6 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import core.cf_scanner as cf
 from core.cf_scanner import (
     CFScanner, IPResult, ScanConfig, OK, RST, TIMEOUT,
     cf_ip_pool, scan_config_from_profile, profile_with_ip,
@@ -181,6 +182,50 @@ def test_scan_config_non_ws_transport_is_not_ws():
                 service_name="gsvc")
     cfg = scan_config_from_profile(p)
     assert cfg.is_ws is False
+
+
+def test_default_scan_config_is_senpai_strict():
+    """Defaults must match SenPaiScanner's strict scan path (anti false-positive).
+
+    SenPaiScanner's scan uses a 64 KB speed sample for HTTP mode and, because
+    that sample is non-zero, ALSO requires a successful WebSocket upgrade
+    (``RequireWebSocket: mode==HTTP && speedBytes>0``). With ``speed_bytes=0``
+    the old defaults accepted almost every Cloudflare edge IP (≈500/2000); these
+    strict defaults are what bring us down to the real scanner's hit rate.
+    """
+    cfg = cf.ScanConfig()
+    assert cfg.speed_bytes == cf.SENPAI_SPEED_SAMPLE_BYTES == 64 * 1024
+    spec = cfg.to_spec()
+    assert spec.speed_bytes == 64 * 1024
+    # HTTP mode + non-zero speed sample ⇒ WebSocket is required even for a
+    # non-ws config, exactly like the upstream scan path.
+    assert spec.require_ws is True
+
+
+def test_strict_health_rejects_edge_without_throughput_or_ws():
+    """A live edge that handshakes + traces but stalls on data / WS is NOT clean.
+
+    This is the core false-positive fix: under the strict defaults the speed
+    sample is taken (``speed_tested``) and WS is required, so an IP that returns
+    a 200 + colo but never delivers bytes or completes a WS upgrade must be
+    rejected — whereas under the old lenient defaults it would have passed.
+    """
+    cfg = cf.ScanConfig()
+    spec = cfg.to_spec()
+    # mimic prober output for an edge that traces fine but stalls on data/WS
+    r = cf.IPResult(ip="104.16.0.1", port=443, mode=cf.MODE_HTTP,
+                    latencies_ms=[40.0, 42.0], tls_ok=True, http_status=200,
+                    colo="AMS", throughput_bps=0.0,
+                    speed_tested=True, ws_ok=False,
+                    require_ws=spec.require_ws)
+    assert r.is_healthy() is False
+    # the same IP, but now it DOES deliver bytes and survives the WS upgrade
+    r_ok = cf.IPResult(ip="104.16.0.1", port=443, mode=cf.MODE_HTTP,
+                       latencies_ms=[40.0, 42.0], tls_ok=True, http_status=200,
+                       colo="AMS", throughput_bps=5_000_000.0,
+                       speed_tested=True, ws_ok=True,
+                       require_ws=spec.require_ws)
+    assert r_ok.is_healthy() is True
 
 
 def test_profile_with_ip_swaps_only_address_and_roundtrips():
