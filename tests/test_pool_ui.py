@@ -519,5 +519,152 @@ class PoolPageImportTest(unittest.TestCase):
         self.assertEqual(store.saved, 0)
 
 
+@unittest.skipUnless(_HAVE_QT, "PySide6 not available")
+class PoolPageSavedListTest(unittest.TestCase):
+    """The always-visible saved sni_ip_pairs list + export-from-saved (the bug
+    the user reported: 'can't export the saved SNI/IP pairs')."""
+
+    def _page(self, store):
+        from ui.window import PoolPage
+        page = PoolPage()
+        page.set_store(store)
+        return page
+
+    def test_saved_list_renders_pairs(self):
+        store = _scan_store(pairs=[
+            {"ip": "1.1.1.1", "sni": "a.com"},
+            {"ip": "2.2.2.2", "sni": "b.com"},
+        ])
+        page = self._page(store)
+        text = page.saved_tbl.toPlainText()
+        self.assertIn("1.1.1.1", text)
+        self.assertIn("a.com", text)
+        self.assertIn("b.com", text)
+        self.assertIn("2", page.lbl_saved_count.text())
+
+    def test_saved_list_empty_shows_hint(self):
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        self.assertIn("خالی", page.saved_tbl.toPlainText())
+
+    def test_export_works_from_saved_list_when_pool_off(self):
+        """Regression: export must work from the saved list even when the pool
+        is disabled / there are no live rows."""
+        import tempfile
+        from unittest import mock
+        store = _scan_store(pairs=[
+            {"ip": "9.9.9.9", "sni": "saved.com"},
+        ])
+        page = self._page(store)
+        page.set_provider(lambda: {"enabled": False})   # pool OFF, no rows
+        self.assertTrue(page.btn_export.isEnabled())
+        path = os.path.join(tempfile.mkdtemp(), "out.txt")
+        with mock.patch("ui.window.QFileDialog.getSaveFileName",
+                        return_value=(path, "")), \
+             mock.patch("ui.window.QMessageBox.information"):
+            page._on_export()
+        body = open(path, encoding="utf-8").read()
+        self.assertIn("9.9.9.9", body)
+        self.assertIn("saved.com", body)
+
+    def test_export_merges_saved_and_live_status(self):
+        import tempfile
+        from unittest import mock
+        store = _scan_store(pairs=[
+            {"ip": "1.1.1.1", "sni": "a.com"},
+            {"ip": "9.9.9.9", "sni": "saved.com"},
+        ])
+        page = self._page(store)
+        # a.com is live & in the pool -> its status becomes "active"
+        page.set_provider(lambda: {
+            "enabled": True, "total": 1, "rows": [
+                {"ip": "1.1.1.1", "sni": "a.com", "loss": 0.0,
+                 "alive": True, "active": 1, "in_pool": True}],
+        })
+        path = os.path.join(tempfile.mkdtemp(), "out.txt")
+        with mock.patch("ui.window.QFileDialog.getSaveFileName",
+                        return_value=(path, "")), \
+             mock.patch("ui.window.QMessageBox.information"):
+            page._on_export()
+        body = open(path, encoding="utf-8").read()
+        self.assertIn("a.com", body)
+        self.assertIn("active", body)     # live status overrides "saved"
+        self.assertIn("saved.com", body)  # saved-only pair still exported
+
+    def test_export_truly_empty_shows_info(self):
+        from unittest import mock
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        page.set_provider(lambda: {"enabled": False})
+        with mock.patch("ui.window.QMessageBox.information") as info, \
+             mock.patch("ui.window.QFileDialog.getSaveFileName") as save:
+            page._on_export()
+            info.assert_called_once()
+            save.assert_not_called()
+
+    def test_clear_saved_removes_all(self):
+        from unittest import mock
+        store = _scan_store(pairs=[
+            {"ip": "1.1.1.1", "sni": "a.com"},
+            {"ip": "2.2.2.2", "sni": "b.com"},
+        ])
+        page = self._page(store)
+        with mock.patch("ui.window.QMessageBox.question",
+                        return_value=__import__(
+                            "PySide6.QtWidgets",
+                            fromlist=["QMessageBox"]).QMessageBox.Yes):
+            page._on_clear_saved()
+        self.assertEqual(len(store.get("sni_ip_pairs")), 0)
+        self.assertIn("خالی", page.saved_tbl.toPlainText())
+
+    def test_clear_saved_cancelled_keeps_pairs(self):
+        from unittest import mock
+        store = _scan_store(pairs=[{"ip": "1.1.1.1", "sni": "a.com"}])
+        page = self._page(store)
+        with mock.patch("ui.window.QMessageBox.question",
+                        return_value=__import__(
+                            "PySide6.QtWidgets",
+                            fromlist=["QMessageBox"]).QMessageBox.No):
+            page._on_clear_saved()
+        self.assertEqual(len(store.get("sni_ip_pairs")), 1)
+
+    def test_add_rows_reports_added_and_duplicates(self):
+        store = _scan_store(pairs=[{"ip": "1.1.1.1", "sni": "a.com"}])
+        page = self._page(store)
+        page._toggle_scan_panel()
+        from PySide6.QtWidgets import QTableWidgetItem
+        from ui.i18n import tr
+        rows = [("1.1.1.1", "a.com", True), ("2.2.2.2", "b.com", True)]
+        page.scan_tbl.setRowCount(len(rows))
+        for i, (ip, sni, ok) in enumerate(rows):
+            page.scan_tbl.setItem(i, page.SC_IP, QTableWidgetItem(ip))
+            page.scan_tbl.setItem(i, page.SC_SNI, QTableWidgetItem(sni))
+            st = page._STATUS_FA["ok"] if ok else page._STATUS_FA["fail"]
+            page.scan_tbl.setItem(i, page.SC_STATUS, QTableWidgetItem(tr(st)))
+            page.scan_tbl.setItem(i, page.SC_SAVED, QTableWidgetItem(""))
+            page._row_for_key[page._scan_key(ip, sni)] = i
+        added, dups, skipped = page._scan_add_rows([0, 1], ok_only=False)
+        self.assertEqual(added, 1)       # only b.com is new
+        self.assertEqual(dups, 1)        # a.com already saved
+        self.assertEqual(skipped, 0)
+
+    def test_saved_list_refreshes_after_add(self):
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        page._toggle_scan_panel()
+        from PySide6.QtWidgets import QTableWidgetItem
+        from ui.i18n import tr
+        page.scan_tbl.setRowCount(1)
+        page.scan_tbl.setItem(0, page.SC_IP, QTableWidgetItem("5.5.5.5"))
+        page.scan_tbl.setItem(0, page.SC_SNI, QTableWidgetItem("new.com"))
+        page.scan_tbl.setItem(
+            0, page.SC_STATUS, QTableWidgetItem(tr(page._STATUS_FA["ok"])))
+        page.scan_tbl.setItem(0, page.SC_SAVED, QTableWidgetItem(""))
+        page._row_for_key[page._scan_key("5.5.5.5", "new.com")] = 0
+        page.scan_tbl.selectAll()
+        page._scan_add_selected()
+        self.assertIn("new.com", page.saved_tbl.toPlainText())
+
+
 if __name__ == "__main__":
     unittest.main()
