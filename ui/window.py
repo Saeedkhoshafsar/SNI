@@ -2351,14 +2351,21 @@ class PoolPage(QWidget):
         sb.addWidget(self.lbl_help)
         root.addWidget(summary)
 
-        # --- per-pair table card -----------------------------------------
-        pairs = Card()
-        pb = pairs.body()
-        head = QHBoxLayout()
-        ph = QLabel(tr("مسیرها (IP × SNI)"))
-        ph.setObjectName("H2")
-        head.addWidget(ph)
-        head.addStretch(1)
+        # --- saved SNI/IP list card --------------------------------------
+        # The user's reusable sni_ip_pairs list — the thing the import/export
+        # buttons actually operate on. This is ALWAYS shown (independent of the
+        # live pool) so the buttons never act on an "empty" view and the user
+        # can see exactly what they have saved, how many, and remove pairs.
+        saved = Card()
+        sv = saved.body()
+        shead = QHBoxLayout()
+        sh = QLabel(tr("فهرست ذخیره‌شده‌ی من (IP × SNI)"))
+        sh.setObjectName("H2")
+        shead.addWidget(sh)
+        self.lbl_saved_count = QLabel(tr("۰ جفت"))
+        self.lbl_saved_count.setObjectName("Faint")
+        shead.addWidget(self.lbl_saved_count)
+        shead.addStretch(1)
         # Inline manual scan ("شروع تست"): toggles the scan panel below (no
         # separate window — the dialog used to feel like it froze on open). The
         # sweep tests every (IP, SNI) pair once against the DPI directly and the
@@ -2366,23 +2373,45 @@ class PoolPage(QWidget):
         self.btn_scan = QPushButton(tr("شروع تست"))
         self.btn_scan.setObjectName("Primary")
         self.btn_scan.clicked.connect(self._toggle_scan_panel)
-        head.addWidget(self.btn_scan)
-        # 7.10 — export the current routes / SNIs to a text file.
+        shead.addWidget(self.btn_scan)
+        # 7.10 — export the saved SNI/IP list (and any live routes) to a file.
         self.btn_export = QPushButton(tr("خروجی فهرست SNI/IP…"))
         self.btn_export.setObjectName("Ghost")
         self.btn_export.clicked.connect(self._on_export)
-        head.addWidget(self.btn_export)
+        shead.addWidget(self.btn_export)
         # import a previously-exported SNI/IP list straight into sni_ip_pairs,
         # so the user never has to copy-paste a list back in by hand.
         self.btn_import = QPushButton(tr("وارد کردن فهرست…"))
         self.btn_import.setObjectName("Ghost")
         self.btn_import.clicked.connect(self._on_import)
-        head.addWidget(self.btn_import)
+        shead.addWidget(self.btn_import)
+        # clear the whole saved list (with confirmation) — there was no way to
+        # do this from the UI before.
+        self.btn_clear_saved = QPushButton(tr("حذف فهرست"))
+        self.btn_clear_saved.setObjectName("Ghost")
+        self.btn_clear_saved.clicked.connect(self._on_clear_saved)
+        shead.addWidget(self.btn_clear_saved)
+        sv.addLayout(shead)
+        self.saved_tbl = QPlainTextEdit()
+        self.saved_tbl.setObjectName("Log")
+        self.saved_tbl.setReadOnly(True)
+        self.saved_tbl.setMinimumHeight(140)
+        sv.addWidget(self.saved_tbl)
+        root.addWidget(saved)
+
+        # --- live pool routes card (only meaningful while connected) ------
+        pairs = Card()
+        pb = pairs.body()
+        head = QHBoxLayout()
+        ph = QLabel(tr("مسیرهای زنده‌ی استخر (هنگام اتصال)"))
+        ph.setObjectName("H2")
+        head.addWidget(ph)
+        head.addStretch(1)
         pb.addLayout(head)
         self.tbl = QPlainTextEdit()
         self.tbl.setObjectName("Log")
         self.tbl.setReadOnly(True)
-        self.tbl.setMinimumHeight(180)
+        self.tbl.setMinimumHeight(150)
         pb.addWidget(self.tbl)
         root.addWidget(pairs)
 
@@ -2483,6 +2512,75 @@ class PoolPage(QWidget):
         """Wire the live ConfigStore so the inline scan can read configs and
         persist added sni_ip_pairs (called by the host in _wire_core)."""
         self._store = store
+        self.refresh_saved_list()
+
+    # ------------------------------------------------------------------
+    #  saved sni_ip_pairs list (always visible, independent of live pool)
+    # ------------------------------------------------------------------
+    def _saved_pairs(self) -> list:
+        """The user's reusable ``sni_ip_pairs`` as a list of ``(ip, sni)``."""
+        store = self._store
+        raw = (store.get("sni_ip_pairs", []) or []) if store else []
+        out = []
+        for p in raw:
+            ip = str(p.get("ip", "")).strip()
+            sni = str(p.get("sni", "")).strip()
+            if ip and sni:
+                out.append((ip, sni))
+        return out
+
+    def refresh_saved_list(self) -> None:
+        """Re-render the saved SNI/IP list card + its count label."""
+        if not hasattr(self, "saved_tbl"):
+            return
+        pairs = self._saved_pairs()
+        n = len(pairs)
+        self.lbl_saved_count.setText(
+            tr("{n} جفت").format(n=n) if n else tr("خالی"))
+        # export / clear only make sense when there is something saved
+        has_any = n > 0
+        if hasattr(self, "btn_clear_saved"):
+            self.btn_clear_saved.setEnabled(has_any)
+        if not pairs:
+            self.saved_tbl.setPlainText(tr(
+                "فهرست SNI/IP شما خالی است. با «شروع تست» جفت‌های سالم را پیدا "
+                "و اضافه کنید، یا با «وارد کردن فهرست…» یک فایل را بارگذاری "
+                "کنید. این جفت‌ها در «تنظیمات» قابل انتخاب‌اند."))
+            return
+        header = f"{tr('IP'):<20}{tr('SNI')}"
+        lines = [header, "─" * 44]
+        for ip, sni in pairs:
+            lines.append(f"{ip:<20}{sni}")
+        self.saved_tbl.setPlainText("\n".join(lines))
+
+    def _on_clear_saved(self) -> None:
+        """Clear the whole saved SNI/IP list (after confirmation)."""
+        if self._store is None:
+            return
+        pairs = self._saved_pairs()
+        if not pairs:
+            self._toast(tr("فهرست از قبل خالی است."), "info")
+            return
+        resp = QMessageBox.question(
+            self, tr("حذف فهرست SNI/IP"),
+            tr("کل فهرست ذخیره‌شده ({n} جفت) حذف شود؟ این کار قابل بازگشت "
+               "نیست.").format(n=len(pairs)),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return
+        n = len(pairs)
+        self._scan_persist([])
+        self.refresh_saved_list()
+        self._toast(tr("{n} جفت حذف شد — فهرست خالی شد.").format(n=n), "warn")
+
+    def _toast(self, text: str, kind: str = "info") -> None:
+        """Show a transient toast on the top-level window (clear feedback)."""
+        try:
+            from ui.widgets import Toast
+            win = self.window() or self
+            Toast.show_message(win, text, kind)
+        except Exception:
+            pass
 
     def _toggle_scan_panel(self) -> None:
         # use isHidden() (the explicit hide flag) rather than isVisible(), which
@@ -2544,18 +2642,25 @@ class PoolPage(QWidget):
     # -- rendering --------------------------------------------------------
     def _render(self, snap) -> None:
         self._last_snap = snap if isinstance(snap, dict) else None
+        # keep the saved-list card in sync on every poll so it reflects any
+        # external changes (e.g. edits made in Settings)
+        self.refresh_saved_list()
+        # export is driven by the SAVED list, not the live pool, so it is
+        # enabled whenever the user has anything saved (or live routes exist).
+        self.btn_export.setEnabled(
+            bool(self._saved_pairs())
+            or bool((snap or {}).get("rows") if isinstance(snap, dict) else []))
         if not snap or not snap.get("enabled"):
             self.lbl_state.setText(tr("استخر: غیرفعال (حالت تک‌مسیره)"))
             self.lbl_counts.setText(tr("مسیرها: —"))
             self.lbl_check.setText(tr("آخرین سلامت‌سنجی: —"))
             self.lbl_route.setText(tr("مسیر فعال: —"))
             self.lbl_failover.setText(tr("بازیابی خودکار: —"))
-            self.btn_export.setEnabled(False)
             self.tbl.setPlainText(tr(
-                "استخر فعال نیست. در «تنظیمات» بیش از یک IP یا SNI وارد کنید "
-                "تا استخر چند-مسیره ساخته شود."))
+                "استخر فقط هنگام اتصال زنده می‌شود. در «تنظیمات» بیش از یک IP یا "
+                "SNI وارد کنید تا استخر چند-مسیره ساخته شود؛ مسیرهای زنده اینجا "
+                "نمایش داده می‌شوند."))
             return
-        self.btn_export.setEnabled(True)
 
         total = int(snap.get("total", 0))
         known = int(snap.get("known", 0))
@@ -2750,9 +2855,18 @@ class PoolPage(QWidget):
         self.scan_btn_run.setEnabled(True)
         self.scan_cmb.setEnabled(True)
         self.scan_btn_stop.setEnabled(False)
-        self.scan_status.setText(
-            tr("پایان — {ok} از {total} جفت سالم بود.").format(
-                ok=ok, total=total))
+        msg = tr("پایان آزمایش — {ok} از {total} جفت سالم بود.").format(
+            ok=ok, total=total)
+        self.scan_status.setText(msg)
+        # clear end-of-scan feedback so the user knows the sweep finished and
+        # how many routes are usable (then they can hit "افزودن همهٔ سالم‌ها").
+        if ok:
+            self._toast(
+                tr("آزمایش تمام شد — {ok} جفت سالم پیدا شد. حالا می‌توانید "
+                   "آن‌ها را به فهرست بیفزایید.").format(ok=ok), "ok")
+        else:
+            self._toast(
+                tr("آزمایش تمام شد — هیچ جفت سالمی پیدا نشد."), "warn")
 
     def _scan_on_result(self, cand: dict) -> None:
         ip = str(cand.get("ip", "")).strip()
@@ -2795,6 +2909,8 @@ class PoolPage(QWidget):
             self._store.save_config()
         except Exception:
             pass
+        # keep the always-visible saved-list card in sync immediately
+        self.refresh_saved_list()
         # let the host refresh Settings so the new pairs are selectable there
         if callable(getattr(self, "pairs_changed", None)):
             try:
@@ -2802,20 +2918,31 @@ class PoolPage(QWidget):
             except Exception:
                 pass
 
-    def _scan_add_rows(self, rows: list, *, ok_only: bool) -> int:
+    def _scan_add_rows(self, rows: list, *, ok_only: bool) -> tuple:
+        """Add scan rows to ``sni_ip_pairs``.
+
+        Returns ``(added, duplicates, skipped)`` so the caller can give the user
+        precise feedback — "how many were added, how many were already in the
+        list, how many were skipped (not OK / blank)".
+        """
         if self._store is None:
-            return 0
+            return (0, 0, 0)
         pairs = list(self._store.get("sni_ip_pairs", []) or [])
         keys = {self._scan_key(p.get("ip", ""), p.get("sni", "")) for p in pairs}
         added = 0
+        duplicates = 0
+        skipped = 0
         for row in rows:
             if ok_only and not self._scan_row_ok(row):
+                skipped += 1
                 continue
             ip, sni = self._scan_row_pair(row)
             if not ip or not sni:
+                skipped += 1
                 continue
             key = self._scan_key(ip, sni)
             if key in keys:
+                duplicates += 1
                 continue
             pairs.append({"sni": sni, "ip": ip})
             keys.add(key)
@@ -2825,76 +2952,132 @@ class PoolPage(QWidget):
             added += 1
         if added:
             self._scan_persist(pairs)
-        return added
+        return (added, duplicates, skipped)
+
+    def _add_feedback(self, added: int, duplicates: int, skipped: int) -> None:
+        """Surface a clear status line + a toast describing what happened."""
+        parts = []
+        if added:
+            parts.append(tr("{n} جفت تازه افزوده شد").format(n=added))
+        if duplicates:
+            parts.append(tr("{n} مورد از قبل بود").format(n=duplicates))
+        if skipped:
+            parts.append(tr("{n} مورد رد شد").format(n=skipped))
+        if not parts:
+            msg = tr("چیزی برای افزودن نبود.")
+            self.scan_status.setText(msg)
+            self._toast(msg, "warn")
+            return
+        msg = " · ".join(parts)
+        self.scan_status.setText(msg)
+        # toast kind: success when something new landed, otherwise informative
+        self._toast(msg, "ok" if added else "info")
 
     def _scan_add_selected(self) -> None:
         rows = self._scan_selected_rows()
         if not rows:
             self.scan_status.setText(tr("هیچ ردیفی انتخاب نشده است."))
+            self._toast(tr("ابتدا چند ردیف را انتخاب کنید."), "warn")
             return
-        n = self._scan_add_rows(rows, ok_only=False)
-        self.scan_status.setText(tr("{n} جفت به فهرست افزوده شد.").format(n=n))
+        added, dups, skipped = self._scan_add_rows(rows, ok_only=False)
+        self._add_feedback(added, dups, skipped)
 
     def _scan_add_all_ok(self) -> None:
         rows = [r for r in range(self.scan_tbl.rowCount())
                 if self._scan_row_ok(r)]
         if not rows:
-            self.scan_status.setText(tr("هیچ جفت سالمی برای افزودن نیست."))
+            msg = tr("هیچ جفت سالمی برای افزودن نیست — اول آزمایش را اجرا کنید.")
+            self.scan_status.setText(msg)
+            self._toast(msg, "warn")
             return
-        n = self._scan_add_rows(rows, ok_only=True)
-        self.scan_status.setText(
-            tr("{n} جفت سالم به فهرست افزوده شد.").format(n=n))
+        added, dups, skipped = self._scan_add_rows(rows, ok_only=True)
+        self._add_feedback(added, dups, skipped)
 
     def _scan_remove_selected(self) -> None:
         rows = self._scan_selected_rows()
         if not rows or self._store is None:
             self.scan_status.setText(tr("هیچ ردیفی انتخاب نشده است."))
+            self._toast(tr("ابتدا چند ردیف را انتخاب کنید."), "warn")
             return
         remove_keys = {self._scan_key(*self._scan_row_pair(r)) for r in rows}
+        before = self._saved_pairs()
         pairs = [
             p for p in (self._store.get("sni_ip_pairs", []) or [])
             if self._scan_key(p.get("ip", ""), p.get("sni", "")) not in remove_keys
         ]
+        removed = max(0, len(before) - len(pairs))
         self._scan_persist(pairs)
         for r in rows:
             saved_item = self.scan_tbl.item(r, self.SC_SAVED)
             if saved_item is not None:
                 saved_item.setText("")
-        self.scan_status.setText(
-            tr("{n} جفت از فهرست حذف شد.").format(n=len(rows)))
+        if removed:
+            msg = tr("{n} جفت از فهرست حذف شد.").format(n=removed)
+            self.scan_status.setText(msg)
+            self._toast(msg, "warn")
+        else:
+            msg = tr("هیچ‌کدام از ردیف‌های انتخابی در فهرست نبودند.")
+            self.scan_status.setText(msg)
+            self._toast(msg, "info")
 
     # -- export (7.10) ----------------------------------------------------
     def _on_export(self) -> None:
-        """Write the current pool's IP/SNI pairs (with status) to a text file.
+        """Write the user's SNI/IP pairs (with status) to a text file.
 
-        The export is now IP-paired (issue: "خروجیِ فهرستِ SNI، IP مناسب
-        ندارد"): each line is ``IP <TAB> SNI <TAB> status`` so every SNI carries
-        the connect IP it was proven against, not a bare SNI string.
+        The export is IP-paired (issue: "خروجیِ فهرستِ SNI، IP مناسب ندارد"):
+        each line is ``IP <TAB> SNI <TAB> status`` so every SNI carries the
+        connect IP it was proven against, not a bare SNI string.
+
+        Fix: the export now ALWAYS works as long as the user has anything saved.
+        Previously it only read the *live* pool snapshot rows, which are empty
+        whenever the tunnel isn't running, so the user could never get a file
+        out of their saved list. We now merge:
+          * every pair in the saved ``sni_ip_pairs`` list (status ``saved``), and
+          * any live pool rows (status active/ok/dead) — these override the
+            saved status when the same pair is currently in the pool.
         """
-        snap = self._last_snap
-        rows = (snap or {}).get("rows", []) if isinstance(snap, dict) else []
+        # start from the saved list so export works even when disconnected
         pairs = []
         seen = set()
+        for ip, sni in self._saved_pairs():
+            key = (ip.lower(), sni.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append((ip, sni, "saved"))
+
+        # overlay/append live pool rows with their richer status
+        snap = self._last_snap
+        rows = (snap or {}).get("rows", []) if isinstance(snap, dict) else []
+        status_by_key = {}
         for r in rows:
             ip = str(r.get("ip", "")).strip()
             sni = str(r.get("sni", "")).strip()
             if not ip or not sni:
                 continue
-            key = (ip.lower(), sni.lower())
-            if key in seen:
-                continue
-            seen.add(key)
             if not r.get("alive", True):
                 status = "dead"
             elif r.get("in_pool"):
                 status = "active"
             else:
                 status = "ok"
-            pairs.append((ip, sni, status))
+            key = (ip.lower(), sni.lower())
+            status_by_key[key] = (ip, sni, status)
+        # update statuses of already-listed pairs, append new live-only ones
+        for i, (ip, sni, _st) in enumerate(pairs):
+            k = (ip.lower(), sni.lower())
+            if k in status_by_key:
+                pairs[i] = status_by_key[k]
+        for key, triple in status_by_key.items():
+            if key not in seen:
+                seen.add(key)
+                pairs.append(triple)
+
         if not pairs:
             QMessageBox.information(
                 self, tr("خروجی SNI/IP"),
-                tr("هنوز هیچ جفت IP/SNIِ آزموده‌شده‌ای برای خروجی‌گرفتن وجود ندارد."))
+                tr("فهرستی برای خروجی‌گرفتن وجود ندارد. ابتدا با «شروع تست» "
+                   "جفت‌های سالم را اضافه کنید یا فهرستی وارد کنید."))
             return
         path, _ = QFileDialog.getSaveFileName(
             self, tr("ذخیره‌ی فهرست SNI/IP"), "sni_ip_list.txt",
@@ -2904,10 +3087,14 @@ class PoolPage(QWidget):
         try:
             from core.pool import export_sni_pairs
             n = export_sni_pairs(pairs, path)
+            self._toast(
+                tr("{n} جفت SNI/IP در فایل ذخیره شد ✓").format(n=n), "ok")
             QMessageBox.information(
                 self, tr("خروجی SNI/IP"),
-                tr("{n} مورد در فایل ذخیره شد.").format(n=n))
+                tr("{n} جفت SNI/IP با موفقیت در فایل ذخیره شد.\n\n{p}").format(
+                    n=n, p=path))
         except Exception as exc:
+            self._toast(tr("خروجی ناموفق بود"), "err")
             QMessageBox.warning(
                 self, tr("خروجی SNI/IP"),
                 tr("ذخیره ناموفق بود: {e}").format(e=exc))
@@ -2943,6 +3130,8 @@ class PoolPage(QWidget):
                 tr("وارد کردن ناموفق بود: {e}").format(e=exc))
             return
         if added <= 0:
+            self._toast(
+                tr("جفت تازه‌ای نبود — همه از قبل در فهرست بودند."), "info")
             QMessageBox.information(
                 self, tr("وارد کردن SNI/IP"),
                 tr("جفت تازه‌ای پیدا نشد — همهٔ موارد فایل از قبل در فهرست بودند."))
@@ -2952,11 +3141,14 @@ class PoolPage(QWidget):
             self._store.save_config()
         except Exception:
             pass
+        self.refresh_saved_list()
         if callable(getattr(self, "pairs_changed", None)):
             try:
                 self.pairs_changed()
             except Exception:
                 pass
+        self._toast(
+            tr("{n} جفت تازه به فهرست افزوده شد ✓").format(n=added), "ok")
         QMessageBox.information(
             self, tr("وارد کردن SNI/IP"),
             tr("{n} جفت تازه از فایل به فهرست SNI/IP افزوده شد.").format(n=added))
