@@ -941,6 +941,10 @@ class ProfilesPage(QWidget):
         self._checked: set[int] = set()
         # host window assigns this; called when the selected profile changes
         self.on_selection_changed = None
+        # host window assigns this; called with a profile when the 🔍 button is
+        # pressed so the main window can navigate to the clean-IP scanner page
+        # (instead of popping up the old dialog). ``profile -> None``.
+        self.on_scan_profile = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
@@ -1495,15 +1499,23 @@ class ProfilesPage(QWidget):
 
     # -- Cloudflare clean-IP scanner (issue #3) ---------------------------
     def _scan_index(self, row: int):
-        """Open the clean-IP scanner using this profile as the reference (#3).
+        """Navigate to the clean-IP scanner page using this profile as the
+        reference config.
 
-        Clean IPs found by the scan are turned into new profiles — byte-for-byte
-        identical to the reference config except their server address is the
-        chosen clean IP — and added to the store.
+        The 🔍 button no longer pops up a separate dialog (per the user's
+        request — "no pop-up, just switch to a section"). Instead it hands the
+        chosen profile to the main window via :attr:`on_scan_profile`, which
+        opens the dedicated «اسکن IP تمیز» page pre-loaded with this config.
+        Clean IPs found there are turned into new profiles identical to the
+        reference config except their server address is the chosen clean IP.
         """
         if not (0 <= row < len(self._store.profiles)):
             return
         prof = self._store.profiles[row]
+        if callable(self.on_scan_profile):
+            self.on_scan_profile(prof)
+            return
+        # fallback (should not happen in the app): the legacy dialog
         try:
             from ui.scanner_dialog import ScannerDialog
         except Exception as exc:
@@ -3760,13 +3772,18 @@ class MainWindow(QWidget):
         # zero-arg provider so it stays decoupled from the engine/pool; the
         # provider is wired in _wire_core once the engine is known.
         self.page_pool = PoolPage()
+        # standalone Cloudflare clean-IP scanner page (SenPaiScanner workflow).
+        # Reachable from the nav rail AND from each config's 🔍 button.
+        from ui.scanner_page import ScannerPage
+        self.page_scanner = ScannerPage()
         # wrap every page in a scroll area so tall content scrolls instead of
         # overlapping/clipping when the window is short (the layout bug on the
         # built Windows app). ``_scroll`` maps page -> its scroll wrapper so the
         # page-change / nav logic can still reason about which page is shown.
         self._scroll: dict[QWidget, QScrollArea] = {}
         for p in (self.page_dashboard, self.page_profiles, self.page_settings,
-                  self.page_strategy, self.page_pool, self.page_log):
+                  self.page_strategy, self.page_pool, self.page_scanner,
+                  self.page_log):
             wrap = _scrollable(p)
             self._scroll[p] = wrap
             self.stack.addWidget(wrap)
@@ -3837,6 +3854,14 @@ class MainWindow(QWidget):
         # persists those keys through the same path as the Settings save.
         self.page_pool.load_pool_settings(self.store.config)
         self.page_pool.save_pool_settings = self._save_pool_settings
+
+        # clean-IP scanner page: feed it the available profiles, wire the 🔍
+        # button to navigate here (pre-selecting that config), and persist any
+        # clean-IP configs the user adds back into the store.
+        self.page_scanner.set_profiles(
+            self.store.profiles, selected=self.store.selected_profile)
+        self.page_scanner.on_add_profiles = self._on_scanner_add_profiles
+        self.page_profiles.on_scan_profile = self._open_scanner_for_profile
 
         # initialise widgets from persisted state
         self.page_settings.load_from(self.store.config)
@@ -4349,6 +4374,42 @@ class MainWindow(QWidget):
             # leaving the page: stop any in-flight inline scan so it never runs
             # probes in the background after the user navigated away.
             self.page_pool.shutdown_scan()
+        # keep the clean-IP scanner's config list fresh when shown; stop any
+        # running scan when leaving it.
+        if current is self._scroll.get(self.page_scanner):
+            self.page_scanner.set_profiles(
+                self.store.profiles,
+                selected=self.page_scanner.current_profile()
+                or self.store.selected_profile)
+        else:
+            self.page_scanner.shutdown_scan()
+
+    # --- clean-IP scanner navigation / persistence -----------------------
+    def _scanner_page_index(self) -> int:
+        """Stack index of the scanner page (kept robust to reordering)."""
+        return self.stack.indexOf(self._scroll.get(self.page_scanner))
+
+    def _open_scanner_for_profile(self, profile):
+        """Navigate to the scanner page with *profile* pre-selected (🔍)."""
+        self.page_scanner.set_profiles(self.store.profiles, selected=profile)
+        self.page_scanner.focus_profile(profile)
+        idx = self._scanner_page_index()
+        if idx >= 0:
+            self.stack.setCurrentIndex(idx)
+            # keep the nav rail highlight in sync
+            btns = getattr(self, "_nav_buttons", [])
+            if 0 <= idx < len(btns):
+                btns[idx].setChecked(True)
+
+    def _on_scanner_add_profiles(self, new_profiles):
+        """Persist clean-IP configs the scanner page produced."""
+        new_profiles = list(new_profiles or [])
+        if not new_profiles:
+            return
+        added = self.store.add_profiles(new_profiles)
+        self.page_profiles.refresh()
+        Toast.show_message(
+            self, tr("{n} کانفیگ با IP تمیز افزوده شد").format(n=added), "ok")
 
     # --- navigation -------------------------------------------------------
     def _build_nav(self) -> QWidget:
@@ -4371,6 +4432,7 @@ class MainWindow(QWidget):
             ("تنظیمات", "settings"),
             ("استراتژی", "strategy"),
             ("استخر", "strategy"),
+            ("آی‌پی تمیز", "servers"),
             ("لاگ", "logs"),
         ]
         self._nav_buttons: list[NavItem] = []

@@ -488,6 +488,111 @@ def test_probe_latency_uses_successful_tries_average():
     assert len(res.latencies_ms) == 3
 
 
+# ---------------------------------------------------------------------------
+#  SenPaiScanner extras: IP-list parsing, multi-port sweep, export
+# ---------------------------------------------------------------------------
+
+def test_parse_ip_list_tolerates_messy_input():
+    from core.cf_scanner import parse_ip_list
+    text = (
+        "# a comment\n"
+        "104.16.1.1\n"
+        "104.16.1.2:8443 , junk\n"
+        "//skip me\n"
+        "108.162.1.0/30\n"          # CIDR → expands to host addresses
+        "1.1.1.1 8.8.8.8\n"          # space-separated on one line
+        "104.16.1.1\n"               # duplicate of the first
+    )
+    ips = parse_ip_list(text)
+    assert ips.count("104.16.1.1") == 1          # de-duplicated
+    assert "104.16.1.2" in ips                   # IP:port → port stripped
+    assert "108.162.1.1" in ips and "108.162.1.2" in ips  # CIDR expanded
+    assert "1.1.1.1" in ips and "8.8.8.8" in ips
+    # comment / junk lines never leak in
+    assert all(tok.replace(".", "").isdigit() for tok in ips)
+
+
+def test_parse_ip_list_respects_limit():
+    from core.cf_scanner import parse_ip_list
+    # /24 has 254 hosts; the limit must cap the expansion
+    ips = parse_ip_list("10.0.0.0/24", limit=10)
+    assert len(ips) == 10
+
+
+def test_all_ports_dedupes_and_keeps_config_port_first():
+    cfg = ScanConfig(port=443, ports=(8443, 2053, 443, 8443))
+    assert cfg.all_ports() == [443, 8443, 2053]
+
+
+def test_scan_probes_every_ip_on_every_port():
+    """Multi-port: candidate set is the IP × port cartesian product."""
+    seen = []
+
+    def fake(ip, spec, timeout):
+        seen.append((ip, spec.port))
+        return IPResult(ip, OK, latency_ms=10.0, port=spec.port,
+                        latencies_ms=[10.0])
+
+    sc = CFScanner(probe_fn=fake)
+    cfg = ScanConfig(port=443, ports=(8443,), concurrency=4, max_results=0)
+    rep = sc.scan(cfg, ips=["104.16.0.1", "104.16.0.2"])
+    assert rep.tested == 4                                 # 2 IPs × 2 ports
+    assert set(seen) == {
+        ("104.16.0.1", 443), ("104.16.0.1", 8443),
+        ("104.16.0.2", 443), ("104.16.0.2", 8443),
+    }
+    # each result records the port it was probed on
+    assert {(r.ip, r.port) for r in rep.clean} == set(seen)
+
+
+def test_scan_invalid_when_no_ports():
+    sc = CFScanner(probe_fn=_even_clean)
+    cfg = ScanConfig(port=0, ports=())            # no valid port at all
+    rep = sc.scan(cfg, ips=["104.16.0.2"])
+    assert rep.tested == 0
+    assert rep.clean == []
+
+
+def test_format_endpoints_and_write_file(tmp_path):
+    from core.cf_scanner import format_endpoints, write_result_file
+    results = [
+        IPResult("104.16.0.1", OK, port=443, latency_ms=10.0,
+                 latencies_ms=[10.0]),
+        IPResult("104.16.0.2", OK, port=8443, latency_ms=20.0,
+                 latencies_ms=[20.0]),
+        IPResult("104.16.0.1", OK, port=443, latency_ms=11.0,
+                 latencies_ms=[11.0]),  # duplicate endpoint
+    ]
+    eps = format_endpoints(results)
+    assert eps == ["104.16.0.1:443", "104.16.0.2:8443"]   # de-duplicated
+    path = tmp_path / "out.txt"
+    write_result_file(str(path), results)
+    body = path.read_text(encoding="utf-8").strip().splitlines()
+    assert body == ["104.16.0.1:443", "104.16.0.2:8443"]
+
+
+def test_default_result_filename_shape():
+    from core.cf_scanner import default_result_filename
+    name = default_result_filename()
+    assert name.startswith("SenPaiScannerResult-")
+    assert name.endswith(".txt")
+
+
+def test_scan_config_from_profile_accepts_senpai_extras():
+    p = Profile.from_dict({"address": "ex.com", "port": 8443, "remark": "r",
+                           "transport": "ws", "sni": "a.com", "host": "a.com",
+                           "path": "/ws"})
+    cfg = scan_config_from_profile(
+        p, ports=(443, 2053), top_n=25, source="file",
+        concurrency=100, timeout=3.0, max_candidates=20000)
+    assert cfg.port == 8443
+    assert cfg.ports == (443, 2053)
+    assert cfg.all_ports() == [8443, 443, 2053]
+    assert cfg.top_n == 25
+    assert cfg.source == "file"
+    assert cfg.concurrency == 100 and cfg.timeout == 3.0
+
+
 if __name__ == "__main__":  # pragma: no cover
     import pytest as _pt
     raise SystemExit(_pt.main([__file__, "-q"]))
