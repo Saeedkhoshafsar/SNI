@@ -929,12 +929,66 @@ class SniIpScannerTest(unittest.TestCase):
             [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com"),
              ("3.3.3.3", "c.com"), ("4.4.4.4", "d.com")],
             workers=4, spoof_probe_fn=fn,
-            on_result=record, on_progress=record,
+            on_results_batch=record, on_progress=record,
             on_done=record, on_log=record)
         scanner.run()
         # all callbacks observed exactly one thread id == the caller's
         self.assertTrue(cb_threads)
         self.assertEqual(set(cb_threads), {caller_tid})
+
+    # -- batched verdicts (freeze fix) ------------------------------------
+    def test_batch_delivers_all_verdicts_as_lists(self):
+        """on_results_batch must deliver every verdict, grouped into lists."""
+        batches = []
+        done = []
+        scanner = SniIpScanner(
+            [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com"),
+             ("3.3.3.3", "c.com")],
+            port=443, timeout=0.1, workers=2,
+            spoof_probe_fn=self._probe([("1.1.1.1", "a.com")]),
+            on_results_batch=lambda lst: batches.append(list(lst)),
+            on_done=lambda ok, t: done.append((ok, t)),
+            batch_size=1000, batch_interval=999.0,  # force a single flush
+        )
+        scanner.run()
+        # every batch is a list; flattening yields every candidate exactly once
+        self.assertTrue(all(isinstance(b, list) for b in batches))
+        flat = [d for b in batches for d in b]
+        finals = {(d["ip"], d["sni"]): d["status"] for d in flat}
+        self.assertEqual(len(finals), 3)
+        self.assertEqual(finals[("1.1.1.1", "a.com")], "ok")
+        self.assertEqual(finals[("2.2.2.2", "b.com")], "fail")
+        self.assertEqual(done, [(1, 3)])
+
+    def test_batch_preferred_over_single_result(self):
+        """When on_results_batch is set, on_result must NOT also fire (no
+        double-delivery / double the signal volume)."""
+        singles = []
+        batches = []
+        scanner = SniIpScanner(
+            [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")],
+            port=443, timeout=0.1, workers=2,
+            spoof_probe_fn=self._probe([]),
+            on_result=lambda d: singles.append(d),
+            on_results_batch=lambda lst: batches.append(list(lst)),
+        )
+        scanner.run()
+        self.assertEqual(singles, [])           # single path silent
+        self.assertTrue(batches)                # batch path active
+
+    def test_no_testing_status_emitted(self):
+        """The intermediate 'testing' verdict is gone (it doubled signals)."""
+        statuses = []
+        scanner = SniIpScanner(
+            [("1.1.1.1", "a.com")],
+            port=443, timeout=0.1, workers=1,
+            spoof_probe_fn=self._probe([("1.1.1.1", "a.com")]),
+            on_results_batch=lambda lst: statuses.extend(
+                d["status"] for d in lst),
+        )
+        scanner.run()
+        self.assertNotIn("testing", statuses)
+        self.assertIn("ok", statuses)
 
 
 class ExportSniPairsTest(unittest.TestCase):

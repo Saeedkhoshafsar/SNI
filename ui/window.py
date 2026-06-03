@@ -434,7 +434,15 @@ class SettingsPage(QWidget):
         form.addWidget(self.sni)
 
         form.addWidget(self._field_label("IP اتصال"))
-        self.connect_ip = QLineEdit("104.19.229.21")
+        # A SINGLE fake SNI can work with MANY connect IPs. This is now an
+        # editable combo, not a line-edit: when you pick a saved SNI above, it
+        # is repopulated with EVERY connect IP saved for that SNI so you can
+        # choose which one to use right now (issue: "یک SNI با چند IP، فقط یکی
+        # ذخیره می‌شد"). You can still type a fresh IP.
+        self.connect_ip = NoScrollComboBox()
+        self.connect_ip.setEditable(True)
+        self.connect_ip.setInsertPolicy(NoScrollComboBox.NoInsert)
+        self.connect_ip.setCurrentText("104.19.229.21")
         form.addWidget(self.connect_ip)
 
         # add / remove pair row
@@ -461,66 +469,20 @@ class SettingsPage(QWidget):
         self.pair_hint.setObjectName("Muted")
         self.pair_hint.setWordWrap(True)
         self.pair_hint.setText(tr(
-            "هر SNI جعلی را با IP اتصالی که با آن کار می‌کند ذخیره کنید؛ "
-            "وقتی همان SNI را انتخاب کنید، IP جفت‌شده‌اش خودکار پر می‌شود."))
+            "هر SNI جعلی می‌تواند چند IP اتصال داشته باشد. IP را وارد و «افزودن "
+            "جفت» را بزنید (هر بار یک IP تازه به همان SNI اضافه می‌شود). وقتی "
+            "همان SNI را انتخاب کنید، همهٔ IPهای ذخیره‌شده‌اش در فهرست «IP "
+            "اتصال» می‌آیند تا یکی را انتخاب کنید."))
         form.addWidget(self.pair_hint)
         form.addSpacing(6)
 
-        # --- multi-IP / multi-SNI route pool (CONNECT_IPS / FAKE_SNIS) -------
-        # When more than one IP and/or SNI is listed here, their cartesian
-        # product becomes a self-healing pool (core.pool): each route is
-        # health-checked in the background and the best ones are used with
-        # weighted-random load-balancing. Leaving these empty keeps the single
-        # CONNECT_IP / FAKE_SNI above (the legacy direct mode) — nothing changes.
+        # NOTE: the multi-IP / multi-SNI route-pool controls (CONNECT_IPS /
+        # FAKE_SNIS / optimise toggle / worker count) used to live here. They
+        # have moved to their own card on the «استخر» (Pool) page so that
+        # everything pool-related — the IP/SNI pool *and* the tester — sits
+        # together. SettingsPage now only owns the single direct route
+        # (CONNECT_IP / FAKE_SNI) and the saved sni_ip_pairs picker above.
         form.addSpacing(4)
-        pool_title = QLabel(tr("استخر چند-مسیره (اختیاری)"))
-        pool_title.setObjectName("Muted")
-        form.addWidget(pool_title)
-
-        # Redesign: opt-in checkbox. When OFF the single fixed route (the saved
-        # best, or the SNI/IP above) is used with NO background testing at all.
-        # When ON the pool tests in the background and swaps in a strictly-better
-        # route losslessly. Default ON.
-        self.chk_pool_optimize = QCheckBox(tr("بهینه‌سازی مسیر در پس‌زمینه"))
-        self.chk_pool_optimize.setChecked(True)
-        form.addWidget(self.chk_pool_optimize)
-        opt_hint = QLabel(tr(
-            "روشن: اول با مسیر فعلی وصل می‌شویم، استخر در پس‌زمینه تست می‌کند و "
-            "مسیر بهتر را بدون قطع جایگزین می‌کند (بهترین نتیجه برای هر کانفیگ "
-            "ذخیره می‌شود).\nخاموش: فقط همان SNI/IP تکی ثابت می‌ماند، هیچ تستی "
-            "انجام نمی‌شود."))
-        opt_hint.setObjectName("Muted")
-        opt_hint.setWordWrap(True)
-        form.addWidget(opt_hint)
-        form.addSpacing(4)
-
-        form.addWidget(self._field_label("IPهای استخر — هر خط یک IP"))
-        self.pool_ips = QPlainTextEdit()
-        self.pool_ips.setObjectName("PoolList")
-        self.pool_ips.setPlaceholderText(tr(
-            "خالی = فقط همان «IP اتصال» بالا.\n"
-            "172.66.41.252\n108.162.196.145\n172.65.13.230"))
-        self.pool_ips.setFixedHeight(78)
-        form.addWidget(self.pool_ips)
-
-        form.addWidget(self._field_label("SNIهای استخر — هر خط یک SNI"))
-        self.pool_snis = QPlainTextEdit()
-        self.pool_snis.setObjectName("PoolList")
-        self.pool_snis.setPlaceholderText(tr(
-            "خالی = فقط همان «SNI جعلی» بالا.\n"
-            "apple.com\ngithub.com\nmicrosoft.com"))
-        self.pool_snis.setFixedHeight(78)
-        form.addWidget(self.pool_snis)
-
-        self.pool_hint = QLabel("")
-        self.pool_hint.setObjectName("Muted")
-        self.pool_hint.setWordWrap(True)
-        form.addWidget(self.pool_hint)
-        self.pool_ips.textChanged.connect(self._update_pool_hint)
-        self.pool_snis.textChanged.connect(self._update_pool_hint)
-        self.chk_pool_optimize.toggled.connect(self._update_pool_hint)
-        self._update_pool_hint()
-        form.addSpacing(6)
 
         ports_wrap = QWidget()
         ports = QHBoxLayout(ports_wrap)
@@ -594,17 +556,13 @@ class SettingsPage(QWidget):
         self.sni.setCurrentText(cfg.get("FAKE_SNI", "www.hcaptcha.com"))
         self.spin_listen.setValue(int(cfg.get("LISTEN_PORT", 40443)))
         self.spin_socks.setValue(int(cfg.get("socks_port", 10808)))
-        self.connect_ip.setText(str(cfg.get("CONNECT_IP", "")))
-        # multi-IP / multi-SNI pool lists (one entry per line)
-        pool_ips = cfg.get("CONNECT_IPS", []) or []
-        pool_snis = cfg.get("FAKE_SNIS", []) or []
-        self.pool_ips.setPlainText(
-            "\n".join(str(x).strip() for x in pool_ips if str(x).strip()))
-        self.pool_snis.setPlainText(
-            "\n".join(str(x).strip() for x in pool_snis if str(x).strip()))
-        self.chk_pool_optimize.setChecked(
-            bool(cfg.get("POOL_OPTIMIZE_ENABLED", True)))
-        self._update_pool_hint()
+        self.connect_ip.setCurrentText(str(cfg.get("CONNECT_IP", "")))
+        # populate the IP combo with every IP saved for the loaded SNI
+        self._rebuild_ip_combo(self.sni.currentText().strip(),
+                               prefer=str(cfg.get("CONNECT_IP", "")).strip())
+        # NOTE: the multi-IP / multi-SNI pool lists (CONNECT_IPS / FAKE_SNIS /
+        # POOL_OPTIMIZE_ENABLED) are now loaded by PoolPage.load_pool_settings,
+        # not here — they moved to the «استخر» page.
         self.chk_lan.setChecked(bool(cfg.get("allow_lan", False)))
         self._update_lan_hint(self.chk_lan.isChecked())
         self.chk_system_proxy.setChecked(bool(cfg.get("system_proxy", False)))
@@ -619,10 +577,9 @@ class SettingsPage(QWidget):
             "FAKE_SNI": self.sni.currentText().strip(),
             "LISTEN_PORT": self.spin_listen.value(),
             "socks_port": self.spin_socks.value(),
-            "CONNECT_IP": self.connect_ip.text().strip(),
-            "CONNECT_IPS": self._pool_ip_list(),
-            "FAKE_SNIS": self._pool_sni_list(),
-            "POOL_OPTIMIZE_ENABLED": bool(self.chk_pool_optimize.isChecked()),
+            "CONNECT_IP": self.connect_ip.currentText().strip(),
+            # CONNECT_IPS / FAKE_SNIS / POOL_OPTIMIZE_ENABLED are now collected
+            # by PoolPage.collect_pool_settings (the pool controls moved there).
             "sni_ip_pairs": list(self._sni_ip_pairs),
             "allow_lan": self.chk_lan.isChecked(),
             "system_proxy": self.chk_system_proxy.isChecked(),
@@ -703,49 +660,6 @@ class SettingsPage(QWidget):
                 "خاموش — کانفیگ‌های معمولی مستقیماً وصل می‌شوند (مثل V2RayTun)؛ "
                 "فقط کانفیگ‌های اسپوف (لینک‌های لوکال) از اسپوفر رد می‌شوند."))
 
-    # -- multi-IP / multi-SNI pool helpers --------------------------------
-    @staticmethod
-    def _parse_lines(text: str) -> list[str]:
-        """Split a textarea into a clean, de-duplicated list (one per line)."""
-        seen: set[str] = set()
-        out: list[str] = []
-        for raw in (text or "").splitlines():
-            v = raw.strip()
-            if v and v.lower() not in seen:
-                seen.add(v.lower())
-                out.append(v)
-        return out
-
-    def _pool_ip_list(self) -> list[str]:
-        return self._parse_lines(self.pool_ips.toPlainText())
-
-    def _pool_sni_list(self) -> list[str]:
-        return self._parse_lines(self.pool_snis.toPlainText())
-
-    def _update_pool_hint(self) -> None:
-        """Live preview of how many (IP, SNI) routes the pool will build."""
-        ips = self._pool_ip_list()
-        snis = self._pool_sni_list()
-        # mirror config_store.pool_enabled(): empty lists fall back to the
-        # single CONNECT_IP / FAKE_SNI, so the pool needs >1 resulting pair.
-        eff_ips = len(ips) or 1
-        eff_snis = len(snis) or 1
-        pairs = eff_ips * eff_snis
-        optimize = self.chk_pool_optimize.isChecked()
-        if not optimize:
-            self.pool_hint.setText(tr(
-                "بهینه‌سازی خاموش — فقط مسیر تکیِ ثابت استفاده می‌شود "
-                "(بدون تست پس‌زمینه)."))
-        elif pairs <= 1:
-            self.pool_hint.setText(tr(
-                "تنها یک مسیر تعریف شده — اول با همین وصل می‌شویم؛ برای جایگزینی "
-                "بدون قطع، چند IP/SNI اضافه کنید تا در پس‌زمینه تست شوند."))
-        else:
-            self.pool_hint.setText(tr(
-                "بهینه‌ساز فعال — {ips} IP × {snis} SNI = {pairs} مسیر در "
-                "پس‌زمینه تست می‌شوند؛ مسیر بهتر بدون قطع جایگزین می‌شود.").format(
-                    ips=eff_ips, snis=eff_snis, pairs=pairs))
-
     def _field_label(self, t: str) -> QLabel:
         lbl = QLabel(tr(t))
         lbl.setObjectName("Muted")
@@ -805,49 +719,125 @@ class SettingsPage(QWidget):
                 return pair
         return None
 
+    def _ips_for_sni(self, sni: str) -> list[str]:
+        """Every connect IP saved for *sni* (de-duped, order preserved).
+
+        A single fake SNI can front many IPs; this collects all of them so the
+        IP combo can offer the full set for the user to pick from."""
+        sni = (sni or "").strip().lower()
+        out: list[str] = []
+        seen: set = set()
+        for pair in self._sni_ip_pairs:
+            if (pair.get("sni") or "").strip().lower() != sni:
+                continue
+            ip = (pair.get("ip") or "").strip()
+            if ip and ip.lower() not in seen:
+                seen.add(ip.lower())
+                out.append(ip)
+        return out
+
+    def _has_pair(self, sni: str, ip: str) -> bool:
+        s = (sni or "").strip().lower()
+        i = (ip or "").strip().lower()
+        return any(
+            (p.get("sni") or "").strip().lower() == s
+            and (p.get("ip") or "").strip().lower() == i
+            for p in self._sni_ip_pairs)
+
+    def _rebuild_ip_combo(self, sni: str, prefer: str = "") -> None:
+        """Repopulate the connect-IP combo with every IP saved for *sni*.
+
+        Keeps the current/typed text when possible so the user's choice (or a
+        freshly typed IP) is preserved."""
+        ips = self._ips_for_sni(sni)
+        current = (prefer or self.connect_ip.currentText()).strip()
+        self.connect_ip.blockSignals(True)
+        self.connect_ip.clear()
+        self.connect_ip.addItems(ips)
+        # keep selection/typed value
+        if current:
+            self.connect_ip.setCurrentText(current)
+        elif ips:
+            self.connect_ip.setCurrentText(ips[0])
+        self.connect_ip.blockSignals(False)
+
     def _on_sni_chosen(self, _index: int) -> None:
-        """When the user picks an SNI that has a saved pair, auto-fill its
-        connect IP (issue #3)."""
+        """When the user picks an SNI, list ALL its saved connect IPs in the IP
+        combo and auto-select the first (issue: one SNI ↔ many IPs)."""
         sni = self.sni.currentText().strip()
-        pair = self._find_pair(sni)
-        if pair and pair.get("ip"):
-            self.connect_ip.setText(str(pair["ip"]).strip())
+        ips = self._ips_for_sni(sni)
+        # rebuild the combo from the saved IPs; prefer the first saved IP
+        self._rebuild_ip_combo(sni, prefer=(ips[0] if ips else ""))
+        if len(ips) > 1:
+            self.pair_hint.setText(tr(
+                "این SNI با {n} IP ذخیره شده — از فهرست «IP اتصال» یکی را "
+                "انتخاب کنید.").format(n=len(ips)))
+        elif ips:
+            self.pair_hint.setText(tr(
+                "IP جفت‌شده پر شد: {ip}").format(ip=ips[0]))
 
     def _add_pair(self) -> None:
-        """Save the current SNI + connect-IP as a reusable pair (issue #3)."""
+        """Save the current SNI + connect-IP as a reusable pair.
+
+        Fix: a SNI can now hold MANY IPs — we APPEND a new (SNI, IP) instead of
+        overwriting the SNI's single IP. Duplicates (same SNI+IP) are ignored."""
         sni = self.sni.currentText().strip()
-        ip = self.connect_ip.text().strip()
+        ip = self.connect_ip.currentText().strip()
         if not sni or not ip:
             self.pair_hint.setText(tr(
                 "برای افزودن جفت، هم SNI جعلی و هم IP اتصال را پر کنید."))
             return
-        existing = self._find_pair(sni)
-        if existing:
-            existing["ip"] = ip          # update the IP for an existing SNI
-        else:
-            self._sni_ip_pairs.append({"sni": sni, "ip": ip})
+        if self._has_pair(sni, ip):
+            self.pair_hint.setText(tr(
+                "این جفت از قبل ذخیره شده است: «{sni}» ← {ip}").format(
+                    sni=sni, ip=ip))
+            return
+        self._sni_ip_pairs.append({"sni": sni, "ip": ip})
         self._rebuild_sni_combo()
         self.sni.setCurrentText(sni)
+        self._rebuild_ip_combo(sni, prefer=ip)
+        n = len(self._ips_for_sni(sni))
         self.pair_hint.setText(tr(
-            "جفت ذخیره شد: «{sni}» ← {ip}").format(sni=sni, ip=ip))
+            "جفت ذخیره شد: «{sni}» ← {ip} (این SNI اکنون {n} IP دارد)").format(
+                sni=sni, ip=ip, n=n))
 
     def _remove_pair(self) -> None:
-        """Remove the pair matching the current SNI (issue #3)."""
+        """Remove the (SNI, currently-selected IP) pair.
+
+        With multi-IP SNIs we remove only the EXACT pair shown (SNI + the IP in
+        the combo), not every IP of that SNI."""
         sni = self.sni.currentText().strip()
-        pair = self._find_pair(sni)
-        if pair is None:
-            self.pair_hint.setText(tr("برای این SNI جفتی ذخیره نشده است."))
+        ip = self.connect_ip.currentText().strip()
+        if not self._has_pair(sni, ip):
+            self.pair_hint.setText(tr(
+                "این جفت (SNI + IP انتخابی) ذخیره نشده است."))
             return
+        s, i = sni.lower(), ip.lower()
         self._sni_ip_pairs = [
             p for p in self._sni_ip_pairs
-            if (p.get("sni") or "").strip().lower() != sni.lower()]
+            if not ((p.get("sni") or "").strip().lower() == s
+                    and (p.get("ip") or "").strip().lower() == i)]
         self._rebuild_sni_combo()
-        self.pair_hint.setText(tr("جفت «{sni}» حذف شد.").format(sni=sni))
+        self.sni.setCurrentText(sni)
+        self._rebuild_ip_combo(sni)
+        left = self._ips_for_sni(sni)
+        if left:
+            self.pair_hint.setText(tr(
+                "جفت «{sni}» ← {ip} حذف شد ({n} IP باقی ماند).").format(
+                    sni=sni, ip=ip, n=len(left)))
+        else:
+            self.pair_hint.setText(tr(
+                "جفت «{sni}» ← {ip} حذف شد.").format(sni=sni, ip=ip))
 
     def _update_pair_count(self) -> None:
         n = len(self._sni_ip_pairs)
-        self.lbl_pair_count.setText(
-            tr("{n} جفت ذخیره‌شده").format(n=n) if n else "")
+        snis = len({(p.get("sni") or "").strip().lower()
+                    for p in self._sni_ip_pairs if (p.get("sni") or "").strip()})
+        if n:
+            self.lbl_pair_count.setText(
+                tr("{n} جفت در {s} SNI").format(n=n, s=snis))
+        else:
+            self.lbl_pair_count.setText("")
 
 
 class _ViewportWidthListWidget(QListWidget):
@@ -2251,15 +2241,21 @@ class _PoolScanWorker(QThread):
     original freeze/crash). The thread is intentionally unparented.
     """
 
+    # results_batch carries a LIST of verdict dicts so the GUI repaints in
+    # bulk (a few times per second) instead of once per probe — this is the
+    # freeze fix. ``result`` is kept for any single-shot callers/tests.
     result = Signal(dict)
+    results_batch = Signal(list)
     progress = Signal(int, int)
     finished_scan = Signal(int, int)
 
-    def __init__(self, candidates, *, port: int, timeout: float):
+    def __init__(self, candidates, *, port: int, timeout: float,
+                 workers: int = 8):
         super().__init__()
         self._candidates = candidates
         self._port = port
         self._timeout = timeout
+        self._workers = max(1, int(workers))
         self._scanner = None
 
     def stop(self):
@@ -2268,9 +2264,13 @@ class _PoolScanWorker(QThread):
 
     def run(self):  # pragma: no cover - exercised via Qt smoke, not unit
         from core.pool import SniIpScanner
+        # Bounded concurrency (8 by default, not 16): 16 simultaneous TLS
+        # handshakes per cycle generated a verdict storm the GUI couldn't keep
+        # up with. Combined with batched emits below, the UI stays responsive.
         self._scanner = SniIpScanner(
             self._candidates, port=self._port, timeout=self._timeout,
-            workers=16, on_result=self.result.emit,
+            workers=self._workers,
+            on_results_batch=self.results_batch.emit,
             on_progress=self.progress.emit, on_done=self.finished_scan.emit)
         try:
             self._scanner.run()
@@ -2351,6 +2351,13 @@ class PoolPage(QWidget):
         sb.addWidget(self.lbl_help)
         root.addWidget(summary)
 
+        # --- pool IP/SNI settings card (moved here from «تنظیمات») --------
+        # Everything that defines the route pool now lives on this page so the
+        # pool definition and the tester sit together. The widgets keep the same
+        # config keys (CONNECT_IPS / FAKE_SNIS / POOL_OPTIMIZE_ENABLED) plus the
+        # new scan_workers control for the inline tester.
+        root.addWidget(self._build_pool_settings_card())
+
         # --- saved SNI/IP list card --------------------------------------
         # The user's reusable sni_ip_pairs list — the thing the import/export
         # buttons actually operate on. This is ALWAYS shown (independent of the
@@ -2424,6 +2431,200 @@ class PoolPage(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(1500)
         self._timer.timeout.connect(self.refresh)
+
+    # ------------------------------------------------------------------
+    #  pool IP/SNI settings card (moved from SettingsPage)
+    # ------------------------------------------------------------------
+    def _build_pool_settings_card(self) -> "Card":
+        """Build the multi-IP / multi-SNI route-pool settings card.
+
+        Owns CONNECT_IPS / FAKE_SNIS / POOL_OPTIMIZE_ENABLED (previously on the
+        Settings page) plus the new ``scan_workers`` control for the inline
+        tester. A dedicated «ذخیره استخر» button persists just these keys via
+        the host callback so the user does not have to hop to Settings to save.
+        """
+        card = Card()
+        form = card.body()
+        form.setSpacing(8)
+
+        title = QLabel(tr("تنظیمات استخر مسیر (چند IP / چند SNI)"))
+        title.setObjectName("H2")
+        form.addWidget(title)
+
+        # opt-in checkbox. OFF → single fixed route, no background testing.
+        # ON → pool tests in the background and swaps in a strictly-better
+        # route losslessly. Default ON.
+        self.chk_pool_optimize = QCheckBox(tr("بهینه‌سازی مسیر در پس‌زمینه"))
+        self.chk_pool_optimize.setChecked(True)
+        form.addWidget(self.chk_pool_optimize)
+        opt_hint = QLabel(tr(
+            "روشن: اول با مسیر فعلی وصل می‌شویم، استخر در پس‌زمینه تست می‌کند و "
+            "مسیر بهتر را بدون قطع جایگزین می‌کند (بهترین نتیجه برای هر کانفیگ "
+            "ذخیره می‌شود).\nخاموش: فقط همان SNI/IP تکی ثابت می‌ماند، هیچ تستی "
+            "انجام نمی‌شود."))
+        opt_hint.setObjectName("Muted")
+        opt_hint.setWordWrap(True)
+        form.addWidget(opt_hint)
+        form.addSpacing(4)
+
+        lbl_ips = QLabel(tr("IPهای استخر — هر خط یک IP"))
+        lbl_ips.setObjectName("Muted")
+        form.addWidget(lbl_ips)
+        self.pool_ips = QPlainTextEdit()
+        self.pool_ips.setObjectName("PoolList")
+        self.pool_ips.setPlaceholderText(tr(
+            "خالی = فقط همان «IP اتصال» تنظیمات.\n"
+            "172.66.41.252\n108.162.196.145\n172.65.13.230"))
+        self.pool_ips.setFixedHeight(78)
+        form.addWidget(self.pool_ips)
+
+        lbl_snis = QLabel(tr("SNIهای استخر — هر خط یک SNI"))
+        lbl_snis.setObjectName("Muted")
+        form.addWidget(lbl_snis)
+        self.pool_snis = QPlainTextEdit()
+        self.pool_snis.setObjectName("PoolList")
+        self.pool_snis.setPlaceholderText(tr(
+            "خالی = فقط همان «SNI جعلی» تنظیمات.\n"
+            "apple.com\ngithub.com\nmicrosoft.com"))
+        self.pool_snis.setFixedHeight(78)
+        form.addWidget(self.pool_snis)
+
+        self.pool_hint = QLabel("")
+        self.pool_hint.setObjectName("Muted")
+        self.pool_hint.setWordWrap(True)
+        form.addWidget(self.pool_hint)
+        self.pool_ips.textChanged.connect(self._update_pool_hint)
+        self.pool_snis.textChanged.connect(self._update_pool_hint)
+        self.chk_pool_optimize.toggled.connect(self._update_pool_hint)
+        form.addSpacing(6)
+
+        # scan_workers: parallel probes used by the inline tester ("شروع تست").
+        # Fewer workers = a calmer GUI during a sweep (the freeze fix); more =
+        # a faster sweep. Clamped 1..32.
+        wrow = QHBoxLayout()
+        wrow.setSpacing(8)
+        wlbl = QLabel(tr("تعداد کارگرهای آزمایش (موازی):"))
+        wlbl.setObjectName("Muted")
+        wrow.addWidget(wlbl)
+        self.spin_workers = NoScrollSpinBox()
+        self.spin_workers.setRange(1, 32)
+        self.spin_workers.setValue(8)
+        self.spin_workers.setMinimumHeight(36)
+        self.spin_workers.setButtonSymbols(QSpinBox.UpDownArrows)
+        wrow.addWidget(self.spin_workers)
+        wrow.addStretch(1)
+        form.addLayout(wrow)
+        wkr_hint = QLabel(tr(
+            "کمتر = رابط نرم‌تر هنگام آزمایش؛ بیشتر = آزمایش سریع‌تر. اگر برنامه "
+            "هنگام تست کند می‌شود این عدد را کم کنید."))
+        wkr_hint.setObjectName("Muted")
+        wkr_hint.setWordWrap(True)
+        form.addWidget(wkr_hint)
+        form.addSpacing(6)
+
+        save_row = QHBoxLayout()
+        save_row.addStretch(1)
+        self.btn_save_pool = QPushButton(tr("ذخیره استخر"))
+        self.btn_save_pool.setObjectName("Primary")
+        self.btn_save_pool.clicked.connect(self._save_pool_settings)
+        save_row.addWidget(self.btn_save_pool)
+        form.addLayout(save_row)
+
+        self._update_pool_hint()
+        return card
+
+    # -- multi-IP / multi-SNI pool helpers (moved from SettingsPage) ------
+    @staticmethod
+    def _parse_lines(text: str) -> list:
+        """Split a textarea into a clean, de-duplicated list (one per line)."""
+        seen = set()
+        out = []
+        for raw in (text or "").splitlines():
+            v = raw.strip()
+            if v and v.lower() not in seen:
+                seen.add(v.lower())
+                out.append(v)
+        return out
+
+    def _pool_ip_list(self) -> list:
+        return self._parse_lines(self.pool_ips.toPlainText())
+
+    def _pool_sni_list(self) -> list:
+        return self._parse_lines(self.pool_snis.toPlainText())
+
+    def _update_pool_hint(self) -> None:
+        """Live preview of how many (IP, SNI) routes the pool will build."""
+        if not hasattr(self, "pool_hint"):
+            return
+        ips = self._pool_ip_list()
+        snis = self._pool_sni_list()
+        # mirror config_store.pool_enabled(): empty lists fall back to the
+        # single CONNECT_IP / FAKE_SNI, so the pool needs >1 resulting pair.
+        eff_ips = len(ips) or 1
+        eff_snis = len(snis) or 1
+        pairs = eff_ips * eff_snis
+        optimize = self.chk_pool_optimize.isChecked()
+        if not optimize:
+            self.pool_hint.setText(tr(
+                "بهینه‌سازی خاموش — فقط مسیر تکیِ ثابت استفاده می‌شود "
+                "(بدون تست پس‌زمینه)."))
+        elif pairs <= 1:
+            self.pool_hint.setText(tr(
+                "تنها یک مسیر تعریف شده — اول با همین وصل می‌شویم؛ برای جایگزینی "
+                "بدون قطع، چند IP/SNI اضافه کنید تا در پس‌زمینه تست شوند."))
+        else:
+            self.pool_hint.setText(tr(
+                "بهینه‌ساز فعال — {ips} IP × {snis} SNI = {pairs} مسیر در "
+                "پس‌زمینه تست می‌شوند؛ مسیر بهتر بدون قطع جایگزین می‌شود.").format(
+                    ips=eff_ips, snis=eff_snis, pairs=pairs))
+
+    def load_pool_settings(self, cfg: dict) -> None:
+        """Populate the pool-settings widgets from a config dict."""
+        if not hasattr(self, "pool_ips"):
+            return
+        pool_ips = cfg.get("CONNECT_IPS", []) or []
+        pool_snis = cfg.get("FAKE_SNIS", []) or []
+        self.pool_ips.setPlainText(
+            "\n".join(str(x).strip() for x in pool_ips if str(x).strip()))
+        self.pool_snis.setPlainText(
+            "\n".join(str(x).strip() for x in pool_snis if str(x).strip()))
+        self.chk_pool_optimize.setChecked(
+            bool(cfg.get("POOL_OPTIMIZE_ENABLED", True)))
+        try:
+            w = int(cfg.get("scan_workers", 8))
+        except (TypeError, ValueError):
+            w = 8
+        self.spin_workers.setValue(max(1, min(32, w)))
+        self._update_pool_hint()
+
+    def collect_pool_settings(self) -> dict:
+        """Read the pool-settings widgets back into a config fragment."""
+        return {
+            "CONNECT_IPS": self._pool_ip_list(),
+            "FAKE_SNIS": self._pool_sni_list(),
+            "POOL_OPTIMIZE_ENABLED": bool(self.chk_pool_optimize.isChecked()),
+            "scan_workers": int(self.spin_workers.value()),
+        }
+
+    def _save_pool_settings(self) -> None:
+        """Persist just the pool settings via the host callback (set by
+        _wire_core). Falls back to writing the store directly if no callback."""
+        cb = getattr(self, "save_pool_settings", None)
+        if callable(cb):
+            try:
+                cb()
+                self._toast(tr("تنظیمات استخر ذخیره شد"), "ok")
+                return
+            except Exception:
+                pass
+        # fallback: write straight to the store if we have one
+        if self._store is not None:
+            try:
+                self._store.update(**self.collect_pool_settings())
+                self._store.save_config()
+                self._toast(tr("تنظیمات استخر ذخیره شد"), "ok")
+            except Exception:
+                self._toast(tr("ذخیره تنظیمات استخر ناموفق بود"), "err")
 
     # ------------------------------------------------------------------
     #  inline scan panel
@@ -2501,6 +2702,13 @@ class PoolPage(QWidget):
         self.scan_btn_rem_sel.setObjectName("Ghost")
         self.scan_btn_rem_sel.clicked.connect(self._scan_remove_selected)
         act.addWidget(self.scan_btn_rem_sel)
+        # Export the HEALTHY scan results straight to a file — the user's actual
+        # ask: "می‌خوام IPهای سالمِ کشف‌شده را خروجی بگیرم". No need to add them
+        # to the saved list first.
+        self.scan_btn_export_ok = QPushButton(tr("خروجی سالم‌ها…"))
+        self.scan_btn_export_ok.setObjectName("Ghost")
+        self.scan_btn_export_ok.clicked.connect(self._scan_export_ok)
+        act.addWidget(self.scan_btn_export_ok)
         act.addStretch(1)
         self.scan_status = QLabel(tr("آماده"))
         self.scan_status.setObjectName("Faint")
@@ -2826,9 +3034,24 @@ class PoolPage(QWidget):
 
         timeout = min(float(self._store.get("probe_timeout", 3.0) or 3.0), 3.0)
         port = self._scan_port(profile)
+        # Concurrency is bounded and user-configurable (default 8). Fewer
+        # workers + batched UI updates keep the window responsive during a
+        # scan (the old 16-worker firehose froze the GUI on any mouse move).
+        # Prefer the live spin widget on this page (so a just-changed value
+        # takes effect without a save round-trip); fall back to the store.
+        try:
+            if hasattr(self, "spin_workers"):
+                workers = int(self.spin_workers.value())
+            else:
+                workers = int(self._store.get("scan_workers", 8) or 8)
+        except Exception:
+            workers = 8
+        workers = max(1, min(workers, 32))
         self._scan_worker = _PoolScanWorker(
-            candidates, port=port, timeout=timeout)
-        self._scan_worker.result.connect(self._scan_on_result)
+            candidates, port=port, timeout=timeout, workers=workers)
+        # use the BATCHED signal (coalesced verdicts) — not per-probe result —
+        # so a fast scan repaints the table a few times/sec, never per row.
+        self._scan_worker.results_batch.connect(self._scan_on_results_batch)
         self._scan_worker.progress.connect(self._scan_on_progress)
         self._scan_worker.finished_scan.connect(self._scan_on_finished)
         self.scan_btn_run.setEnabled(False)
@@ -2868,7 +3091,8 @@ class PoolPage(QWidget):
             self._toast(
                 tr("آزمایش تمام شد — هیچ جفت سالمی پیدا نشد."), "warn")
 
-    def _scan_on_result(self, cand: dict) -> None:
+    def _apply_scan_verdict(self, cand: dict) -> None:
+        """Update a single table row from a verdict dict (no repaint control)."""
         ip = str(cand.get("ip", "")).strip()
         sni = str(cand.get("sni", "")).strip()
         status = str(cand.get("status", "pending"))
@@ -2887,6 +3111,26 @@ class PoolPage(QWidget):
                 st_item.setForeground(QColor("#3ddc97"))
             elif status == "fail":
                 st_item.setForeground(QColor("#ff6b6b"))
+
+    def _scan_on_result(self, cand: dict) -> None:
+        # single-verdict path (back-compat / tests)
+        self._apply_scan_verdict(cand)
+
+    def _scan_on_results_batch(self, cands: list) -> None:
+        """Apply a BATCH of verdicts in one bulk repaint (freeze fix).
+
+        Disabling table updates while we mutate every row, then re-enabling
+        once, collapses N individual repaints into a single one — the GUI stays
+        smooth even with hundreds of candidates and a fast scan.
+        """
+        if not cands:
+            return
+        self.scan_tbl.setUpdatesEnabled(False)
+        try:
+            for cand in cands:
+                self._apply_scan_verdict(cand)
+        finally:
+            self.scan_tbl.setUpdatesEnabled(True)
 
     # -- inline scan: add / remove to sni_ip_pairs ------------------------
     def _scan_selected_rows(self) -> list:
@@ -3019,6 +3263,54 @@ class PoolPage(QWidget):
             msg = tr("هیچ‌کدام از ردیف‌های انتخابی در فهرست نبودند.")
             self.scan_status.setText(msg)
             self._toast(msg, "info")
+
+    def _scan_ok_pairs(self) -> list:
+        """Every (ip, sni, 'ok') from the scan table whose verdict is healthy."""
+        out = []
+        seen = set()
+        for r in range(self.scan_tbl.rowCount()):
+            if not self._scan_row_ok(r):
+                continue
+            ip, sni = self._scan_row_pair(r)
+            ip, sni = ip.strip(), sni.strip()
+            if not ip or not sni:
+                continue
+            key = (ip.lower(), sni.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((ip, sni, "ok"))
+        return out
+
+    def _scan_export_ok(self) -> None:
+        """Export ONLY the healthy scan results to a file (the user's ask:
+        'خروجی IPهای سالمِ کشف‌شده'). No need to add them to the saved list
+        first — the scan results are exported directly."""
+        pairs = self._scan_ok_pairs()
+        if not pairs:
+            msg = tr("هیچ جفت سالمی برای خروجی نیست — اول آزمایش را اجرا کنید.")
+            self.scan_status.setText(msg)
+            self._toast(msg, "warn")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr("ذخیره‌ی IPهای سالم"), "sni_ip_healthy.txt",
+            tr("فایل متنی (*.txt)"))
+        if not path:
+            return
+        try:
+            from core.pool import export_sni_pairs
+            n = export_sni_pairs(pairs, path, header="Healthy SNI/IP pairs")
+            self._toast(
+                tr("{n} جفت سالم در فایل ذخیره شد ✓").format(n=n), "ok")
+            QMessageBox.information(
+                self, tr("خروجی سالم‌ها"),
+                tr("{n} جفت سالم با موفقیت ذخیره شد.\n\n{p}").format(
+                    n=n, p=path))
+        except Exception as exc:
+            self._toast(tr("خروجی ناموفق بود"), "err")
+            QMessageBox.warning(
+                self, tr("خروجی سالم‌ها"),
+                tr("ذخیره ناموفق بود: {e}").format(e=exc))
 
     # -- export (7.10) ----------------------------------------------------
     def _on_export(self) -> None:
@@ -3539,6 +3831,11 @@ class MainWindow(QWidget):
         # Settings page refreshes when the user adds/removes pairs.
         self.page_pool.set_store(self.store)
         self.page_pool.pairs_changed = self._refresh_after_pairs_changed
+        # the pool IP/SNI/optimise/workers settings moved onto this page; load
+        # them and give the page a save callback so its «ذخیره استخر» button
+        # persists those keys through the same path as the Settings save.
+        self.page_pool.load_pool_settings(self.store.config)
+        self.page_pool.save_pool_settings = self._save_pool_settings
 
         # initialise widgets from persisted state
         self.page_settings.load_from(self.store.config)
@@ -4026,6 +4323,17 @@ class MainWindow(QWidget):
         self.page_dashboard.set_mode(
             self.store.get("connection_mode", "Tunnel"))
         Toast.show_message(self, tr("تنظیمات ذخیره شد"), "ok")
+
+    def _save_pool_settings(self):
+        """Persist the pool IP/SNI/optimise/workers settings (these widgets
+        live on the Pool page now). Pushes the new config to the engine so a
+        running session picks up the changed pool immediately."""
+        self.store.update(**self.page_pool.collect_pool_settings())
+        self.store.save_config()
+        try:
+            self.engine.update_config(self.store.config)
+        except Exception:
+            pass
 
     def _on_page_changed(self, index: int):
         current = self.stack.widget(index)

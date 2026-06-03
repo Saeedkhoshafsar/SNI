@@ -31,26 +31,29 @@ def setUpModule():
 
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 not available")
-class SettingsPagePoolTest(unittest.TestCase):
+class PoolPagePoolSettingsTest(unittest.TestCase):
+    """The route-pool settings (CONNECT_IPS / FAKE_SNIS / optimise / workers)
+    moved from SettingsPage to PoolPage — these used to be SettingsPagePoolTest.
+    """
+
     def _page(self):
-        from ui.window import SettingsPage
-        return SettingsPage()
+        from ui.window import PoolPage
+        return PoolPage()
 
     def test_pool_lists_roundtrip(self):
         page = self._page()
-        page.load_from({
-            "CONNECT_IP": "1.1.1.1", "FAKE_SNI": "a.com",
+        page.load_pool_settings({
             "CONNECT_IPS": ["9.9.9.9", "8.8.8.8"],
             "FAKE_SNIS": ["x.com", "y.com"],
         })
-        out = page.collect()
+        out = page.collect_pool_settings()
         self.assertEqual(out["CONNECT_IPS"], ["9.9.9.9", "8.8.8.8"])
         self.assertEqual(out["FAKE_SNIS"], ["x.com", "y.com"])
 
     def test_empty_pool_lists_collect_empty(self):
         page = self._page()
-        page.load_from({"CONNECT_IP": "1.1.1.1", "FAKE_SNI": "a.com"})
-        out = page.collect()
+        page.load_pool_settings({})
+        out = page.collect_pool_settings()
         self.assertEqual(out["CONNECT_IPS"], [])
         self.assertEqual(out["FAKE_SNIS"], [])
 
@@ -60,15 +63,13 @@ class SettingsPagePoolTest(unittest.TestCase):
         self.assertEqual(page._pool_ip_list(), ["1.1.1.1", "2.2.2.2"])
 
     def test_hint_disabled_for_single_pair(self):
-        # redesign: a single defined route is no longer "disabled" — we connect
-        # with it first; the hint invites adding more for background testing.
+        # a single defined route is not "disabled" — we connect with it first;
+        # the hint invites adding more for background testing.
         page = self._page()
-        page.load_from({"CONNECT_IP": "1.1.1.1", "FAKE_SNI": "a.com"})
+        page.load_pool_settings({})
         self.assertIn("تنها یک مسیر", page.pool_hint.text())
 
     def test_hint_optimize_off(self):
-        # redesign: when the optimiser checkbox is off, the hint says testing is
-        # off regardless of how many routes are defined.
         page = self._page()
         page.pool_ips.setPlainText("1.1.1.1\n2.2.2.2")
         page.pool_snis.setPlainText("a.com\nb.com")
@@ -86,13 +87,39 @@ class SettingsPagePoolTest(unittest.TestCase):
         self.assertIn("فعال", page.pool_hint.text())
 
     def test_hint_uses_singular_fallback_for_count(self):
-        # one pool IP + empty SNI list ⇒ falls back to single SNI ⇒ 1 route ⇒
-        # "single route" hint (connect first; add more to test in background).
         page = self._page()
         page.pool_ips.setPlainText("1.1.1.1")
         page.pool_snis.setPlainText("")
         page._update_pool_hint()
         self.assertIn("تنها یک مسیر", page.pool_hint.text())
+
+    def test_scan_workers_roundtrip_clamped(self):
+        page = self._page()
+        page.load_pool_settings({"scan_workers": 16})
+        self.assertEqual(page.collect_pool_settings()["scan_workers"], 16)
+        # out-of-range values clamp into 1..32
+        page.load_pool_settings({"scan_workers": 999})
+        self.assertEqual(page.collect_pool_settings()["scan_workers"], 32)
+        page.load_pool_settings({"scan_workers": 0})
+        self.assertEqual(page.collect_pool_settings()["scan_workers"], 1)
+
+    def test_scan_workers_default_is_eight(self):
+        page = self._page()
+        page.load_pool_settings({})
+        self.assertEqual(page.collect_pool_settings()["scan_workers"], 8)
+
+    def test_settings_page_no_longer_owns_pool_widgets(self):
+        # ensure the move is real: SettingsPage must not expose the pool widgets
+        # or the pool keys in its collect() anymore.
+        from ui.window import SettingsPage
+        sp = SettingsPage()
+        self.assertFalse(hasattr(sp, "pool_ips"))
+        self.assertFalse(hasattr(sp, "pool_snis"))
+        self.assertFalse(hasattr(sp, "chk_pool_optimize"))
+        out = sp.collect()
+        self.assertNotIn("CONNECT_IPS", out)
+        self.assertNotIn("FAKE_SNIS", out)
+        self.assertNotIn("POOL_OPTIMIZE_ENABLED", out)
 
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 not available")
@@ -647,6 +674,83 @@ class PoolPageSavedListTest(unittest.TestCase):
         self.assertEqual(added, 1)       # only b.com is new
         self.assertEqual(dups, 1)        # a.com already saved
         self.assertEqual(skipped, 0)
+
+    def test_results_batch_updates_rows_in_bulk(self):
+        """The batched verdict handler (freeze fix) updates every row it's
+        given in one shot."""
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        page._toggle_scan_panel()
+        from PySide6.QtWidgets import QTableWidgetItem
+        from ui.i18n import tr
+        rows = [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")]
+        page.scan_tbl.setRowCount(len(rows))
+        for i, (ip, sni) in enumerate(rows):
+            page.scan_tbl.setItem(i, page.SC_IP, QTableWidgetItem(ip))
+            page.scan_tbl.setItem(i, page.SC_SNI, QTableWidgetItem(sni))
+            page.scan_tbl.setItem(i, page.SC_LAT, QTableWidgetItem("—"))
+            page.scan_tbl.setItem(
+                i, page.SC_STATUS,
+                QTableWidgetItem(tr(page._STATUS_FA["pending"])))
+            page.scan_tbl.setItem(i, page.SC_SAVED, QTableWidgetItem(""))
+            page._row_for_key[page._scan_key(ip, sni)] = i
+        page._scan_on_results_batch([
+            {"ip": "1.1.1.1", "sni": "a.com", "status": "ok",
+             "latency_ms": 12.0},
+            {"ip": "2.2.2.2", "sni": "b.com", "status": "fail",
+             "latency_ms": 50.0},
+        ])
+        self.assertEqual(
+            page.scan_tbl.item(0, page.SC_STATUS).text(),
+            tr(page._STATUS_FA["ok"]))
+        self.assertEqual(
+            page.scan_tbl.item(1, page.SC_STATUS).text(),
+            tr(page._STATUS_FA["fail"]))
+        self.assertIn("12", page.scan_tbl.item(0, page.SC_LAT).text())
+
+    def test_empty_batch_is_noop(self):
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        page._toggle_scan_panel()
+        page._scan_on_results_batch([])   # must not raise
+
+    def test_export_ok_writes_only_healthy_scan_results(self):
+        import tempfile
+        from unittest import mock
+        from PySide6.QtWidgets import QTableWidgetItem
+        from ui.i18n import tr
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        page._toggle_scan_panel()
+        rows = [("1.1.1.1", "good.com", "ok"),
+                ("2.2.2.2", "bad.com", "fail"),
+                ("3.3.3.3", "good2.com", "ok")]
+        page.scan_tbl.setRowCount(len(rows))
+        for i, (ip, sni, st) in enumerate(rows):
+            page.scan_tbl.setItem(i, page.SC_IP, QTableWidgetItem(ip))
+            page.scan_tbl.setItem(i, page.SC_SNI, QTableWidgetItem(sni))
+            page.scan_tbl.setItem(
+                i, page.SC_STATUS,
+                QTableWidgetItem(tr(page._STATUS_FA[st])))
+            page.scan_tbl.setItem(i, page.SC_SAVED, QTableWidgetItem(""))
+        path = os.path.join(tempfile.mkdtemp(), "ok.txt")
+        with mock.patch("ui.window.QFileDialog.getSaveFileName",
+                        return_value=(path, "")), \
+             mock.patch("ui.window.QMessageBox.information"):
+            page._scan_export_ok()
+        body = open(path, encoding="utf-8").read()
+        self.assertIn("good.com", body)
+        self.assertIn("good2.com", body)
+        self.assertNotIn("bad.com", body)   # only healthy rows
+
+    def test_export_ok_no_healthy_shows_warning(self):
+        from unittest import mock
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        page._toggle_scan_panel()
+        with mock.patch("ui.window.QFileDialog.getSaveFileName") as save:
+            page._scan_export_ok()
+            save.assert_not_called()
 
     def test_saved_list_refreshes_after_add(self):
         store = _scan_store(pairs=[])
