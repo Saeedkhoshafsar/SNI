@@ -1494,6 +1494,13 @@ class EngineController:
         proxy = self._proxy
         if mgr is None or proxy is None:
             return
+        # User's golden rule (redesign): the optimiser keeps EXPLORING in the
+        # background so the Pool page shows live health, but it must NOT swap the
+        # live route on its own — good pairs are surfaced for the manual scan
+        # ("شروع تست") to add to ``sni_ip_pairs`` instead. Auto-swap stays off
+        # unless POOL_AUTO_SWAP is explicitly enabled.
+        if not bool(self.config.get("POOL_AUTO_SWAP", False)):
+            return
         ev = self._promoter_stop
         # poll a bit faster than the health interval so improvements land soon
         period = max(3.0, float(getattr(mgr, "interval", 30.0)) / 3.0)
