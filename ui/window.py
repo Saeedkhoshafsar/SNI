@@ -2264,6 +2264,7 @@ class PoolPage(QWidget):
         super().__init__(parent)
         self._provider = None          # callable -> snapshot dict
         self._last_snap = None         # latest snapshot (for the export action)
+        self.scan_handler = None       # zero-arg callable: open the scan dialog
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
         root.setSpacing(16)
@@ -2312,8 +2313,16 @@ class PoolPage(QWidget):
         ph.setObjectName("H2")
         head.addWidget(ph)
         head.addStretch(1)
+        # Manual SNI/IP scan ("شروع تست"): opens the scan dialog so the user
+        # picks ONE spoof config, sweeps every (IP, SNI) pair once, and adds the
+        # good ones to their reusable sni_ip_pairs list. The host wires
+        # ``scan_handler`` in _wire_core (decoupled from the engine/store here).
+        self.btn_scan = QPushButton(tr("شروع تست"))
+        self.btn_scan.setObjectName("Primary")
+        self.btn_scan.clicked.connect(self._on_scan)
+        head.addWidget(self.btn_scan)
         # 7.10 — export the current routes / SNIs to a text file.
-        self.btn_export = QPushButton(tr("خروجی فهرست SNI…"))
+        self.btn_export = QPushButton(tr("خروجی فهرست SNI/IP…"))
         self.btn_export.setObjectName("Ghost")
         self.btn_export.clicked.connect(self._on_export)
         head.addWidget(self.btn_export)
@@ -2423,37 +2432,59 @@ class PoolPage(QWidget):
 
         self.tbl.setPlainText(self._pair_table(snap.get("rows", []) or []))
 
+    # -- manual scan ("شروع تست") -----------------------------------------
+    def _on_scan(self) -> None:
+        """Open the manual SNI/IP scan dialog (wired by the host)."""
+        if callable(self.scan_handler):
+            self.scan_handler()
+
     # -- export (7.10) ----------------------------------------------------
     def _on_export(self) -> None:
-        """Write the current pool's SNIs to a user-chosen text file."""
+        """Write the current pool's IP/SNI pairs (with status) to a text file.
+
+        The export is now IP-paired (issue: "خروجیِ فهرستِ SNI، IP مناسب
+        ندارد"): each line is ``IP <TAB> SNI <TAB> status`` so every SNI carries
+        the connect IP it was proven against, not a bare SNI string.
+        """
         snap = self._last_snap
         rows = (snap or {}).get("rows", []) if isinstance(snap, dict) else []
-        snis = []
+        pairs = []
         seen = set()
         for r in rows:
-            s = str(r.get("sni", "")).strip()
-            if s and s not in seen:
-                seen.add(s)
-                snis.append(s)
-        if not snis:
+            ip = str(r.get("ip", "")).strip()
+            sni = str(r.get("sni", "")).strip()
+            if not ip or not sni:
+                continue
+            key = (ip.lower(), sni.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            if not r.get("alive", True):
+                status = "dead"
+            elif r.get("in_pool"):
+                status = "active"
+            else:
+                status = "ok"
+            pairs.append((ip, sni, status))
+        if not pairs:
             QMessageBox.information(
-                self, tr("خروجی SNI"),
-                tr("هنوز هیچ SNIِ آزموده‌شده‌ای برای خروجی‌گرفتن وجود ندارد."))
+                self, tr("خروجی SNI/IP"),
+                tr("هنوز هیچ جفت IP/SNIِ آزموده‌شده‌ای برای خروجی‌گرفتن وجود ندارد."))
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, tr("ذخیره‌ی فهرست SNI"), "sni_list.txt",
+            self, tr("ذخیره‌ی فهرست SNI/IP"), "sni_ip_list.txt",
             tr("فایل متنی (*.txt)"))
         if not path:
             return
         try:
-            from core.pool import export_sni_list
-            n = export_sni_list(snis, path)
+            from core.pool import export_sni_pairs
+            n = export_sni_pairs(pairs, path)
             QMessageBox.information(
-                self, tr("خروجی SNI"),
+                self, tr("خروجی SNI/IP"),
                 tr("{n} مورد در فایل ذخیره شد.").format(n=n))
         except Exception as exc:
             QMessageBox.warning(
-                self, tr("خروجی SNI"),
+                self, tr("خروجی SNI/IP"),
                 tr("ذخیره ناموفق بود: {e}").format(e=exc))
 
     @staticmethod
@@ -2836,6 +2867,9 @@ class MainWindow(QWidget):
         # reflects saved settings.
         self.page_pool.set_provider(
             lambda: self.engine.pool_summary(self.store.config))
+        # manual SNI/IP scan ("شروع تست"): opens the scan dialog bound to the
+        # live store so added pairs persist and Settings refreshes afterwards.
+        self.page_pool.scan_handler = self._open_sni_scan
 
         # initialise widgets from persisted state
         self.page_settings.load_from(self.store.config)
@@ -3307,6 +3341,30 @@ class MainWindow(QWidget):
         else:
             Toast.show_message(
                 self, tr("استراتژی انتخاب شد: {name}").format(name=name), "ok")
+
+    def _open_sni_scan(self):
+        """Open the manual SNI/IP scan dialog ("شروع تست").
+
+        The user picks ONE spoof config, sweeps every (IP, SNI) pair once, and
+        adds the good ones to ``sni_ip_pairs``. The dialog writes accepted pairs
+        straight into the store, so afterwards we reload Settings + the SNI combo
+        so the new pairs are immediately selectable there.
+        """
+        try:
+            from ui.sni_scan_dialog import SniScanDialog
+        except Exception as exc:
+            QMessageBox.warning(
+                self, tr("آزمایش"),
+                tr("باز کردن پنجرهٔ آزمایش ناموفق بود: {e}").format(e=exc))
+            return
+        dlg = SniScanDialog(self.store, self.window())
+        dlg.exec()
+        # the dialog persisted any added/removed pairs to the store; refresh the
+        # Settings page so its SNI/IP pair manager + combo reflect the changes.
+        try:
+            self.page_settings.load_from(self.store.config)
+        except Exception:
+            pass
 
     def _save_settings(self):
         self.store.update(**self.page_settings.collect())

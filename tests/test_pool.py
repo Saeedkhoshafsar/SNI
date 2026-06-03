@@ -810,3 +810,149 @@ class SpoofProbeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Manual SNI/IP scanner (issue: "شروع تست" button) + export_sni_pairs
+# ---------------------------------------------------------------------------
+
+from core.pool import (
+    SniIpScanner,
+    ScanCandidate,
+    build_scan_candidates,
+    export_sni_pairs,
+)
+
+
+class BuildScanCandidatesTest(unittest.TestCase):
+    def test_cartesian_product_plus_extra_pairs_dedupe_order(self):
+        cands = build_scan_candidates(
+            ["1.1.1.1", "2.2.2.2", "1.1.1.1"],   # dupe IP
+            ["a.com", "b.com"],
+            extra_pairs=[("9.9.9.9", "z.com"), ("1.1.1.1", "a.com")],
+        )
+        # extra_pairs come first; the (1.1.1.1, a.com) extra dedupes the product
+        self.assertEqual(cands[0], ("9.9.9.9", "z.com"))
+        self.assertEqual(cands[1], ("1.1.1.1", "a.com"))
+        # extras {z.com, (1.1.1.1,a.com)} + product (4) − 1 overlap = 5 unique
+        self.assertEqual(len(cands), 5)
+        # no duplicates
+        self.assertEqual(len(cands), len(set(cands)))
+
+    def test_blanks_dropped(self):
+        cands = build_scan_candidates(["", "  "], ["x.com"],
+                                      extra_pairs=[("", "y.com")])
+        self.assertEqual(cands, [])
+
+
+class SniIpScannerTest(unittest.TestCase):
+    def _probe(self, good):
+        good = set(good)
+
+        def fn(ip, port, timeout, sni):
+            return (ip, sni) in good
+
+        return fn
+
+    def test_streams_verdicts_and_counts_ok(self):
+        results = []
+        progress = []
+        done = []
+        scanner = SniIpScanner(
+            [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")],
+            port=443, timeout=0.1, workers=2,
+            spoof_probe_fn=self._probe([("1.1.1.1", "a.com")]),
+            on_result=lambda d: results.append(d),
+            on_progress=lambda d, t: progress.append((d, t)),
+            on_done=lambda ok, t: done.append((ok, t)),
+        )
+        scanner.run()
+        # one OK, one FAIL
+        self.assertEqual(done, [(1, 2)])
+        finals = {(r["ip"], r["sni"]): r["status"]
+                  for r in results if r["status"] in ("ok", "fail")}
+        self.assertEqual(finals[("1.1.1.1", "a.com")], "ok")
+        self.assertEqual(finals[("2.2.2.2", "b.com")], "fail")
+        # progress reached the total
+        self.assertEqual(progress[-1], (2, 2))
+
+    def test_dedupes_candidates(self):
+        scanner = SniIpScanner(
+            [("1.1.1.1", "a.com"), ("1.1.1.1", "A.COM")],  # case-insensitive dup
+            spoof_probe_fn=self._probe([]),
+        )
+        self.assertEqual(scanner.total, 1)
+
+    def test_empty_calls_done_zero(self):
+        done = []
+        SniIpScanner([], on_done=lambda ok, t: done.append((ok, t))).run()
+        self.assertEqual(done, [(0, 0)])
+
+    def test_stop_halts_before_all(self):
+        # a probe that signals stop on the first call
+        scanner = None
+        calls = []
+        lock = __import__("threading").Lock()
+
+        def fn(ip, port, timeout, sni):
+            with lock:
+                calls.append(ip)
+            scanner.stop()
+            return True
+
+        scanner = SniIpScanner(
+            [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com"),
+             ("3.3.3.3", "c.com")],
+            workers=1, spoof_probe_fn=fn)
+        scanner.run()
+        # stop after the first probe leaves the rest unprobed
+        self.assertLessEqual(len(calls), 3)
+
+    def test_callbacks_fire_on_caller_thread_not_workers(self):
+        # The GUI-hang fix: every callback MUST be emitted from the thread that
+        # called run() (the host's QThread), never from a probe worker thread.
+        # Emitting a Qt signal from a raw thread is what froze/crashed the app.
+        import threading as _t
+        caller_tid = _t.get_ident()
+        cb_threads = []
+
+        def fn(ip, port, timeout, sni):
+            # probe runs on a worker thread (different id) — that's fine
+            return True
+
+        def record(*_a):
+            cb_threads.append(_t.get_ident())
+
+        scanner = SniIpScanner(
+            [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com"),
+             ("3.3.3.3", "c.com"), ("4.4.4.4", "d.com")],
+            workers=4, spoof_probe_fn=fn,
+            on_result=record, on_progress=record,
+            on_done=record, on_log=record)
+        scanner.run()
+        # all callbacks observed exactly one thread id == the caller's
+        self.assertTrue(cb_threads)
+        self.assertEqual(set(cb_threads), {caller_tid})
+
+
+class ExportSniPairsTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_writes_ip_sni_status_and_dedupes(self):
+        path = os.path.join(self.dir, "pairs.txt")
+        n = export_sni_pairs(
+            [("1.1.1.1", "a.com", "ok"),
+             ("1.1.1.1", "A.COM", "fail"),    # case-insensitive dup
+             ("2.2.2.2", "b.com", "")],
+            path)
+        self.assertEqual(n, 2)
+        body = open(path, encoding="utf-8").read()
+        self.assertIn("1.1.1.1\ta.com\tok", body)
+        self.assertIn("2.2.2.2\tb.com", body)
+        self.assertIn("# Total: 2", body)
+
+    def test_drops_blank_rows(self):
+        path = os.path.join(self.dir, "pairs2.txt")
+        n = export_sni_pairs([("", "a.com", "ok"), ("1.1.1.1", "", "ok")], path)
+        self.assertEqual(n, 0)

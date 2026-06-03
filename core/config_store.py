@@ -46,6 +46,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (new connections only). When False the single fixed route is used and NO
     # testing happens at all (the user is happy with the SNI they already found).
     "POOL_OPTIMIZE_ENABLED": True,
+    # Background route AUTO-SWAP. The user's decision (see issue: "به جای
+    # جایگزینی بهترین مسیر بنظرم جایگزین نکن فقط به لیست جفت sni/ip ها اضافه کن"):
+    # the optimiser may keep *exploring* in the background (so the Pool page shows
+    # live health), but it must NOT silently replace the live route. Good pairs
+    # are surfaced for the user to add to ``sni_ip_pairs`` via the manual scan
+    # ("شروع تست") instead. Default OFF so the live route is never swapped without
+    # the user's say-so. Flip to True to restore the old auto-promote behaviour.
+    "POOL_AUTO_SWAP": False,
     # Per-config best (IP, SNI) results found by the optimiser. Keyed by a stable
     # config-identity string (see ConfigStore.config_identity). Each value is
     # {"ip": str, "sni": str, "loss": float, "ts": float}. On the next Start with
