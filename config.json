@@ -7,12 +7,25 @@
   "FAKE_SNI": "www.hcaptcha.com",
   "CONNECT_IPS": [],
   "FAKE_SNIS": [],
+  "POOL_OPTIMIZE_ENABLED": true,
+  "POOL_AUTO_SWAP": false,
+  "POOL_BEST_RESULTS": {},
   "HEALTH_CHECK_INTERVAL": 30,
   "HEALTH_CHECK_TIMEOUT": 3,
   "PROBE_COUNT": 5,
   "ACTIVE_SLOTS": 3,
   "LOSS_THRESHOLD": 0.2,
   "DEAD_THRESHOLD": 0.8,
+  "sni_ip_pairs": [
+    {
+      "sni": "www.hcaptcha.com",
+      "ip": "104.19.229.21"
+    },
+    {
+      "sni": "www.speedtest.net",
+      "ip": "104.19.229.21"
+    }
+  ],
   "socks_port": 10808,
   "http_port": 10809,
   "allow_lan": false,
@@ -24,6 +37,7 @@
   "verbose_conn_log": false,
   "auto_prober": false,
   "probe_timeout": 5.0,
+  "scan_workers": 4,
   "ping_samples": 3,
   "ping_timeout": 3.0,
   "ping_measure_download": true,
