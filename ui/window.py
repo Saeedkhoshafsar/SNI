@@ -2250,7 +2250,7 @@ class _PoolScanWorker(QThread):
     finished_scan = Signal(int, int)
 
     def __init__(self, candidates, *, port: int, timeout: float,
-                 workers: int = 8):
+                 workers: int = 4):
         super().__init__()
         self._candidates = candidates
         self._port = port
@@ -2311,45 +2311,20 @@ class PoolPage(QWidget):
         self._store = None             # ConfigStore (wired by the host)
         self._scan_worker = None       # _PoolScanWorker | None
         self._row_for_key = {}         # (ip,sni) -> scan table row
+        self._scan_all_rows = {}       # (ip,sni) -> full row dict (sort/filter)
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
         root.setSpacing(16)
 
         root.addWidget(_section_title(
-            "استخر مسیرها", "وضعیت زنده‌ی استخر چند-IP / چند-SNI"))
+            "استخر مسیرها", "استخر چند-IP / چند-SNI و آزمایش جفت‌ها"))
 
-        # --- summary card -------------------------------------------------
-        summary = Card()
-        sb = summary.body()
-        self.lbl_state = QLabel(tr("استخر: —"))
-        self.lbl_state.setObjectName("H2")
-        self.lbl_counts = QLabel(tr("مسیرها: —"))
-        self.lbl_counts.setObjectName("Faint")
-        self.lbl_check = QLabel(tr("آخرین سلامت‌سنجی: —"))
-        self.lbl_check.setObjectName("Faint")
-        # Redesign: live active route vs best candidate found by the optimiser.
-        self.lbl_route = QLabel(tr("مسیر فعال: —"))
-        self.lbl_route.setObjectName("Faint")
-        self.lbl_route.setWordWrap(True)
-        # per-IP rapid-failover state (7.8): shows any IP currently blocked
-        self.lbl_failover = QLabel(tr("بازیابی خودکار: —"))
-        self.lbl_failover.setObjectName("Faint")
-        self.lbl_failover.setWordWrap(True)
-        self.lbl_help = QLabel(tr(
-            "اول با مسیر فعلی (که می‌دانیم وصل می‌شود) متصل می‌شویم؛ سپس استخر "
-            "چند-IP/چند-SNI در پس‌زمینه تست می‌کند و اگر مسیری «به‌روشنی بهتر» "
-            "پیدا کرد، آن را بدون قطع اتصال جایگزین می‌کند. بهترین نتیجه برای هر "
-            "کانفیگ ذخیره می‌شود تا دفعهٔ بعد از همان شروع کنیم. با تیکِ "
-            "«بهینه‌سازی مسیر در پس‌زمینه» در تنظیمات می‌توانید تست را خاموش کنید."))
-        self.lbl_help.setObjectName("Faint")
-        self.lbl_help.setWordWrap(True)
-        sb.addWidget(self.lbl_state)
-        sb.addWidget(self.lbl_counts)
-        sb.addWidget(self.lbl_check)
-        sb.addWidget(self.lbl_route)
-        sb.addWidget(self.lbl_failover)
-        sb.addWidget(self.lbl_help)
-        root.addWidget(summary)
+        # NOTE: the old "live pool status" summary card (استخر/مسیرها/آخرین
+        # سلامت‌سنجی/مسیر فعال/بازیابی خودکار) was removed — that on-the-fly
+        # multi-route picture belonged to an earlier design we did not end up
+        # shipping, so it only ever showed dead placeholders. The page now
+        # focuses on what the user actually uses: the pool definition, the saved
+        # SNI/IP list, and the inline tester.
 
         # --- pool IP/SNI settings card (moved here from «تنظیمات») --------
         # Everything that defines the route pool now lives on this page so the
@@ -2406,21 +2381,8 @@ class PoolPage(QWidget):
         sv.addWidget(self.saved_tbl)
         root.addWidget(saved)
 
-        # --- live pool routes card (only meaningful while connected) ------
-        pairs = Card()
-        pb = pairs.body()
-        head = QHBoxLayout()
-        ph = QLabel(tr("مسیرهای زنده‌ی استخر (هنگام اتصال)"))
-        ph.setObjectName("H2")
-        head.addWidget(ph)
-        head.addStretch(1)
-        pb.addLayout(head)
-        self.tbl = QPlainTextEdit()
-        self.tbl.setObjectName("Log")
-        self.tbl.setReadOnly(True)
-        self.tbl.setMinimumHeight(150)
-        pb.addWidget(self.tbl)
-        root.addWidget(pairs)
+        # NOTE: the "live pool routes" card was removed alongside the summary
+        # card above (same abandoned live-multi-route design).
 
         # --- inline scan panel (hidden until "شروع تست") ------------------
         self.scan_card = self._build_scan_card()
@@ -2508,7 +2470,7 @@ class PoolPage(QWidget):
         wrow.addWidget(wlbl)
         self.spin_workers = NoScrollSpinBox()
         self.spin_workers.setRange(1, 32)
-        self.spin_workers.setValue(8)
+        self.spin_workers.setValue(4)
         self.spin_workers.setMinimumHeight(36)
         self.spin_workers.setButtonSymbols(QSpinBox.UpDownArrows)
         wrow.addWidget(self.spin_workers)
@@ -2591,9 +2553,9 @@ class PoolPage(QWidget):
         self.chk_pool_optimize.setChecked(
             bool(cfg.get("POOL_OPTIMIZE_ENABLED", True)))
         try:
-            w = int(cfg.get("scan_workers", 8))
+            w = int(cfg.get("scan_workers", 4))
         except (TypeError, ValueError):
-            w = 8
+            w = 4
         self.spin_workers.setValue(max(1, min(32, w)))
         self._update_pool_hint()
 
@@ -2669,6 +2631,34 @@ class PoolPage(QWidget):
         self.scan_progress.setRange(0, 100)
         self.scan_progress.setValue(0)
         b.addWidget(self.scan_progress)
+
+        # --- sort / group / filter toolbar -------------------------------
+        # Finding the best routes by eye in a long list is painful, so give the
+        # user a one-click ordering: lowest ping first, healthy first, group by
+        # SNI, or group by IP (so you see which SNIs an IP can pair with), plus
+        # a "healthy only" filter.
+        sort_row = QHBoxLayout()
+        sort_row.setSpacing(8)
+        sort_lbl = QLabel(tr("مرتب‌سازی:"))
+        sort_lbl.setObjectName("Muted")
+        sort_row.addWidget(sort_lbl)
+        self.scan_sort = NoScrollComboBox()
+        # (label, mode-key) — first entry is the default (lowest ping).
+        self._SCAN_SORT_MODES = [
+            (tr("کم‌ترین پینگ"), "latency"),
+            (tr("سالم‌ها اول"), "healthy"),
+            (tr("گروه‌بندی بر اساس SNI"), "sni"),
+            (tr("گروه‌بندی بر اساس IP"), "ip"),
+        ]
+        for label, key in self._SCAN_SORT_MODES:
+            self.scan_sort.addItem(label, key)
+        self.scan_sort.currentIndexChanged.connect(self._scan_resort)
+        sort_row.addWidget(self.scan_sort)
+        self.scan_only_ok = QCheckBox(tr("فقط سالم‌ها"))
+        self.scan_only_ok.toggled.connect(self._scan_apply_filter)
+        sort_row.addWidget(self.scan_only_ok)
+        sort_row.addStretch(1)
+        b.addLayout(sort_row)
 
         self.scan_tbl = QTableWidget(0, 5)
         self.scan_tbl.setObjectName("ScanResults")
@@ -2849,80 +2839,12 @@ class PoolPage(QWidget):
 
     # -- rendering --------------------------------------------------------
     def _render(self, snap) -> None:
+        # The live-status summary/route cards were removed; the only thing the
+        # poll still does is keep the saved-list card and the export button in
+        # sync (so external edits — e.g. from Settings — show up here too).
         self._last_snap = snap if isinstance(snap, dict) else None
-        # keep the saved-list card in sync on every poll so it reflects any
-        # external changes (e.g. edits made in Settings)
         self.refresh_saved_list()
-        # export is driven by the SAVED list, not the live pool, so it is
-        # enabled whenever the user has anything saved (or live routes exist).
-        self.btn_export.setEnabled(
-            bool(self._saved_pairs())
-            or bool((snap or {}).get("rows") if isinstance(snap, dict) else []))
-        if not snap or not snap.get("enabled"):
-            self.lbl_state.setText(tr("استخر: غیرفعال (حالت تک‌مسیره)"))
-            self.lbl_counts.setText(tr("مسیرها: —"))
-            self.lbl_check.setText(tr("آخرین سلامت‌سنجی: —"))
-            self.lbl_route.setText(tr("مسیر فعال: —"))
-            self.lbl_failover.setText(tr("بازیابی خودکار: —"))
-            self.tbl.setPlainText(tr(
-                "استخر فقط هنگام اتصال زنده می‌شود. در «تنظیمات» بیش از یک IP یا "
-                "SNI وارد کنید تا استخر چند-مسیره ساخته شود؛ مسیرهای زنده اینجا "
-                "نمایش داده می‌شوند."))
-            return
-
-        total = int(snap.get("total", 0))
-        known = int(snap.get("known", 0))
-        stable = int(snap.get("stable", 0))
-        weak = int(snap.get("weak", 0))
-        dead = int(snap.get("dead", 0))
-        unexplored = int(snap.get("unexplored", 0))
-        active = int(snap.get("active", 0))
-
-        self.lbl_state.setText(
-            tr("استخر: فعال — {active} مسیر در حال سرویس").format(active=active))
-        self.lbl_counts.setText(tr(
-            "کل {total} · سالم {stable} · ضعیف {weak} · مرده {dead} · "
-            "کشف‌نشده {unexplored} (آزموده {known})").format(
-                total=total, stable=stable, weak=weak, dead=dead,
-                unexplored=unexplored, known=known))
-
-        secs = snap.get("seconds_since_check")
-        if secs is None:
-            self.lbl_check.setText(tr("آخرین سلامت‌سنجی: در حال راه‌اندازی…"))
-        else:
-            self.lbl_check.setText(
-                tr("آخرین سلامت‌سنجی: {s} ثانیه پیش").format(s=int(secs)))
-
-        # Redesign: active route vs best candidate found by the optimiser.
-        active_route = snap.get("active_route") or {}
-        best_route = snap.get("best_route") or {}
-        if active_route.get("ip"):
-            txt = tr("مسیر فعال: {ip} (SNI: {sni})").format(
-                ip=active_route.get("ip"), sni=active_route.get("sni"))
-            if best_route.get("ip"):
-                same = (best_route.get("ip") == active_route.get("ip")
-                        and best_route.get("sni") == active_route.get("sni"))
-                if same:
-                    txt += tr(" — بهترین مسیر همین است ✓")
-                else:
-                    txt += tr(" · بهترین یافته‌شده: {ip} (SNI: {sni}، افت "
-                              "{loss:.0f}%)").format(
-                        ip=best_route.get("ip"), sni=best_route.get("sni"),
-                        loss=float(best_route.get("loss", 0.0)) * 100)
-            self.lbl_route.setText(txt)
-        else:
-            self.lbl_route.setText(tr("مسیر فعال: —"))
-
-        # per-IP failover line (7.8): list any IP currently in rapid-failover.
-        blocked = snap.get("blocked_ips") or []
-        if blocked:
-            self.lbl_failover.setText(tr(
-                "بازیابی خودکار: {n} IP موقتاً کنار گذاشته شد — {ips}").format(
-                    n=len(blocked), ips="، ".join(str(x) for x in blocked)))
-        else:
-            self.lbl_failover.setText(tr("بازیابی خودکار: همه‌ی IPها سالم‌اند"))
-
-        self.tbl.setPlainText(self._pair_table(snap.get("rows", []) or []))
+        self.btn_export.setEnabled(bool(self._saved_pairs()))
 
     # -- inline scan: config picker + candidate building ------------------
     def _scan_spoof_profiles(self) -> list:
@@ -3016,6 +2938,7 @@ class PoolPage(QWidget):
         self.scan_tbl.setUpdatesEnabled(False)
         self.scan_tbl.setRowCount(0)
         self._row_for_key.clear()
+        self._scan_all_rows = {}       # drop previous sweep's backing rows
         self.scan_tbl.setRowCount(len(candidates))
         for i, (ip, sni) in enumerate(candidates):
             self.scan_tbl.setItem(i, self.SC_IP, QTableWidgetItem(ip))
@@ -3034,7 +2957,7 @@ class PoolPage(QWidget):
 
         timeout = min(float(self._store.get("probe_timeout", 3.0) or 3.0), 3.0)
         port = self._scan_port(profile)
-        # Concurrency is bounded and user-configurable (default 8). Fewer
+        # Concurrency is bounded and user-configurable (default 4). Fewer
         # workers + batched UI updates keep the window responsive during a
         # scan (the old 16-worker firehose froze the GUI on any mouse move).
         # Prefer the live spin widget on this page (so a just-changed value
@@ -3043,9 +2966,9 @@ class PoolPage(QWidget):
             if hasattr(self, "spin_workers"):
                 workers = int(self.spin_workers.value())
             else:
-                workers = int(self._store.get("scan_workers", 8) or 8)
+                workers = int(self._store.get("scan_workers", 4) or 4)
         except Exception:
-            workers = 8
+            workers = 4
         workers = max(1, min(workers, 32))
         self._scan_worker = _PoolScanWorker(
             candidates, port=port, timeout=timeout, workers=workers)
@@ -3078,6 +3001,12 @@ class PoolPage(QWidget):
         self.scan_btn_run.setEnabled(True)
         self.scan_cmb.setEnabled(True)
         self.scan_btn_stop.setEnabled(False)
+        # auto-order the finished results by the chosen mode (default: lowest
+        # ping first) so the best routes float to the top without manual work.
+        try:
+            self._scan_resort()
+        except Exception:
+            pass
         msg = tr("پایان آزمایش — {ok} از {total} جفت سالم بود.").format(
             ok=ok, total=total)
         self.scan_status.setText(msg)
@@ -3131,6 +3060,116 @@ class PoolPage(QWidget):
                 self._apply_scan_verdict(cand)
         finally:
             self.scan_tbl.setUpdatesEnabled(True)
+
+    # -- inline scan: sort / group / filter -------------------------------
+    def _scan_rows_data(self) -> list:
+        """Snapshot every table row as a dict so we can re-order/filter safely.
+
+        ``latency`` is a float (``inf`` when unknown) for sorting; ``ok`` is the
+        healthy flag derived from the status cell.
+        """
+        rows = []
+        ok_text = tr(self._STATUS_FA["ok"])
+        for r in range(self.scan_tbl.rowCount()):
+            ip_it = self.scan_tbl.item(r, self.SC_IP)
+            sni_it = self.scan_tbl.item(r, self.SC_SNI)
+            lat_it = self.scan_tbl.item(r, self.SC_LAT)
+            st_it = self.scan_tbl.item(r, self.SC_STATUS)
+            sv_it = self.scan_tbl.item(r, self.SC_SAVED)
+            lat_text = lat_it.text() if lat_it else "—"
+            try:
+                latency = float(lat_text.replace("ms", "").strip())
+            except (ValueError, AttributeError):
+                latency = float("inf")
+            status_text = st_it.text() if st_it else ""
+            rows.append({
+                "ip": ip_it.text() if ip_it else "",
+                "sni": sni_it.text() if sni_it else "",
+                "lat_text": lat_text,
+                "latency": latency,
+                "status_text": status_text,
+                "saved_text": sv_it.text() if sv_it else "",
+                "ok": status_text == ok_text,
+            })
+        return rows
+
+    def _scan_sort_mode(self) -> str:
+        if not hasattr(self, "scan_sort"):
+            return "latency"
+        return self.scan_sort.currentData() or "latency"
+
+    def _scan_sorted_rows(self, rows: list) -> list:
+        """Order *rows* (dicts from _scan_rows_data) by the chosen mode."""
+        mode = self._scan_sort_mode()
+        if mode == "healthy":
+            return sorted(rows, key=lambda d: (not d["ok"], d["latency"]))
+        if mode == "sni":
+            # group by SNI; healthy first within each group, then by latency
+            return sorted(
+                rows, key=lambda d: (d["sni"].lower(), not d["ok"], d["latency"]))
+        if mode == "ip":
+            # group by IP so you see which SNIs each IP can pair with
+            return sorted(
+                rows, key=lambda d: (d["ip"].lower(), not d["ok"], d["latency"]))
+        # default "latency": healthy first, then ascending ping; fails sink down
+        return sorted(
+            rows, key=lambda d: (not d["ok"], d["latency"], d["sni"], d["ip"]))
+
+    def _scan_rewrite_table(self, rows: list) -> None:
+        """Re-render the scan table from row dicts and rebuild the
+        (ip,sni)->row index so live verdict updates still find their row."""
+        if not hasattr(self, "scan_tbl"):
+            return
+        ok_text = tr(self._STATUS_FA["ok"])
+        fail_text = tr(self._STATUS_FA["fail"])
+        only_ok = (hasattr(self, "scan_only_ok")
+                   and self.scan_only_ok.isChecked())
+        visible = [d for d in rows if (d["ok"] or not only_ok)]
+        self.scan_tbl.setUpdatesEnabled(False)
+        try:
+            self.scan_tbl.setRowCount(0)
+            self._row_for_key.clear()
+            self.scan_tbl.setRowCount(len(visible))
+            for i, d in enumerate(visible):
+                self.scan_tbl.setItem(i, self.SC_IP, QTableWidgetItem(d["ip"]))
+                self.scan_tbl.setItem(i, self.SC_SNI, QTableWidgetItem(d["sni"]))
+                self.scan_tbl.setItem(
+                    i, self.SC_LAT, QTableWidgetItem(d["lat_text"]))
+                st = QTableWidgetItem(d["status_text"])
+                if d["status_text"] == ok_text:
+                    st.setForeground(QColor("#3ddc97"))
+                elif d["status_text"] == fail_text:
+                    st.setForeground(QColor("#ff6b6b"))
+                self.scan_tbl.setItem(i, self.SC_STATUS, st)
+                self.scan_tbl.setItem(
+                    i, self.SC_SAVED, QTableWidgetItem(d["saved_text"]))
+                self._row_for_key[self._scan_key(d["ip"], d["sni"])] = i
+        finally:
+            self.scan_tbl.setUpdatesEnabled(True)
+
+    def _scan_resort(self, *_a) -> None:
+        """Re-order (and re-filter) the table by the current sort mode.
+
+        We keep a backing list of EVERY scanned row keyed by (ip,sni) so the
+        «فقط سالم‌ها» filter never destroys hidden rows — unchecking it brings
+        them all back. Verdict cells from the visible table override the backing
+        copy so live results stay current.
+        """
+        current = {self._scan_key(d["ip"], d["sni"]): d
+                   for d in self._scan_rows_data()}
+        backing = getattr(self, "_scan_all_rows", {}) or {}
+        # start from the full backing set, refresh with whatever is on-screen now
+        merged = dict(backing)
+        merged.update(current)
+        self._scan_all_rows = merged
+        rows = list(merged.values())
+        if not rows:
+            return
+        self._scan_rewrite_table(self._scan_sorted_rows(rows))
+
+    def _scan_apply_filter(self, *_a) -> None:
+        """Apply the «فقط سالم‌ها» filter (re-uses the resort/rewrite path)."""
+        self._scan_resort()
 
     # -- inline scan: add / remove to sni_ip_pairs ------------------------
     def _scan_selected_rows(self) -> list:
@@ -3199,14 +3238,28 @@ class PoolPage(QWidget):
         return (added, duplicates, skipped)
 
     def _add_feedback(self, added: int, duplicates: int, skipped: int) -> None:
-        """Surface a clear status line + a toast describing what happened."""
+        """Surface a clear status line + a toast describing what happened.
+
+        The wording is deliberately explicit so the «از قبل بود» count is never
+        confusing: it means *already in YOUR saved list*. When nothing new is
+        added because everything was already there we say so plainly — this was
+        the source of the user's confusion: after importing someone else's list
+        the pairs are already saved, so a later «افزودن سالم‌ها» finds them all
+        as duplicates."""
+        # common "all already saved" case → one clear, dedicated message
+        if added == 0 and duplicates and not skipped:
+            msg = tr("همهٔ این {n} جفت از قبل در فهرست شما بودند — چیز تازه‌ای "
+                     "اضافه نشد.").format(n=duplicates)
+            self.scan_status.setText(msg)
+            self._toast(msg, "info")
+            return
         parts = []
         if added:
             parts.append(tr("{n} جفت تازه افزوده شد").format(n=added))
         if duplicates:
-            parts.append(tr("{n} مورد از قبل بود").format(n=duplicates))
+            parts.append(tr("{n} از قبل در فهرست شما بود").format(n=duplicates))
         if skipped:
-            parts.append(tr("{n} مورد رد شد").format(n=skipped))
+            parts.append(tr("{n} مورد رد شد (ناسالم/ناقص)").format(n=skipped))
         if not parts:
             msg = tr("چیزی برای افزودن نبود.")
             self.scan_status.setText(msg)
@@ -3320,15 +3373,10 @@ class PoolPage(QWidget):
         each line is ``IP <TAB> SNI <TAB> status`` so every SNI carries the
         connect IP it was proven against, not a bare SNI string.
 
-        Fix: the export now ALWAYS works as long as the user has anything saved.
-        Previously it only read the *live* pool snapshot rows, which are empty
-        whenever the tunnel isn't running, so the user could never get a file
-        out of their saved list. We now merge:
-          * every pair in the saved ``sni_ip_pairs`` list (status ``saved``), and
-          * any live pool rows (status active/ok/dead) — these override the
-            saved status when the same pair is currently in the pool.
+        Export is driven purely by the saved ``sni_ip_pairs`` list now (the
+        live-pool rows card was removed), so it always works whether or not the
+        tunnel is running.
         """
-        # start from the saved list so export works even when disconnected
         pairs = []
         seen = set()
         for ip, sni in self._saved_pairs():
@@ -3337,33 +3385,6 @@ class PoolPage(QWidget):
                 continue
             seen.add(key)
             pairs.append((ip, sni, "saved"))
-
-        # overlay/append live pool rows with their richer status
-        snap = self._last_snap
-        rows = (snap or {}).get("rows", []) if isinstance(snap, dict) else []
-        status_by_key = {}
-        for r in rows:
-            ip = str(r.get("ip", "")).strip()
-            sni = str(r.get("sni", "")).strip()
-            if not ip or not sni:
-                continue
-            if not r.get("alive", True):
-                status = "dead"
-            elif r.get("in_pool"):
-                status = "active"
-            else:
-                status = "ok"
-            key = (ip.lower(), sni.lower())
-            status_by_key[key] = (ip, sni, status)
-        # update statuses of already-listed pairs, append new live-only ones
-        for i, (ip, sni, _st) in enumerate(pairs):
-            k = (ip.lower(), sni.lower())
-            if k in status_by_key:
-                pairs[i] = status_by_key[k]
-        for key, triple in status_by_key.items():
-            if key not in seen:
-                seen.add(key)
-                pairs.append(triple)
 
         if not pairs:
             QMessageBox.information(
@@ -3444,26 +3465,6 @@ class PoolPage(QWidget):
         QMessageBox.information(
             self, tr("وارد کردن SNI/IP"),
             tr("{n} جفت تازه از فایل به فهرست SNI/IP افزوده شد.").format(n=added))
-
-    @staticmethod
-    def _pair_table(rows: list) -> str:
-        if not rows:
-            return tr("هنوز مسیری آزموده نشده — اولین سلامت‌سنجی در حال انجام است…")
-        header = (f"{tr('IP'):<18}{tr('SNI'):<24}"
-                  f"{tr('افت'):>7}{tr('اتصال'):>7}  {tr('وضعیت')}")
-        lines = [header]
-        for r in rows:
-            if not r.get("alive", True):
-                state = tr("مرده")
-            elif r.get("in_pool"):
-                state = tr("★ فعال")
-            else:
-                state = tr("سالم")
-            lines.append(
-                f"{str(r.get('ip', '')):<18}{str(r.get('sni', '')):<24}"
-                f"{float(r.get('loss', 0.0)) * 100:>6.0f}%"
-                f"{int(r.get('active', 0)):>7}  {state}")
-        return "\n".join(lines)
 
 
 class LogPage(QWidget):

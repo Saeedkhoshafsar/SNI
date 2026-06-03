@@ -103,10 +103,10 @@ class PoolPagePoolSettingsTest(unittest.TestCase):
         page.load_pool_settings({"scan_workers": 0})
         self.assertEqual(page.collect_pool_settings()["scan_workers"], 1)
 
-    def test_scan_workers_default_is_eight(self):
+    def test_scan_workers_default_is_four(self):
         page = self._page()
         page.load_pool_settings({})
-        self.assertEqual(page.collect_pool_settings()["scan_workers"], 8)
+        self.assertEqual(page.collect_pool_settings()["scan_workers"], 4)
 
     def test_settings_page_no_longer_owns_pool_widgets(self):
         # ensure the move is real: SettingsPage must not expose the pool widgets
@@ -124,57 +124,28 @@ class PoolPagePoolSettingsTest(unittest.TestCase):
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 not available")
 class PoolPageTest(unittest.TestCase):
+    """The old live-status summary/route cards were removed (abandoned design).
+    The page no longer renders snapshot labels — _render only keeps the saved
+    list + export button in sync — so these tests assert it stays robust."""
+
     def _page(self):
         from ui.window import PoolPage
         return PoolPage()
 
-    def test_no_provider_renders_disabled(self):
+    def test_summary_card_widgets_removed(self):
         page = self._page()
-        page.refresh()
-        self.assertIn("غیرفعال", page.lbl_state.text())
+        for attr in ("lbl_state", "lbl_counts", "lbl_check", "lbl_route",
+                     "lbl_failover", "tbl"):
+            self.assertFalse(hasattr(page, attr),
+                             f"{attr} should have been removed")
 
-    def test_disabled_snapshot(self):
+    def test_no_provider_refresh_is_safe(self):
         page = self._page()
-        page.set_provider(lambda: {"enabled": False})
-        self.assertIn("غیرفعال", page.lbl_state.text())
+        page.refresh()        # must not raise even with no provider
 
-    def test_enabled_snapshot_counts_and_check_age(self):
+    def test_disabled_snapshot_is_safe(self):
         page = self._page()
-        page.set_provider(lambda: {
-            "enabled": True, "total": 6, "known": 4, "stable": 3,
-            "weak": 1, "dead": 0, "unexplored": 2, "active": 2,
-            "seconds_since_check": 12.0, "rows": [],
-        })
-        self.assertIn("فعال", page.lbl_state.text())
-        self.assertIn("6", page.lbl_counts.text())
-        self.assertIn("12", page.lbl_check.text())
-
-    def test_enabled_snapshot_renders_rows(self):
-        page = self._page()
-        page.set_provider(lambda: {
-            "enabled": True, "total": 2, "known": 2, "stable": 1,
-            "weak": 0, "dead": 1, "unexplored": 0, "active": 1,
-            "seconds_since_check": 5.0,
-            "rows": [
-                {"ip": "9.9.9.9", "sni": "x.com", "loss": 0.05,
-                 "alive": True, "active": 1, "in_pool": True},
-                {"ip": "8.8.8.8", "sni": "y.com", "loss": 1.0,
-                 "alive": False, "active": 0, "in_pool": False},
-            ],
-        })
-        text = page.tbl.toPlainText()
-        self.assertIn("9.9.9.9", text)
-        self.assertIn("8.8.8.8", text)
-        self.assertIn("★", text)        # active pair marker
-        self.assertIn("مرده", text)     # dead pair state
-
-    def test_seconds_none_shows_bootstrapping(self):
-        page = self._page()
-        page.set_provider(lambda: {
-            "enabled": True, "total": 4, "rows": [],
-            "seconds_since_check": None,
-        })
-        self.assertIn("راه‌اندازی", page.lbl_check.text())
+        page.set_provider(lambda: {"enabled": False})   # must not raise
 
     def test_provider_exception_is_swallowed(self):
         page = self._page()
@@ -183,7 +154,6 @@ class PoolPageTest(unittest.TestCase):
             raise RuntimeError("nope")
 
         page.set_provider(boom)        # must not raise
-        self.assertIn("غیرفعال", page.lbl_state.text())
 
     def test_polling_start_stop(self):
         page = self._page()
@@ -251,55 +221,34 @@ class EngineBridgePoolSummaryTest(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAVE_QT, "PySide6 not available")
-class PoolPageFailoverExportTest(unittest.TestCase):
-    def _page(self):
+class PoolPageExportTest(unittest.TestCase):
+    """Export is now driven by the SAVED sni_ip_pairs list (the live-pool rows
+    card + failover line were removed), so these tests set up a saved store."""
+
+    def _page(self, pairs=None):
         from ui.window import PoolPage
-        return PoolPage()
+        page = PoolPage()
+        page._store = _FakeStore({"sni_ip_pairs": pairs or []})
+        page.refresh_saved_list()
+        return page
 
-    def test_failover_line_lists_blocked(self):
-        page = self._page()
-        page.set_provider(lambda: {
-            "enabled": True, "total": 2, "known": 2, "stable": 1, "weak": 1,
-            "dead": 0, "unexplored": 0, "active": 1, "seconds_since_check": 3,
-            "rows": [{"ip": "1.1.1.1", "sni": "a.com", "loss": 0.0,
-                      "alive": True, "active": 1, "in_pool": True}],
-            "blocked_ips": ["9.9.9.9"],
-        })
-        self.assertIn("9.9.9.9", page.lbl_failover.text())
-
-    def test_failover_line_all_healthy(self):
-        page = self._page()
-        page.set_provider(lambda: {
-            "enabled": True, "total": 2, "known": 2, "active": 1,
-            "seconds_since_check": 1, "rows": [], "blocked_ips": [],
-        })
-        self.assertIn("سالم", page.lbl_failover.text())
-
-    def test_export_button_disabled_when_pool_off(self):
-        page = self._page()
-        page.set_provider(lambda: {"enabled": False})
+    def test_export_button_disabled_when_no_saved(self):
+        page = self._page([])
+        page.refresh()
         self.assertFalse(page.btn_export.isEnabled())
 
-    def test_export_button_enabled_when_pool_on(self):
-        page = self._page()
-        page.set_provider(lambda: {
-            "enabled": True, "total": 1, "rows": [
-                {"ip": "1.1.1.1", "sni": "a.com", "loss": 0.0,
-                 "alive": True, "active": 0, "in_pool": True}],
-        })
+    def test_export_button_enabled_when_saved(self):
+        page = self._page([{"ip": "1.1.1.1", "sni": "a.com"}])
+        page.refresh()
         self.assertTrue(page.btn_export.isEnabled())
 
     def test_export_writes_snis(self):
         import tempfile
         from unittest import mock
-        page = self._page()
-        page.set_provider(lambda: {
-            "enabled": True, "total": 2, "rows": [
-                {"ip": "1.1.1.1", "sni": "a.com", "loss": 0.0, "alive": True,
-                 "active": 0, "in_pool": True},
-                {"ip": "2.2.2.2", "sni": "b.com", "loss": 0.0, "alive": True,
-                 "active": 0, "in_pool": True}],
-        })
+        page = self._page([
+            {"ip": "1.1.1.1", "sni": "a.com"},
+            {"ip": "2.2.2.2", "sni": "b.com"},
+        ])
         path = os.path.join(tempfile.mkdtemp(), "out.txt")
         with mock.patch("ui.window.QFileDialog.getSaveFileName",
                         return_value=(path, "")), \
@@ -308,11 +257,11 @@ class PoolPageFailoverExportTest(unittest.TestCase):
         body = open(path, encoding="utf-8").read()
         self.assertIn("a.com", body)
         self.assertIn("b.com", body)
+        self.assertIn("1.1.1.1", body)
 
-    def test_export_no_snis_shows_info(self):
+    def test_export_no_saved_shows_info(self):
         from unittest import mock
-        page = self._page()
-        page.set_provider(lambda: {"enabled": True, "total": 0, "rows": []})
+        page = self._page([])
         with mock.patch("ui.window.QMessageBox.information") as info, \
              mock.patch("ui.window.QFileDialog.getSaveFileName") as save:
             page._on_export()
@@ -338,9 +287,9 @@ class _FakePlainProfile:
 
 
 class _FakeStore:
-    def __init__(self, cfg, profiles):
+    def __init__(self, cfg, profiles=None):
         self.config = cfg
-        self.profiles = profiles
+        self.profiles = profiles or []
         self.saved = 0
 
     def get(self, key, default=None):
@@ -594,7 +543,9 @@ class PoolPageSavedListTest(unittest.TestCase):
         self.assertIn("9.9.9.9", body)
         self.assertIn("saved.com", body)
 
-    def test_export_merges_saved_and_live_status(self):
+    def test_export_uses_saved_list_only(self):
+        # The live-pool overlay was removed; export now reflects the saved list
+        # purely (every pair exported with status "saved").
         import tempfile
         from unittest import mock
         store = _scan_store(pairs=[
@@ -602,12 +553,6 @@ class PoolPageSavedListTest(unittest.TestCase):
             {"ip": "9.9.9.9", "sni": "saved.com"},
         ])
         page = self._page(store)
-        # a.com is live & in the pool -> its status becomes "active"
-        page.set_provider(lambda: {
-            "enabled": True, "total": 1, "rows": [
-                {"ip": "1.1.1.1", "sni": "a.com", "loss": 0.0,
-                 "alive": True, "active": 1, "in_pool": True}],
-        })
         path = os.path.join(tempfile.mkdtemp(), "out.txt")
         with mock.patch("ui.window.QFileDialog.getSaveFileName",
                         return_value=(path, "")), \
@@ -615,8 +560,8 @@ class PoolPageSavedListTest(unittest.TestCase):
             page._on_export()
         body = open(path, encoding="utf-8").read()
         self.assertIn("a.com", body)
-        self.assertIn("active", body)     # live status overrides "saved"
-        self.assertIn("saved.com", body)  # saved-only pair still exported
+        self.assertIn("saved.com", body)
+        self.assertIn("saved", body)      # all rows carry the "saved" status
 
     def test_export_truly_empty_shows_info(self):
         from unittest import mock
@@ -768,6 +713,150 @@ class PoolPageSavedListTest(unittest.TestCase):
         page.scan_tbl.selectAll()
         page._scan_add_selected()
         self.assertIn("new.com", page.saved_tbl.toPlainText())
+
+
+@unittest.skipUnless(_HAVE_QT, "PySide6 not available")
+class PoolPageScanSortFilterTest(unittest.TestCase):
+    """Sort/group/filter toolbar for the scan results table."""
+
+    def _page_with_rows(self, rows):
+        """rows: list of (ip, sni, status_key, latency_ms_or_None)."""
+        from ui.window import PoolPage
+        from PySide6.QtWidgets import QTableWidgetItem
+        from ui.i18n import tr
+        page = PoolPage()
+        page._store = _FakeStore({"sni_ip_pairs": []})
+        page._toggle_scan_panel()
+        page.scan_tbl.setRowCount(len(rows))
+        for i, (ip, sni, st, lat) in enumerate(rows):
+            page.scan_tbl.setItem(i, page.SC_IP, QTableWidgetItem(ip))
+            page.scan_tbl.setItem(i, page.SC_SNI, QTableWidgetItem(sni))
+            page.scan_tbl.setItem(
+                i, page.SC_LAT,
+                QTableWidgetItem("—" if lat is None else "%.0fms" % lat))
+            page.scan_tbl.setItem(
+                i, page.SC_STATUS, QTableWidgetItem(tr(page._STATUS_FA[st])))
+            page.scan_tbl.setItem(i, page.SC_SAVED, QTableWidgetItem(""))
+            page._row_for_key[page._scan_key(ip, sni)] = i
+        return page
+
+    def _ips_in_order(self, page):
+        return [page.scan_tbl.item(r, page.SC_IP).text()
+                for r in range(page.scan_tbl.rowCount())]
+
+    def _set_mode(self, page, key):
+        idx = page.scan_sort.findData(key)
+        page.scan_sort.setCurrentIndex(idx)
+        # setting the already-current index fires no signal, so resort directly
+        page._scan_resort()
+
+    def test_default_mode_is_lowest_ping(self):
+        page = self._page_with_rows([])
+        self.assertEqual(page._scan_sort_mode(), "latency")
+
+    def test_sort_by_latency_puts_fastest_healthy_first(self):
+        page = self._page_with_rows([
+            ("1.1.1.1", "a.com", "ok", 90.0),
+            ("2.2.2.2", "b.com", "ok", 10.0),
+            ("3.3.3.3", "c.com", "fail", None),
+        ])
+        self._set_mode(page, "latency")
+        order = self._ips_in_order(page)
+        # fastest healthy first, failed sinks to the bottom
+        self.assertEqual(order[0], "2.2.2.2")
+        self.assertEqual(order[1], "1.1.1.1")
+        self.assertEqual(order[-1], "3.3.3.3")
+
+    def test_group_by_ip_keeps_same_ip_together(self):
+        page = self._page_with_rows([
+            ("1.1.1.1", "a.com", "ok", 20.0),
+            ("2.2.2.2", "b.com", "ok", 10.0),
+            ("1.1.1.1", "z.com", "ok", 30.0),
+        ])
+        self._set_mode(page, "ip")
+        order = self._ips_in_order(page)
+        # the two 1.1.1.1 rows are adjacent (grouped)
+        self.assertEqual(order, ["1.1.1.1", "1.1.1.1", "2.2.2.2"])
+
+    def test_group_by_sni_keeps_same_sni_together(self):
+        page = self._page_with_rows([
+            ("1.1.1.1", "same.com", "ok", 20.0),
+            ("2.2.2.2", "other.com", "ok", 10.0),
+            ("3.3.3.3", "same.com", "ok", 30.0),
+        ])
+        self._set_mode(page, "sni")
+        snis = [page.scan_tbl.item(r, page.SC_SNI).text()
+                for r in range(page.scan_tbl.rowCount())]
+        # the two "same.com" rows are adjacent
+        self.assertEqual(snis[0], "other.com")
+        self.assertEqual(snis[1], "same.com")
+        self.assertEqual(snis[2], "same.com")
+
+    def test_only_healthy_filter_hides_failed_rows(self):
+        page = self._page_with_rows([
+            ("1.1.1.1", "a.com", "ok", 20.0),
+            ("2.2.2.2", "b.com", "fail", None),
+            ("3.3.3.3", "c.com", "ok", 30.0),
+        ])
+        page.scan_only_ok.setChecked(True)
+        order = self._ips_in_order(page)
+        self.assertEqual(len(order), 2)
+        self.assertNotIn("2.2.2.2", order)
+
+    def test_filter_then_uncheck_restores_rows(self):
+        page = self._page_with_rows([
+            ("1.1.1.1", "a.com", "ok", 20.0),
+            ("2.2.2.2", "b.com", "fail", None),
+        ])
+        page.scan_only_ok.setChecked(True)
+        self.assertEqual(page.scan_tbl.rowCount(), 1)
+        page.scan_only_ok.setChecked(False)
+        self.assertEqual(page.scan_tbl.rowCount(), 2)
+
+
+@unittest.skipUnless(_HAVE_QT, "PySide6 not available")
+class PoolPageAddFeedbackTest(unittest.TestCase):
+    """The «از قبل بود» feedback wording fix."""
+
+    def _page(self, pairs):
+        from ui.window import PoolPage
+        page = PoolPage()
+        page._store = _FakeStore({"sni_ip_pairs": list(pairs)})
+        page._toggle_scan_panel()
+        return page
+
+    def _seed_rows(self, page, rows):
+        from PySide6.QtWidgets import QTableWidgetItem
+        from ui.i18n import tr
+        page.scan_tbl.setRowCount(len(rows))
+        for i, (ip, sni) in enumerate(rows):
+            page.scan_tbl.setItem(i, page.SC_IP, QTableWidgetItem(ip))
+            page.scan_tbl.setItem(i, page.SC_SNI, QTableWidgetItem(sni))
+            page.scan_tbl.setItem(
+                i, page.SC_STATUS, QTableWidgetItem(tr(page._STATUS_FA["ok"])))
+            page.scan_tbl.setItem(i, page.SC_SAVED, QTableWidgetItem(""))
+            page._row_for_key[page._scan_key(ip, sni)] = i
+
+    def test_all_already_saved_gives_clear_message(self):
+        # the user's confusion: imported someone else's list (already saved),
+        # then "add healthy" reports them all as already-present.
+        page = self._page([
+            {"ip": "1.1.1.1", "sni": "a.com"},
+            {"ip": "2.2.2.2", "sni": "b.com"},
+        ])
+        self._seed_rows(page, [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")])
+        page._scan_add_all_ok()
+        txt = page.scan_status.text()
+        self.assertIn("از قبل در فهرست شما", txt)
+        self.assertIn("2", txt)
+
+    def test_mixed_added_and_duplicate_message(self):
+        page = self._page([{"ip": "1.1.1.1", "sni": "a.com"}])
+        self._seed_rows(page, [("1.1.1.1", "a.com"), ("2.2.2.2", "b.com")])
+        page._scan_add_all_ok()
+        txt = page.scan_status.text()
+        self.assertIn("تازه افزوده", txt)
+        self.assertIn("از قبل در فهرست شما", txt)
 
 
 if __name__ == "__main__":
