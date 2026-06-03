@@ -101,6 +101,27 @@ MODE_TLS = "tls"
 MODE_HTTP = "http"
 
 
+# Candidate-IP sources (mirror SenPaiScanner's "Source" row).
+SOURCE_RANDOM = "random"   # sample random Cloudflare ranges
+SOURCE_FILE = "file"       # read candidates from a user-supplied list
+
+
+# Cloudflare CDN ports that behave differently under DPI — SenPaiScanner offers
+# these as a multi-select so Phase 1 can find the best ``IP:port`` pair before
+# Phase 2 validation. ``0`` is a sentinel meaning "use the config's own port".
+CF_PORTS: tuple[int, ...] = (443, 8443, 2053, 2083, 2087, 2096)
+
+# SenPaiScanner's Count / Workers / Timeout / Top-N presets (the dialog rows).
+COUNT_PRESETS: tuple[int, ...] = (1000, 5000, 20000, 100000)
+WORKER_PRESETS: tuple[int, ...] = (50, 100, 200)
+TIMEOUT_PRESETS: tuple[float, ...] = (2.0, 3.0, 5.0)
+TOPN_PRESETS: tuple[int, ...] = (10, 25, 50, 100)
+
+# Hard ceiling on how many candidate IPs a single run may sweep (matches the
+# 100,000 the user asked for — keeps a runaway "Custom" entry from OOM-ing).
+MAX_CANDIDATES_HARD = 100_000
+
+
 # probe outcome (kept for backward compatibility with the old API + the UI).
 OK = "ok"
 RST = "rst"
@@ -775,6 +796,71 @@ def is_cloudflare_host(host: str) -> bool:
 #  IP pool generation (ported from ipsrc.go)
 # ---------------------------------------------------------------------------
 
+def parse_ip_list(text: str, *, limit: int = MAX_CANDIDATES_HARD) -> List[str]:
+    """Extract candidate IPs from free-form *text* (paste box **or** file).
+
+    Mirrors SenPaiScanner's "From File" loader, which tolerates messy input:
+
+    * one entry per line **or** comma/space separated,
+    * ``#`` / ``//`` comments and blank lines ignored,
+    * CSV rows accepted (the IP is taken from the first column),
+    * ``IP:port`` and ``IP/CIDR`` accepted — a CIDR is **expanded** (host
+      addresses only) so a pasted ``104.16.0.0/24`` becomes 254 candidates,
+    * duplicates removed while preserving first-seen order.
+
+    Both bare IPs and the result of pasting another user's ``ips.txt`` (which
+    may carry ``IP:port`` endpoints) work unchanged.
+    """
+    out: List[str] = []
+    seen: set[str] = set()
+    if not text:
+        return out
+    # split on newlines first, then on commas/whitespace within a line.
+    raw_tokens: List[str] = []
+    for line in text.replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("//"):
+            continue
+        # a CSV row → keep the first column only (SenPaiScanner behaviour)
+        if "," in line:
+            line = line.split(",", 1)[0].strip()
+        raw_tokens.extend(t for t in line.replace("\t", " ").split(" ") if t)
+
+    def _add(ip: str) -> None:
+        if ip and ip not in seen:
+            seen.add(ip)
+            out.append(ip)
+
+    for tok in raw_tokens:
+        if len(out) >= limit:
+            break
+        tok = tok.strip().strip(",;")
+        if not tok:
+            continue
+        # strip an "IP:port" suffix (but leave IPv6 alone)
+        if tok.count(":") == 1 and "." in tok:
+            tok = tok.split(":", 1)[0]
+        # CIDR → expand to host addresses (bounded by the remaining budget)
+        if "/" in tok:
+            try:
+                net = ipaddress.ip_network(tok, strict=False)
+            except ValueError:
+                continue
+            hosts = net.hosts() if net.num_addresses > 2 else iter(
+                [net.network_address])
+            for host in hosts:
+                if len(out) >= limit:
+                    break
+                _add(str(host))
+            continue
+        try:
+            ipaddress.ip_address(tok)
+        except ValueError:
+            continue
+        _add(tok)
+    return out
+
+
 def cf_ip_pool(count: int = 512,
                cidrs: Sequence[str] = CLOUDFLARE_IPV4_CIDRS,
                *, rng: Optional[random.Random] = None) -> List[str]:
@@ -851,10 +937,34 @@ class ScanConfig:
     mode: str = MODE_HTTP
     speed_bytes: int = 0
     require_ws: bool = False
+    # --- SenPaiScanner setup-row extras ---
+    source: str = SOURCE_RANDOM   # SOURCE_RANDOM | SOURCE_FILE
+    # Extra CDN ports to also probe each IP on (beyond ``port``). Empty = just
+    # the config port. Each selected port multiplies Phase-1 work (IPs × ports).
+    ports: tuple[int, ...] = ()
+    # Phase-2 budget: how many of the best Phase-1 hits to validate with xray.
+    # 0 = validate **all** clean hits.
+    top_n: int = 0
 
-    def to_spec(self) -> "ProbeSpec":
+    def all_ports(self) -> List[int]:
+        """The full, de-duplicated port list to probe each IP on.
+
+        Always includes the config ``port`` (the SenPaiScanner "Config" pill),
+        plus any extra :attr:`ports`. Order is stable: config port first.
+        """
+        seen: set[int] = set()
+        out: List[int] = []
+        for p in (self.port, *self.ports):
+            p = int(p)
+            if 0 < p < 65536 and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    def to_spec(self, port: Optional[int] = None) -> "ProbeSpec":
         return ProbeSpec(
-            port=self.port, server_name=self.server_name,
+            port=int(port if port is not None else self.port),
+            server_name=self.server_name,
             host=self.host or self.server_name, path=self.path or "/",
             is_ws=self.is_ws, is_tls=self.is_tls, tries=self.tries,
             mode=self.mode, speed_bytes=self.speed_bytes,
@@ -959,23 +1069,37 @@ class CFScanner:
         generated. Fully fail-soft: a bad probe never aborts the whole run.
         """
         report = ScanReport(config=cfg)
-        candidates = list(ips) if ips is not None else cf_ip_pool(
-            cfg.max_candidates)
-        if not candidates or not (0 < cfg.port < 65536):
+        if ips is not None:
+            base_ips = list(ips)
+        else:
+            base_ips = cf_ip_pool(min(cfg.max_candidates, MAX_CANDIDATES_HARD))
+
+        ports = cfg.all_ports()
+        if not base_ips or not ports:
             self._log("اسکن لغو شد — لیست IP یا پورت نامعتبر است")
             return report
+
+        # SenPaiScanner multi-port: every IP is probed on every selected port,
+        # so the candidate set is the cartesian product (ip × port). Phase 1
+        # work = len(IPs) × len(ports) — surfaced in the log so a big port list
+        # doesn't silently balloon the run.
+        candidates = [(ip, port) for ip in base_ips for port in ports]
+
         ws_note = " · WS" if (cfg.is_ws or cfg.require_ws) else ""
+        ports_note = ("پورت " + ", ".join(str(p) for p in ports)
+                      if len(ports) == 1
+                      else f"{len(ports)} پورت ({', '.join(str(p) for p in ports)})")
         self._phase("phase1")
-        self._log(f"فاز ۱ — پروب اتصال {len(candidates)} IP کلودفلر روی پورت "
-                  f"{cfg.port} (SNI: {cfg.server_name or '—'}{ws_note}, "
-                  f"تلاش: {cfg.tries}) …")
+        self._log(f"فاز ۱ — پروب اتصال {len(base_ips)} IP کلودفلر روی "
+                  f"{ports_note} (SNI: {cfg.server_name or '—'}{ws_note}, "
+                  f"تلاش: {cfg.tries}) — مجموعاً {len(candidates)} پروب …")
 
         total = len(candidates)
-        workers = max(1, min(int(cfg.concurrency), 256))
+        workers = max(1, min(int(cfg.concurrency), 512))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(self._probe_one, ip, cfg): ip
-                for ip in candidates
+                pool.submit(self._probe_one, ip, port, cfg): (ip, port)
+                for ip, port in candidates
             }
             try:
                 for fut in as_completed(futures):
@@ -994,7 +1118,7 @@ class CFScanner:
                         report.results.append(res)
                         found += 1
                         extra = f" · {res.detail}" if res.detail else ""
-                        self._log(f"✓ IP تمیز: {res.ip} "
+                        self._log(f"✓ IP تمیز: {res.ip}:{res.port} "
                                   f"({res.latency_ms:.0f}ms{extra})")
                         if self._on_result:
                             try:
@@ -1014,7 +1138,7 @@ class CFScanner:
 
         clean = report.clean
         self._log(f"فاز ۱ تمام شد — {len(clean)} IP تمیز از "
-                  f"{report.tested} IP آزمایش‌شده پیدا شد")
+                  f"{report.tested} پروب آزمایش‌شده پیدا شد")
         return report
 
     def _accept(self, res: IPResult, cfg: ScanConfig) -> bool:
@@ -1022,13 +1146,19 @@ class CFScanner:
             return False
         return True
 
-    def _probe_one(self, ip: str, cfg: ScanConfig) -> Optional[IPResult]:
+    def _probe_one(self, ip: str, port: int,
+                   cfg: ScanConfig) -> Optional[IPResult]:
         if self._stopping():
             return None
         try:
-            return self.probe_fn(ip, cfg.to_spec(), cfg.timeout)
+            res = self.probe_fn(ip, cfg.to_spec(port), cfg.timeout)
+            # make sure the result records which port it was probed on, even if
+            # an injected fake probe forgot to set it.
+            if res is not None and not getattr(res, "port", 0):
+                res.port = port
+            return res
         except Exception as exc:  # never let one bad probe kill the sweep
-            return IPResult(ip, ERROR, detail=repr(exc))
+            return IPResult(ip, ERROR, detail=repr(exc), port=port)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,3 +1207,46 @@ def profile_with_ip(profile, ip: str, *, suffix: str = ""):
     data["remark"] = f"{base_remark} · {tag}"
     data["raw"] = ""
     return Profile.from_dict(data)
+
+
+# ---------------------------------------------------------------------------
+#  result export (SenPaiScanner's live "ips.txt" / result file)
+# ---------------------------------------------------------------------------
+
+def format_endpoints(results: Sequence[IPResult]) -> List[str]:
+    """Return ``IP:port`` strings for the given results (clean, paste-ready).
+
+    Mirrors SenPaiScanner's export lines (e.g. ``104.16.72.162:443``) which
+    drop straight into client configs / IP lists. Duplicates are removed while
+    preserving order.
+    """
+    out: List[str] = []
+    seen: set[str] = set()
+    for r in results:
+        ep = f"{r.ip}:{int(getattr(r, 'port', 0) or 443)}"
+        if ep not in seen:
+            seen.add(ep)
+            out.append(ep)
+    return out
+
+
+def write_result_file(path: str, results: Sequence[IPResult]) -> str:
+    """Write ``IP:port`` endpoints to *path* (one per line) and return *path*.
+
+    Used for both the live, continuously-updated result file SenPaiScanner
+    keeps next to the binary and the on-demand "export" the user triggers.
+    Fail-soft: any I/O error is swallowed so a read-only CWD never crashes a
+    scan.
+    """
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(format_endpoints(results)))
+            fh.write("\n")
+    except Exception:
+        pass
+    return path
+
+
+def default_result_filename() -> str:
+    """``SenPaiScannerResult-YYYYMMDD-HHMMSS.txt`` (SenPaiScanner naming)."""
+    return time.strftime("SenPaiScannerResult-%Y%m%d-%H%M%S.txt")
