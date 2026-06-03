@@ -821,6 +821,8 @@ from core.pool import (
     ScanCandidate,
     build_scan_candidates,
     export_sni_pairs,
+    import_sni_pairs,
+    parse_sni_pairs_text,
 )
 
 
@@ -956,3 +958,82 @@ class ExportSniPairsTest(unittest.TestCase):
         path = os.path.join(self.dir, "pairs2.txt")
         n = export_sni_pairs([("", "a.com", "ok"), ("1.1.1.1", "", "ok")], path)
         self.assertEqual(n, 0)
+
+
+class ParseSniPairsTextTest(unittest.TestCase):
+    def test_parses_ip_sni_status_tab(self):
+        text = ("# header\n# IP <TAB> SNI <TAB> status\n\n"
+                "1.1.1.1\tcdn.cloudflare.com\tok\n"
+                "2.2.2.2\tdns.google\tfail\n")
+        self.assertEqual(parse_sni_pairs_text(text), [
+            ("1.1.1.1", "cdn.cloudflare.com"),
+            ("2.2.2.2", "dns.google"),
+        ])
+
+    def test_detects_swapped_sni_ip_order(self):
+        # SNI first, IP second — the IP column is detected regardless of order
+        self.assertEqual(parse_sni_pairs_text("dns.google\t8.8.8.8"),
+                         [("8.8.8.8", "dns.google")])
+
+    def test_comma_and_whitespace_separators(self):
+        self.assertEqual(parse_sni_pairs_text("9.9.9.9, example.com, ok"),
+                         [("9.9.9.9", "example.com")])
+        self.assertEqual(parse_sni_pairs_text("3.3.3.3   a.com"),
+                         [("3.3.3.3", "a.com")])
+
+    def test_skips_comments_blanks_and_short_lines(self):
+        text = "# c\n\nonlyonecolumn\n4.4.4.4\tb.com\n"
+        self.assertEqual(parse_sni_pairs_text(text), [("4.4.4.4", "b.com")])
+
+    def test_dedupes_case_insensitive(self):
+        text = "1.1.1.1\tA.com\n1.1.1.1\ta.COM\n"
+        self.assertEqual(parse_sni_pairs_text(text), [("1.1.1.1", "A.com")])
+
+    def test_ipv6_recognised(self):
+        self.assertEqual(parse_sni_pairs_text("2606:4700:4700::1111\tdns.cf"),
+                         [("2606:4700:4700::1111", "dns.cf")])
+
+
+class ImportSniPairsTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def _write(self, name, text):
+        path = os.path.join(self.dir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_roundtrip_with_export(self):
+        path = os.path.join(self.dir, "rt.txt")
+        export_sni_pairs(
+            [("1.1.1.1", "cdn.cloudflare.com", "ok"),
+             ("2.2.2.2", "dns.google", "ok")], path)
+        merged, added = import_sni_pairs(path, existing=[])
+        self.assertEqual(added, 2)
+        self.assertEqual(merged, [
+            {"sni": "cdn.cloudflare.com", "ip": "1.1.1.1"},
+            {"sni": "dns.google", "ip": "2.2.2.2"},
+        ])
+
+    def test_merges_only_new_pairs(self):
+        path = self._write("m.txt",
+                            "1.1.1.1\ta.com\n2.2.2.2\tb.com\n")
+        existing = [{"ip": "1.1.1.1", "sni": "a.com"}]
+        merged, added = import_sni_pairs(path, existing=existing)
+        self.assertEqual(added, 1)             # only b.com is new
+        self.assertEqual(len(merged), 2)
+        self.assertIn({"sni": "b.com", "ip": "2.2.2.2"}, merged)
+
+    def test_nothing_new_returns_zero(self):
+        path = self._write("z.txt", "1.1.1.1\ta.com\n")
+        existing = [{"ip": "1.1.1.1", "sni": "A.COM"}]   # case-insensitive dup
+        merged, added = import_sni_pairs(path, existing=existing)
+        self.assertEqual(added, 0)
+        self.assertEqual(len(merged), 1)
+
+    def test_existing_none_starts_empty(self):
+        path = self._write("e.txt", "5.5.5.5\tc.com\n")
+        merged, added = import_sni_pairs(path, existing=None)
+        self.assertEqual(added, 1)
+        self.assertEqual(merged, [{"sni": "c.com", "ip": "5.5.5.5"}])

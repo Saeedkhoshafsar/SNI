@@ -293,5 +293,231 @@ class PoolPageFailoverExportTest(unittest.TestCase):
             save.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+#  Inline SNI/IP scan (embedded in PoolPage — replaces the old dialog).
+# ---------------------------------------------------------------------------
+
+class _FakeSpoofProfile:
+    is_spoof_config = True
+    spoof_connect_ip = "127.0.0.1"
+    spoof_connect_port = 40443
+    spoof_fake_sni = "www.example.com"
+    display_name = "Spoof Test Config"
+
+
+class _FakePlainProfile:
+    is_spoof_config = False
+    display_name = "Plain Config"
+
+
+class _FakeStore:
+    def __init__(self, cfg, profiles):
+        self.config = cfg
+        self.profiles = profiles
+        self.saved = 0
+
+    def get(self, key, default=None):
+        return self.config.get(key, default)
+
+    def set(self, key, value):
+        self.config[key] = value
+
+    def save_config(self):
+        self.saved += 1
+
+
+def _scan_store(n_ips=40, n_snis=40, pairs=None):
+    cfg = {
+        "CONNECT_IPS": ["10.0.0.%d" % i for i in range(n_ips)],
+        "FAKE_SNIS": ["sni%d.example.com" % i for i in range(n_snis)],
+        "sni_ip_pairs": list(pairs or []),
+        "probe_timeout": 2.0,
+    }
+    return _FakeStore(cfg, [_FakePlainProfile(), _FakeSpoofProfile()])
+
+
+@unittest.skipUnless(_HAVE_QT, "PySide6 not available")
+class PoolPageInlineScanTest(unittest.TestCase):
+    def _page(self, store):
+        from ui.window import PoolPage
+        page = PoolPage()
+        page.set_store(store)
+        return page
+
+    def test_toggle_shows_panel_and_lists_only_spoof_configs(self):
+        page = self._page(_scan_store())
+        # the page itself isn't shown in the headless test, so isVisible() is
+        # always False; check the explicit hidden flag instead.
+        self.assertTrue(page.scan_card.isHidden())
+        page._toggle_scan_panel()
+        self.assertFalse(page.scan_card.isHidden())
+        datas = [page.scan_cmb.itemData(i)
+                 for i in range(page.scan_cmb.count())]
+        spoof = [d for d in datas if d is not None]
+        self.assertEqual(len(spoof), 1)          # plain profile filtered out
+        self.assertTrue(page.scan_btn_run.isEnabled())
+
+    def test_no_spoof_config_disables_run(self):
+        store = _FakeStore(
+            {"CONNECT_IPS": ["1.1.1.1"], "FAKE_SNIS": ["a.com"],
+             "sni_ip_pairs": []}, [_FakePlainProfile()])
+        page = self._page(store)
+        page._toggle_scan_panel()
+        self.assertFalse(page.scan_btn_run.isEnabled())
+
+    def test_candidates_capped(self):
+        page = self._page(_scan_store(40, 40))
+        page._toggle_scan_panel()
+        prof = next(d for d in (page.scan_cmb.itemData(i)
+                                for i in range(page.scan_cmb.count()))
+                    if d is not None)
+        cands = page._scan_candidate_pairs(prof)
+        self.assertLessEqual(len(cands), page.MAX_CANDIDATES)
+        self.assertEqual(len(cands), page.MAX_CANDIDATES)
+
+    def test_seed_is_text_only_and_fast(self):
+        import time
+        import core.pool as pool
+        page = self._page(_scan_store(40, 40))
+        page._toggle_scan_panel()
+        orig = pool.spoof_handshake_probe
+        pool.spoof_handshake_probe = lambda ip, port, t, sni: False
+        try:
+            t0 = time.monotonic()
+            page._scan_start()
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            self.assertGreater(page.scan_tbl.rowCount(), 0)
+            self.assertLessEqual(page.scan_tbl.rowCount(), page.MAX_CANDIDATES)
+            # NO per-row cell widgets (that froze the GUI in the old design)
+            for r in range(page.scan_tbl.rowCount()):
+                for c in range(page.scan_tbl.columnCount()):
+                    self.assertIsNone(page.scan_tbl.cellWidget(r, c))
+                    self.assertIsNotNone(page.scan_tbl.item(r, c))
+            self.assertLess(elapsed_ms, 1500.0)
+        finally:
+            page.shutdown_scan()
+            pool.spoof_handshake_probe = orig
+
+    def _seed_rows(self, page, rows):
+        from PySide6.QtWidgets import QTableWidgetItem
+        page.scan_tbl.setRowCount(len(rows))
+        page._row_for_key.clear()
+        for i, (ip, sni, ok) in enumerate(rows):
+            page.scan_tbl.setItem(i, page.SC_IP, QTableWidgetItem(ip))
+            page.scan_tbl.setItem(i, page.SC_SNI, QTableWidgetItem(sni))
+            page.scan_tbl.setItem(i, page.SC_LAT, QTableWidgetItem("10ms"))
+            st = page._STATUS_FA["ok"] if ok else page._STATUS_FA["fail"]
+            from ui.i18n import tr
+            page.scan_tbl.setItem(i, page.SC_STATUS, QTableWidgetItem(tr(st)))
+            page.scan_tbl.setItem(i, page.SC_SAVED, QTableWidgetItem(""))
+            page._row_for_key[page._scan_key(ip, sni)] = i
+
+    def test_add_all_ok_persists_only_healthy(self):
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        page._toggle_scan_panel()
+        self._seed_rows(page, [
+            ("1.1.1.1", "good1.com", True),
+            ("2.2.2.2", "bad.com", False),
+            ("3.3.3.3", "good2.com", True),
+        ])
+        page._scan_add_all_ok()
+        snis = {p["sni"] for p in store.get("sni_ip_pairs")}
+        self.assertEqual(snis, {"good1.com", "good2.com"})
+        self.assertGreaterEqual(store.saved, 1)
+
+    def test_add_selected_then_remove_roundtrip(self):
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        page._toggle_scan_panel()
+        self._seed_rows(page, [
+            ("1.1.1.1", "a.com", True),
+            ("2.2.2.2", "b.com", False),
+        ])
+        page.scan_tbl.selectAll()
+        page._scan_add_selected()
+        self.assertEqual(len(store.get("sni_ip_pairs")), 2)
+        page.scan_tbl.selectAll()
+        page._scan_remove_selected()
+        self.assertEqual(len(store.get("sni_ip_pairs")), 0)
+
+    def test_add_is_idempotent(self):
+        store = _scan_store(pairs=[{"ip": "1.1.1.1", "sni": "a.com"}])
+        page = self._page(store)
+        page._toggle_scan_panel()
+        self._seed_rows(page, [("1.1.1.1", "a.com", True)])
+        page.scan_tbl.selectAll()
+        page._scan_add_selected()
+        self.assertEqual(len(store.get("sni_ip_pairs")), 1)
+
+    def test_pairs_changed_callback_fires_on_add(self):
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        fired = []
+        page.pairs_changed = lambda: fired.append(1)
+        page._toggle_scan_panel()
+        self._seed_rows(page, [("1.1.1.1", "a.com", True)])
+        page.scan_tbl.selectAll()
+        page._scan_add_selected()
+        self.assertEqual(fired, [1])
+
+
+@unittest.skipUnless(_HAVE_QT, "PySide6 not available")
+class PoolPageImportTest(unittest.TestCase):
+    def _page(self, store):
+        from ui.window import PoolPage
+        page = PoolPage()
+        page.set_store(store)
+        return page
+
+    def _write(self, text):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "imp.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_import_merges_new_pairs_and_refreshes(self):
+        from unittest import mock
+        store = _scan_store(pairs=[{"ip": "1.1.1.1", "sni": "a.com"}])
+        page = self._page(store)
+        fired = []
+        page.pairs_changed = lambda: fired.append(1)
+        path = self._write("1.1.1.1\ta.com\n2.2.2.2\tb.com\n")
+        with mock.patch("ui.window.QFileDialog.getOpenFileName",
+                        return_value=(path, "")), \
+             mock.patch("ui.window.QMessageBox.information") as info:
+            page._on_import()
+        # only b.com is new
+        snis = {p["sni"] for p in store.get("sni_ip_pairs")}
+        self.assertEqual(snis, {"a.com", "b.com"})
+        self.assertGreaterEqual(store.saved, 1)
+        self.assertEqual(fired, [1])
+        info.assert_called_once()
+
+    def test_import_nothing_new_shows_info_and_no_save(self):
+        from unittest import mock
+        store = _scan_store(pairs=[{"ip": "1.1.1.1", "sni": "a.com"}])
+        page = self._page(store)
+        path = self._write("1.1.1.1\tA.COM\n")        # dup (case-insensitive)
+        with mock.patch("ui.window.QFileDialog.getOpenFileName",
+                        return_value=(path, "")), \
+             mock.patch("ui.window.QMessageBox.information") as info:
+            page._on_import()
+        self.assertEqual(store.saved, 0)
+        self.assertEqual(len(store.get("sni_ip_pairs")), 1)
+        info.assert_called_once()
+
+    def test_import_cancelled_does_nothing(self):
+        from unittest import mock
+        store = _scan_store(pairs=[])
+        page = self._page(store)
+        with mock.patch("ui.window.QFileDialog.getOpenFileName",
+                        return_value=("", "")):
+            page._on_import()
+        self.assertEqual(len(store.get("sni_ip_pairs")), 0)
+        self.assertEqual(store.saved, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
