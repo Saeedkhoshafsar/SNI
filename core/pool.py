@@ -1353,6 +1353,110 @@ def export_sni_pairs(
     return len(clean)
 
 
+def parse_sni_pairs_text(text: str) -> List[Tuple[str, str]]:
+    """Parse an exported SNI/IP list back into ``(ip, sni)`` pairs.
+
+    This is the inverse of :func:`export_sni_pairs` so a user can re-import a
+    list they (or someone else) generated, instead of copy-pasting. It is
+    deliberately forgiving about the exact layout so hand-edited or third-party
+    files still load:
+
+      * ``#`` comment lines and blank lines are ignored.
+      * Columns may be separated by **TAB, comma, or whitespace**.
+      * The first two non-status columns are read as ``IP`` and ``SNI``. We
+        detect which one is the IP (``a.b.c.d`` / contains ``:`` for IPv6) so a
+        ``SNI<TAB>IP`` file loads just as well as ``IP<TAB>SNI``; if neither
+        column looks like an IP we assume the export order ``IP, SNI``.
+      * A trailing ``status`` column (e.g. ``ok`` / ``سالم``) is ignored.
+
+    Returns de-duplicated ``(ip, sni)`` tuples (case-insensitive, first wins)
+    with blanks dropped — ready to merge straight into ``sni_ip_pairs``.
+    """
+    import re as _re
+
+    def _looks_like_ip(token: str) -> bool:
+        t = token.strip()
+        if not t:
+            return False
+        # IPv4 dotted quad
+        if _re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", t):
+            return all(0 <= int(p) <= 255 for p in t.split("."))
+        # IPv6 (very loose) — has a colon and only hex/colon chars
+        if ":" in t and _re.fullmatch(r"[0-9A-Fa-f:]+", t):
+            return True
+        return False
+
+    seen: set = set()
+    out: List[Tuple[str, str]] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # split on TAB / comma first; fall back to any whitespace run
+        if "\t" in line:
+            cols = [c.strip() for c in line.split("\t")]
+        elif "," in line:
+            cols = [c.strip() for c in line.split(",")]
+        else:
+            cols = [c.strip() for c in line.split()]
+        cols = [c for c in cols if c]
+        if len(cols) < 2:
+            continue
+        a, b = cols[0], cols[1]
+        # decide which column is the IP
+        if _looks_like_ip(a) and not _looks_like_ip(b):
+            ip, sni = a, b
+        elif _looks_like_ip(b) and not _looks_like_ip(a):
+            ip, sni = b, a
+        else:
+            ip, sni = a, b  # export order: IP, SNI
+        if not ip or not sni:
+            continue
+        key = (ip.lower(), sni.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((ip, sni))
+    return out
+
+
+def import_sni_pairs(
+    filepath: str,
+    existing: Optional[List[dict]] = None,
+) -> Tuple[List[dict], int]:
+    """Read *filepath* and merge its ``(ip, sni)`` pairs into *existing*.
+
+    Reads a file produced by :func:`export_sni_pairs` (or a compatible list) via
+    :func:`parse_sni_pairs_text`, then appends any pairs not already present in
+    *existing* (the user's ``sni_ip_pairs`` list of ``{"sni", "ip"}`` dicts),
+    de-duplicated case-insensitively.
+
+    Returns ``(merged_list, added_count)`` — ``merged_list`` is a new list ready
+    to store back, and ``added_count`` is how many NEW pairs were imported (0
+    means everything was already in the list).
+    """
+    with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    pairs = parse_sni_pairs_text(text)
+
+    merged: List[dict] = list(existing or [])
+    keys: set = set()
+    for p in merged:
+        ip = str(p.get("ip", "")).strip().lower()
+        sni = str(p.get("sni", "")).strip().lower()
+        keys.add((ip, sni))
+
+    added = 0
+    for ip, sni in pairs:
+        key = (ip.lower(), sni.lower())
+        if key in keys:
+            continue
+        keys.add(key)
+        merged.append({"sni": sni, "ip": ip})
+        added += 1
+    return merged, added
+
+
 def export_routes(
     manager_or_config,
     filepath: str,

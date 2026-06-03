@@ -592,6 +592,49 @@ def build_qss(p: Palette) -> str:
         border-radius: {p.radius_sm}px;
         margin: 1px;
     }}
+    /* ---- Tables (route pool scan results, diagnostics) ---- */
+    /* Without an explicit rule a QTableWidget falls back to the native
+       light palette → thin dark text on a near-white grid that is unreadable
+       on the dark theme. Pin every part to the active palette. */
+    QTableWidget, QTableView {{
+        background: {p.surface_alt};
+        alternate-background-color: {p.elevated};
+        border: 1px solid {p.border};
+        border-radius: {p.radius_sm}px;
+        color: {p.text};
+        gridline-color: {p.border};
+        font-size: 12.5px;
+        selection-background-color: {p.accent};
+        selection-color: {p.on_accent};
+        outline: 0;
+    }}
+    QTableWidget::item, QTableView::item {{
+        padding: 6px 8px;
+        border: none;
+    }}
+    QTableWidget::item:selected, QTableView::item:selected {{
+        background: {p.accent};
+        color: {p.on_accent};
+    }}
+    QHeaderView {{
+        background: {p.surface};
+    }}
+    QHeaderView::section {{
+        background: {p.surface};
+        color: {p.text_muted};
+        padding: 7px 8px;
+        border: none;
+        border-bottom: 1px solid {p.border};
+        border-right: 1px solid {p.border};
+        font-weight: 600;
+    }}
+    QHeaderView::section:last {{ border-right: none; }}
+    QTableCornerButton::section {{
+        background: {p.surface};
+        border: none;
+        border-bottom: 1px solid {p.border};
+    }}
+
     QComboBox#LogFilter {{
         min-width: 88px;
         padding: 5px 8px;

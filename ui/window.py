@@ -18,11 +18,13 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSizeGrip, QSpinBox, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
+    QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QScrollArea, QSizeGrip, QSpinBox, QStackedWidget,
+    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
+from PySide6.QtGui import QColor
 
 
 def _scrollable(page: QWidget) -> QScrollArea:
@@ -2240,6 +2242,42 @@ class DiagnosticsPage(QWidget):
         return "\n".join(lines)
 
 
+class _PoolScanWorker(QThread):
+    """Run the SNI/IP sweep off the GUI thread for the inline pool scanner.
+
+    The scanner's probe sockets live on daemon worker threads; this QThread only
+    *drains* the result queue and re-emits each verdict as a **queued Qt signal**
+    so the GUI thread is never touched from a raw probe thread (that was the
+    original freeze/crash). The thread is intentionally unparented.
+    """
+
+    result = Signal(dict)
+    progress = Signal(int, int)
+    finished_scan = Signal(int, int)
+
+    def __init__(self, candidates, *, port: int, timeout: float):
+        super().__init__()
+        self._candidates = candidates
+        self._port = port
+        self._timeout = timeout
+        self._scanner = None
+
+    def stop(self):
+        if self._scanner is not None:
+            self._scanner.stop()
+
+    def run(self):  # pragma: no cover - exercised via Qt smoke, not unit
+        from core.pool import SniIpScanner
+        self._scanner = SniIpScanner(
+            self._candidates, port=self._port, timeout=self._timeout,
+            workers=16, on_result=self.result.emit,
+            on_progress=self.progress.emit, on_done=self.finished_scan.emit)
+        try:
+            self._scanner.run()
+        except Exception:
+            self.finished_scan.emit(0, len(self._candidates))
+
+
 class PoolPage(QWidget):
     """Live picture of the multi-IP / multi-SNI route pool (core.pool).
 
@@ -2260,11 +2298,19 @@ class PoolPage(QWidget):
                             {ip, sni, loss, alive, active, in_pool}
     """
 
+    # column indices for the inline scan results table
+    SC_IP, SC_SNI, SC_LAT, SC_STATUS, SC_SAVED = range(5)
+    MAX_CANDIDATES = 600
+    _STATUS_FA = {"pending": "در صف", "testing": "در حال آزمایش…",
+                  "ok": "✓ سالم", "fail": "✗ ناموفق"}
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._provider = None          # callable -> snapshot dict
         self._last_snap = None         # latest snapshot (for the export action)
-        self.scan_handler = None       # zero-arg callable: open the scan dialog
+        self._store = None             # ConfigStore (wired by the host)
+        self._scan_worker = None       # _PoolScanWorker | None
+        self._row_for_key = {}         # (ip,sni) -> scan table row
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
         root.setSpacing(16)
@@ -2313,31 +2359,148 @@ class PoolPage(QWidget):
         ph.setObjectName("H2")
         head.addWidget(ph)
         head.addStretch(1)
-        # Manual SNI/IP scan ("شروع تست"): opens the scan dialog so the user
-        # picks ONE spoof config, sweeps every (IP, SNI) pair once, and adds the
-        # good ones to their reusable sni_ip_pairs list. The host wires
-        # ``scan_handler`` in _wire_core (decoupled from the engine/store here).
+        # Inline manual scan ("شروع تست"): toggles the scan panel below (no
+        # separate window — the dialog used to feel like it froze on open). The
+        # sweep tests every (IP, SNI) pair once against the DPI directly and the
+        # user adds the good ones to their reusable sni_ip_pairs list.
         self.btn_scan = QPushButton(tr("شروع تست"))
         self.btn_scan.setObjectName("Primary")
-        self.btn_scan.clicked.connect(self._on_scan)
+        self.btn_scan.clicked.connect(self._toggle_scan_panel)
         head.addWidget(self.btn_scan)
         # 7.10 — export the current routes / SNIs to a text file.
         self.btn_export = QPushButton(tr("خروجی فهرست SNI/IP…"))
         self.btn_export.setObjectName("Ghost")
         self.btn_export.clicked.connect(self._on_export)
         head.addWidget(self.btn_export)
+        # import a previously-exported SNI/IP list straight into sni_ip_pairs,
+        # so the user never has to copy-paste a list back in by hand.
+        self.btn_import = QPushButton(tr("وارد کردن فهرست…"))
+        self.btn_import.setObjectName("Ghost")
+        self.btn_import.clicked.connect(self._on_import)
+        head.addWidget(self.btn_import)
         pb.addLayout(head)
         self.tbl = QPlainTextEdit()
         self.tbl.setObjectName("Log")
         self.tbl.setReadOnly(True)
-        self.tbl.setMinimumHeight(220)
+        self.tbl.setMinimumHeight(180)
         pb.addWidget(self.tbl)
-        root.addWidget(pairs, 1)
+        root.addWidget(pairs)
+
+        # --- inline scan panel (hidden until "شروع تست") ------------------
+        self.scan_card = self._build_scan_card()
+        self.scan_card.setVisible(False)
+        root.addWidget(self.scan_card, 1)
 
         # poll timer (started/stopped when the page becomes visible)
         self._timer = QTimer(self)
         self._timer.setInterval(1500)
         self._timer.timeout.connect(self.refresh)
+
+    # ------------------------------------------------------------------
+    #  inline scan panel
+    # ------------------------------------------------------------------
+    def _build_scan_card(self) -> "Card":
+        card = Card()
+        b = card.body()
+
+        title = QLabel(tr("آزمایش جفت‌های SNI/IP"))
+        title.setObjectName("H2")
+        b.addWidget(title)
+
+        intro = QLabel(tr(
+            "یک کانفیگ اسپوف (۱۲۷.۰.۰.۱:۴۰۴۴۳) را انتخاب کنید و «اجرای آزمایش» "
+            "را بزنید. آزمایش مستقیماً DPI را می‌سنجد و به اتصال فعلی شما کاری "
+            "ندارد — حتی وقتی متصل هستید نتیجه واقعی است. مسیر فعال جابه‌جا "
+            "نمی‌شود؛ ردیف‌های سالم را انتخاب کنید و با دکمه‌های پایین به فهرست "
+            "SNI/IP خود بیفزایید تا بعداً در «تنظیمات» انتخابشان کنید."))
+        intro.setObjectName("Faint")
+        intro.setWordWrap(True)
+        b.addWidget(intro)
+
+        pick = QHBoxLayout()
+        pick.setSpacing(8)
+        lbl = QLabel(tr("کانفیگ اسپوف:"))
+        lbl.setObjectName("Muted")
+        pick.addWidget(lbl)
+        self.scan_cmb = NoScrollComboBox()
+        pick.addWidget(self.scan_cmb, 1)
+        self.scan_btn_run = QPushButton(tr("اجرای آزمایش"))
+        self.scan_btn_run.setObjectName("Primary")
+        self.scan_btn_run.clicked.connect(self._scan_start)
+        pick.addWidget(self.scan_btn_run)
+        self.scan_btn_stop = QPushButton(tr("توقف"))
+        self.scan_btn_stop.setObjectName("Ghost")
+        self.scan_btn_stop.setEnabled(False)
+        self.scan_btn_stop.clicked.connect(self._scan_stop)
+        pick.addWidget(self.scan_btn_stop)
+        b.addLayout(pick)
+
+        self.scan_progress = QProgressBar()
+        self.scan_progress.setRange(0, 100)
+        self.scan_progress.setValue(0)
+        b.addWidget(self.scan_progress)
+
+        self.scan_tbl = QTableWidget(0, 5)
+        self.scan_tbl.setObjectName("ScanResults")
+        self.scan_tbl.setHorizontalHeaderLabels(
+            [tr("IP"), tr("SNI"), tr("تأخیر"), tr("وضعیت"), tr("در فهرست؟")])
+        self.scan_tbl.verticalHeader().setVisible(False)
+        self.scan_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.scan_tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.scan_tbl.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.scan_tbl.setAlternatingRowColors(True)
+        self.scan_tbl.setMinimumHeight(240)
+        hh = self.scan_tbl.horizontalHeader()
+        hh.setSectionResizeMode(self.SC_IP, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.SC_SNI, QHeaderView.Stretch)
+        hh.setSectionResizeMode(self.SC_LAT, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.SC_STATUS, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.SC_SAVED, QHeaderView.ResizeToContents)
+        b.addWidget(self.scan_tbl, 1)
+
+        act = QHBoxLayout()
+        act.setSpacing(8)
+        self.scan_btn_add_sel = QPushButton(tr("افزودن انتخاب‌شده‌ها"))
+        self.scan_btn_add_sel.setObjectName("Ghost")
+        self.scan_btn_add_sel.clicked.connect(self._scan_add_selected)
+        act.addWidget(self.scan_btn_add_sel)
+        self.scan_btn_add_ok = QPushButton(tr("افزودن همهٔ سالم‌ها"))
+        self.scan_btn_add_ok.setObjectName("Ghost")
+        self.scan_btn_add_ok.clicked.connect(self._scan_add_all_ok)
+        act.addWidget(self.scan_btn_add_ok)
+        self.scan_btn_rem_sel = QPushButton(tr("حذف انتخاب‌شده‌ها"))
+        self.scan_btn_rem_sel.setObjectName("Ghost")
+        self.scan_btn_rem_sel.clicked.connect(self._scan_remove_selected)
+        act.addWidget(self.scan_btn_rem_sel)
+        act.addStretch(1)
+        self.scan_status = QLabel(tr("آماده"))
+        self.scan_status.setObjectName("Faint")
+        act.addWidget(self.scan_status)
+        b.addLayout(act)
+        return card
+
+    def set_store(self, store) -> None:
+        """Wire the live ConfigStore so the inline scan can read configs and
+        persist added sni_ip_pairs (called by the host in _wire_core)."""
+        self._store = store
+
+    def _toggle_scan_panel(self) -> None:
+        # use isHidden() (the explicit hide flag) rather than isVisible(), which
+        # also reflects ancestor visibility and would mis-toggle before the page
+        # is shown / in headless tests.
+        show = self.scan_card.isHidden()
+        self.scan_card.setVisible(show)
+        if show:
+            self._scan_populate_configs()
+            self.btn_scan.setText(tr("بستن آزمایش"))
+            # nudge the scroll so the panel is visible
+            try:
+                self.scan_card.setFocus()
+            except Exception:
+                pass
+        else:
+            self._scan_stop()
+            self.btn_scan.setText(tr("شروع تست"))
 
     def set_provider(self, provider) -> None:
         """Give the page a zero-arg callable returning a snapshot dict."""
@@ -2351,6 +2514,22 @@ class PoolPage(QWidget):
 
     def stop_polling(self) -> None:
         self._timer.stop()
+
+    def shutdown_scan(self) -> None:
+        """Stop any running inline scan and give the worker a short grace
+        window. Daemon probe sockets unwind on their own timeout, so this never
+        blocks the GUI (used on page-leave and app close)."""
+        w = self._scan_worker
+        if w is not None:
+            try:
+                w.stop()
+            except Exception:
+                pass
+            try:
+                if w.isRunning():
+                    w.wait(800)
+            except Exception:
+                pass
 
     def refresh(self) -> None:
         if self._provider is None:
@@ -2432,11 +2611,257 @@ class PoolPage(QWidget):
 
         self.tbl.setPlainText(self._pair_table(snap.get("rows", []) or []))
 
-    # -- manual scan ("شروع تست") -----------------------------------------
-    def _on_scan(self) -> None:
-        """Open the manual SNI/IP scan dialog (wired by the host)."""
-        if callable(self.scan_handler):
-            self.scan_handler()
+    # -- inline scan: config picker + candidate building ------------------
+    def _scan_spoof_profiles(self) -> list:
+        out = []
+        store = self._store
+        if store is None:
+            return out
+        for prof in getattr(store, "profiles", []) or []:
+            try:
+                if bool(getattr(prof, "is_spoof_config", False)):
+                    out.append(prof)
+            except Exception:
+                continue
+        return out
+
+    def _scan_populate_configs(self) -> None:
+        self.scan_cmb.clear()
+        profs = self._scan_spoof_profiles()
+        if not profs:
+            self.scan_cmb.addItem(
+                tr("هیچ کانفیگ اسپوفی یافت نشد (۱۲۷.۰.۰.۱:۴۰۴۴۳)"), None)
+            self.scan_cmb.setEnabled(False)
+            self.scan_btn_run.setEnabled(False)
+            return
+        self.scan_cmb.setEnabled(True)
+        self.scan_btn_run.setEnabled(True)
+        for prof in profs:
+            name = getattr(prof, "display_name", "") or tr("کانفیگ")
+            self.scan_cmb.addItem(name, prof)
+
+    def _scan_key(self, ip: str, sni: str) -> tuple:
+        return (str(ip).strip().lower(), str(sni).strip().lower())
+
+    def _scan_existing_keys(self) -> set:
+        store = self._store
+        pairs = (store.get("sni_ip_pairs", []) or []) if store else []
+        return {self._scan_key(p.get("ip", ""), p.get("sni", "")) for p in pairs}
+
+    def _scan_candidate_pairs(self, profile) -> list:
+        from core.pool import build_scan_candidates
+        store = self._store
+        cfg = store.config if store else {}
+        extra = []
+        for p in (cfg.get("sni_ip_pairs", []) or []):
+            ip = str(p.get("ip", "")).strip()
+            sni = str(p.get("sni", "")).strip()
+            if ip and sni:
+                extra.append((ip, sni))
+        ips = list(cfg.get("CONNECT_IPS", []) or [])
+        snis = list(cfg.get("FAKE_SNIS", []) or [])
+        if cfg.get("CONNECT_IP"):
+            ips.append(str(cfg["CONNECT_IP"]))
+        if cfg.get("FAKE_SNI"):
+            snis.append(str(cfg["FAKE_SNI"]))
+        try:
+            if getattr(profile, "spoof_connect_ip", ""):
+                ips.append(str(profile.spoof_connect_ip))
+            if getattr(profile, "spoof_fake_sni", ""):
+                snis.append(str(profile.spoof_fake_sni))
+        except Exception:
+            pass
+        cands = build_scan_candidates(ips, snis, extra_pairs=extra)
+        if len(cands) > self.MAX_CANDIDATES:
+            cands = cands[:self.MAX_CANDIDATES]
+        return cands
+
+    def _scan_port(self, profile) -> int:
+        try:
+            return int(getattr(profile, "spoof_connect_port", 0) or 443)
+        except Exception:
+            return 443
+
+    # -- inline scan: lifecycle -------------------------------------------
+    def _scan_start(self) -> None:
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            return
+        if self._store is None:
+            return
+        profile = self.scan_cmb.currentData()
+        if profile is None:
+            self.scan_status.setText(tr("کانفیگ اسپوفی انتخاب نشده است."))
+            return
+        candidates = self._scan_candidate_pairs(profile)
+        if not candidates:
+            self.scan_status.setText(tr(
+                "هیچ جفت IP/SNI برای آزمایش نیست — در «تنظیمات» اضافه کنید."))
+            return
+
+        existing = self._scan_existing_keys()
+        self.scan_tbl.setSortingEnabled(False)
+        self.scan_tbl.setUpdatesEnabled(False)
+        self.scan_tbl.setRowCount(0)
+        self._row_for_key.clear()
+        self.scan_tbl.setRowCount(len(candidates))
+        for i, (ip, sni) in enumerate(candidates):
+            self.scan_tbl.setItem(i, self.SC_IP, QTableWidgetItem(ip))
+            self.scan_tbl.setItem(i, self.SC_SNI, QTableWidgetItem(sni))
+            self.scan_tbl.setItem(i, self.SC_LAT, QTableWidgetItem("—"))
+            self.scan_tbl.setItem(
+                i, self.SC_STATUS,
+                QTableWidgetItem(tr(self._STATUS_FA["pending"])))
+            saved = self._scan_key(ip, sni) in existing
+            self.scan_tbl.setItem(
+                i, self.SC_SAVED, QTableWidgetItem("✓" if saved else ""))
+            self._row_for_key[self._scan_key(ip, sni)] = i
+        self.scan_tbl.setUpdatesEnabled(True)
+        self.scan_progress.setRange(0, len(candidates))
+        self.scan_progress.setValue(0)
+
+        timeout = min(float(self._store.get("probe_timeout", 3.0) or 3.0), 3.0)
+        port = self._scan_port(profile)
+        self._scan_worker = _PoolScanWorker(
+            candidates, port=port, timeout=timeout)
+        self._scan_worker.result.connect(self._scan_on_result)
+        self._scan_worker.progress.connect(self._scan_on_progress)
+        self._scan_worker.finished_scan.connect(self._scan_on_finished)
+        self.scan_btn_run.setEnabled(False)
+        self.scan_cmb.setEnabled(False)
+        self.scan_btn_stop.setEnabled(True)
+        self.scan_status.setText(
+            tr("در حال آزمایش {n} جفت…").format(n=len(candidates)))
+        self._scan_worker.start()
+
+    def _scan_stop(self) -> None:
+        w = self._scan_worker
+        if w is not None:
+            try:
+                w.stop()
+            except Exception:
+                pass
+        self.scan_btn_stop.setEnabled(False)
+
+    def _scan_on_progress(self, done: int, total: int) -> None:
+        self.scan_progress.setRange(0, total)
+        self.scan_progress.setValue(done)
+
+    def _scan_on_finished(self, ok: int, total: int) -> None:
+        self.scan_btn_run.setEnabled(True)
+        self.scan_cmb.setEnabled(True)
+        self.scan_btn_stop.setEnabled(False)
+        self.scan_status.setText(
+            tr("پایان — {ok} از {total} جفت سالم بود.").format(
+                ok=ok, total=total))
+
+    def _scan_on_result(self, cand: dict) -> None:
+        ip = str(cand.get("ip", "")).strip()
+        sni = str(cand.get("sni", "")).strip()
+        status = str(cand.get("status", "pending"))
+        latency = cand.get("latency_ms")
+        row = self._row_for_key.get(self._scan_key(ip, sni))
+        if row is None:
+            return
+        lat_item = self.scan_tbl.item(row, self.SC_LAT)
+        if lat_item is not None:
+            lat_item.setText("—" if latency is None
+                             else "%.0fms" % float(latency))
+        st_item = self.scan_tbl.item(row, self.SC_STATUS)
+        if st_item is not None:
+            st_item.setText(tr(self._STATUS_FA.get(status, status)))
+            if status == "ok":
+                st_item.setForeground(QColor("#3ddc97"))
+            elif status == "fail":
+                st_item.setForeground(QColor("#ff6b6b"))
+
+    # -- inline scan: add / remove to sni_ip_pairs ------------------------
+    def _scan_selected_rows(self) -> list:
+        return sorted({idx.row() for idx in self.scan_tbl.selectedIndexes()})
+
+    def _scan_row_pair(self, row: int) -> tuple:
+        ip = self.scan_tbl.item(row, self.SC_IP)
+        sni = self.scan_tbl.item(row, self.SC_SNI)
+        return (ip.text() if ip else "", sni.text() if sni else "")
+
+    def _scan_row_ok(self, row: int) -> bool:
+        st = self.scan_tbl.item(row, self.SC_STATUS)
+        return st is not None and st.text() == tr(self._STATUS_FA["ok"])
+
+    def _scan_persist(self, pairs) -> None:
+        if self._store is None:
+            return
+        self._store.set("sni_ip_pairs", pairs)
+        try:
+            self._store.save_config()
+        except Exception:
+            pass
+        # let the host refresh Settings so the new pairs are selectable there
+        if callable(getattr(self, "pairs_changed", None)):
+            try:
+                self.pairs_changed()
+            except Exception:
+                pass
+
+    def _scan_add_rows(self, rows: list, *, ok_only: bool) -> int:
+        if self._store is None:
+            return 0
+        pairs = list(self._store.get("sni_ip_pairs", []) or [])
+        keys = {self._scan_key(p.get("ip", ""), p.get("sni", "")) for p in pairs}
+        added = 0
+        for row in rows:
+            if ok_only and not self._scan_row_ok(row):
+                continue
+            ip, sni = self._scan_row_pair(row)
+            if not ip or not sni:
+                continue
+            key = self._scan_key(ip, sni)
+            if key in keys:
+                continue
+            pairs.append({"sni": sni, "ip": ip})
+            keys.add(key)
+            saved_item = self.scan_tbl.item(row, self.SC_SAVED)
+            if saved_item is not None:
+                saved_item.setText("✓")
+            added += 1
+        if added:
+            self._scan_persist(pairs)
+        return added
+
+    def _scan_add_selected(self) -> None:
+        rows = self._scan_selected_rows()
+        if not rows:
+            self.scan_status.setText(tr("هیچ ردیفی انتخاب نشده است."))
+            return
+        n = self._scan_add_rows(rows, ok_only=False)
+        self.scan_status.setText(tr("{n} جفت به فهرست افزوده شد.").format(n=n))
+
+    def _scan_add_all_ok(self) -> None:
+        rows = [r for r in range(self.scan_tbl.rowCount())
+                if self._scan_row_ok(r)]
+        if not rows:
+            self.scan_status.setText(tr("هیچ جفت سالمی برای افزودن نیست."))
+            return
+        n = self._scan_add_rows(rows, ok_only=True)
+        self.scan_status.setText(
+            tr("{n} جفت سالم به فهرست افزوده شد.").format(n=n))
+
+    def _scan_remove_selected(self) -> None:
+        rows = self._scan_selected_rows()
+        if not rows or self._store is None:
+            self.scan_status.setText(tr("هیچ ردیفی انتخاب نشده است."))
+            return
+        remove_keys = {self._scan_key(*self._scan_row_pair(r)) for r in rows}
+        pairs = [
+            p for p in (self._store.get("sni_ip_pairs", []) or [])
+            if self._scan_key(p.get("ip", ""), p.get("sni", "")) not in remove_keys
+        ]
+        self._scan_persist(pairs)
+        for r in rows:
+            saved_item = self.scan_tbl.item(r, self.SC_SAVED)
+            if saved_item is not None:
+                saved_item.setText("")
+        self.scan_status.setText(
+            tr("{n} جفت از فهرست حذف شد.").format(n=len(rows)))
 
     # -- export (7.10) ----------------------------------------------------
     def _on_export(self) -> None:
@@ -2486,6 +2911,55 @@ class PoolPage(QWidget):
             QMessageBox.warning(
                 self, tr("خروجی SNI/IP"),
                 tr("ذخیره ناموفق بود: {e}").format(e=exc))
+
+    # -- import -----------------------------------------------------------
+    def _on_import(self) -> None:
+        """Import a previously-exported SNI/IP list file into sni_ip_pairs.
+
+        Lets the user load a list they (or someone else) produced with the
+        export button — no copy-pasting. The file is parsed leniently
+        (TAB/comma/space, comments ignored, IP/SNI order auto-detected) and only
+        NEW pairs are appended to the user's reusable ``sni_ip_pairs`` list. The
+        Settings page is refreshed so the imported pairs are immediately
+        selectable there.
+        """
+        if self._store is None:
+            QMessageBox.warning(
+                self, tr("وارد کردن SNI/IP"),
+                tr("امکان وارد کردن نیست — فروشگاه تنظیمات در دسترس نیست."))
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("انتخاب فایل فهرست SNI/IP"), "",
+            tr("فایل متنی (*.txt);;همهٔ فایل‌ها (*)"))
+        if not path:
+            return
+        try:
+            from core.pool import import_sni_pairs
+            existing = list(self._store.get("sni_ip_pairs", []) or [])
+            merged, added = import_sni_pairs(path, existing=existing)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, tr("وارد کردن SNI/IP"),
+                tr("وارد کردن ناموفق بود: {e}").format(e=exc))
+            return
+        if added <= 0:
+            QMessageBox.information(
+                self, tr("وارد کردن SNI/IP"),
+                tr("جفت تازه‌ای پیدا نشد — همهٔ موارد فایل از قبل در فهرست بودند."))
+            return
+        self._store.set("sni_ip_pairs", merged)
+        try:
+            self._store.save_config()
+        except Exception:
+            pass
+        if callable(getattr(self, "pairs_changed", None)):
+            try:
+                self.pairs_changed()
+            except Exception:
+                pass
+        QMessageBox.information(
+            self, tr("وارد کردن SNI/IP"),
+            tr("{n} جفت تازه از فایل به فهرست SNI/IP افزوده شد.").format(n=added))
 
     @staticmethod
     def _pair_table(rows: list) -> str:
@@ -2867,9 +3341,12 @@ class MainWindow(QWidget):
         # reflects saved settings.
         self.page_pool.set_provider(
             lambda: self.engine.pool_summary(self.store.config))
-        # manual SNI/IP scan ("شروع تست"): opens the scan dialog bound to the
-        # live store so added pairs persist and Settings refreshes afterwards.
-        self.page_pool.scan_handler = self._open_sni_scan
+        # inline SNI/IP scan ("شروع تست"): the scan panel is embedded in the
+        # pool page (no separate window). Give it the live store so it can list
+        # spoof configs and persist added sni_ip_pairs, and a callback so the
+        # Settings page refreshes when the user adds/removes pairs.
+        self.page_pool.set_store(self.store)
+        self.page_pool.pairs_changed = self._refresh_after_pairs_changed
 
         # initialise widgets from persisted state
         self.page_settings.load_from(self.store.config)
@@ -3342,25 +3819,9 @@ class MainWindow(QWidget):
             Toast.show_message(
                 self, tr("استراتژی انتخاب شد: {name}").format(name=name), "ok")
 
-    def _open_sni_scan(self):
-        """Open the manual SNI/IP scan dialog ("شروع تست").
-
-        The user picks ONE spoof config, sweeps every (IP, SNI) pair once, and
-        adds the good ones to ``sni_ip_pairs``. The dialog writes accepted pairs
-        straight into the store, so afterwards we reload Settings + the SNI combo
-        so the new pairs are immediately selectable there.
-        """
-        try:
-            from ui.sni_scan_dialog import SniScanDialog
-        except Exception as exc:
-            QMessageBox.warning(
-                self, tr("آزمایش"),
-                tr("باز کردن پنجرهٔ آزمایش ناموفق بود: {e}").format(e=exc))
-            return
-        dlg = SniScanDialog(self.store, self.window())
-        dlg.exec()
-        # the dialog persisted any added/removed pairs to the store; refresh the
-        # Settings page so its SNI/IP pair manager + combo reflect the changes.
+    def _refresh_after_pairs_changed(self):
+        """The inline pool scan added/removed sni_ip_pairs; reload Settings so
+        its SNI/IP pair manager + combo immediately reflect the change."""
         try:
             self.page_settings.load_from(self.store.config)
         except Exception:
@@ -3384,6 +3845,9 @@ class MainWindow(QWidget):
             self.page_pool.start_polling()
         else:
             self.page_pool.stop_polling()
+            # leaving the page: stop any in-flight inline scan so it never runs
+            # probes in the background after the user navigated away.
+            self.page_pool.shutdown_scan()
 
     # --- navigation -------------------------------------------------------
     def _build_nav(self) -> QWidget:
@@ -3724,6 +4188,11 @@ class MainWindow(QWidget):
         # GC'd mid-run (would crash on exit)
         try:
             self.page_profiles.stop_inline_pings()
+        except Exception:
+            pass
+        # stop any in-flight inline pool scan so its QThread isn't torn down mid-run
+        try:
+            self.page_pool.shutdown_scan()
         except Exception:
             pass
         try:
